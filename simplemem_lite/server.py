@@ -189,6 +189,33 @@ async def get_stats() -> dict:
     return result
 
 
+@mcp.tool()
+async def reset_all(confirm: bool = False) -> dict:
+    """DEBUG: Completely reset all memories and relationships.
+
+    WARNING: This is destructive and irreversible!
+    Deletes ALL stored memories, embeddings, and graph relationships.
+
+    Args:
+        confirm: Must be True to actually perform the reset
+
+    Returns:
+        {memories_deleted, relations_deleted} or error if not confirmed
+    """
+    log.warning(f"Tool: reset_all called (confirm={confirm})")
+
+    if not confirm:
+        log.info("Tool: reset_all aborted - confirmation required")
+        return {
+            "error": "Reset not confirmed",
+            "message": "Set confirm=True to actually delete all data. This is irreversible!",
+        }
+
+    result = store.reset_all()
+    log.warning(f"Tool: reset_all complete: {result}")
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESOURCES (4 Browsable Data Sources)
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -526,3 +526,16 @@ class MemoryStore:
             )
 
         return memories
+
+    def reset_all(self) -> dict[str, Any]:
+        """Reset all data - delete all memories and relationships.
+
+        WARNING: This is destructive and irreversible. For debug purposes only.
+
+        Returns:
+            Dictionary with counts of deleted items
+        """
+        log.warning("MemoryStore.reset_all: Initiating complete data wipe")
+        result = self.db.reset_all()
+        log.warning(f"MemoryStore.reset_all: Complete - {result}")
+        return result

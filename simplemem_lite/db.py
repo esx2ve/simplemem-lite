@@ -310,3 +310,44 @@ class DatabaseManager:
     def write_lock(self) -> threading.Lock:
         """Get the write lock for two-phase commit."""
         return self._write_lock
+
+    def reset_all(self) -> dict[str, int]:
+        """Reset all data - delete all memories and relationships.
+
+        WARNING: This is destructive and irreversible. For debug purposes only.
+
+        Returns:
+            Dictionary with counts of deleted items
+        """
+        log.warning("RESET_ALL: Starting complete data wipe")
+
+        with self._write_lock:
+            # Count before deletion for reporting
+            result = self.kuzu_conn.execute("MATCH (m:Memory) RETURN count(m)")
+            memories_count = result.get_next()[0] if result.has_next() else 0
+
+            result = self.kuzu_conn.execute("MATCH ()-[r:RELATES_TO]->() RETURN count(r)")
+            relations_count = result.get_next()[0] if result.has_next() else 0
+
+            # Delete all relationships first (must be done before nodes)
+            log.debug("RESET_ALL: Deleting all relationships")
+            self.kuzu_conn.execute("MATCH ()-[r:RELATES_TO]->() DELETE r")
+
+            # Delete all memory nodes
+            log.debug("RESET_ALL: Deleting all memory nodes")
+            self.kuzu_conn.execute("MATCH (m:Memory) DELETE m")
+
+            # Drop and recreate LanceDB table
+            log.debug("RESET_ALL: Dropping LanceDB table")
+            if self.VECTOR_TABLE_NAME in self.lance_db.table_names():
+                self.lance_db.drop_table(self.VECTOR_TABLE_NAME)
+
+            # Recreate table with schema
+            log.debug("RESET_ALL: Recreating LanceDB table")
+            self._init_lance_table()
+
+        log.warning(f"RESET_ALL: Complete. Deleted {memories_count} memories, {relations_count} relations")
+        return {
+            "memories_deleted": memories_count,
+            "relations_deleted": relations_count,
+        }
