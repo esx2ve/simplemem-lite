@@ -15,6 +15,16 @@ from simplemem_lite.logging import get_logger
 
 log = get_logger("memory")
 
+# Semantic weights for relation types (applied in Python for flexibility)
+RELATION_WEIGHTS = {
+    "contains": 1.0,    # Hierarchical drill-down
+    "child_of": 1.0,    # Reverse contains
+    "supports": 0.8,    # Evidence for conclusion
+    "follows": 0.6,     # Temporal sequence
+    "mentions": 0.4,    # Reference
+    "relates": 0.3,     # Generic/weak
+}
+
 
 @dataclass
 class MemoryItem:
@@ -539,3 +549,127 @@ class MemoryStore:
         result = self.db.reset_all()
         log.warning(f"MemoryStore.reset_all: Complete - {result}")
         return result
+
+    def reason(
+        self,
+        query: str,
+        seed_limit: int = 5,
+        max_hops: int = 2,
+        min_score: float = 0.1,
+    ) -> list[dict[str, Any]]:
+        """Multi-hop reasoning over memory graph.
+
+        Combines vector search with graph traversal and semantic path scoring
+        to find conclusions supported by chains of evidence.
+
+        Args:
+            query: Natural language query
+            seed_limit: Number of seed nodes from vector search
+            max_hops: Maximum path length for traversal
+            min_score: Minimum score threshold for results
+
+        Returns:
+            List of conclusions with scores and proof chains
+        """
+        log.info(f"Reasoning: query='{query[:50]}...', max_hops={max_hops}")
+
+        # Step 1: Vector search for seed nodes
+        log.trace("Step 1: Finding seed nodes via vector search")
+        query_embedding = embed(query, self.config)
+        seeds = self.db.search_vectors(query_embedding, limit=seed_limit)
+        log.debug(f"Found {len(seeds)} seed nodes")
+
+        if not seeds:
+            return []
+
+        # Step 2: Graph traversal from each seed
+        log.trace("Step 2: Graph traversal from seeds")
+        all_paths: dict[str, dict[str, Any]] = {}  # end_uuid -> best path info
+
+        for seed in seeds:
+            seed_uuid = seed["uuid"]
+            seed_score = 1 - seed.get("_distance", 0)  # Vector similarity
+
+            # Get paths from this seed
+            paths = self.db.get_paths(seed_uuid, max_hops=max_hops)
+
+            for path in paths:
+                end_uuid = path["end_uuid"]
+
+                # Calculate path score
+                path_score = self._score_path(path, seed_score)
+
+                # Evidence aggregation: keep best path to each node
+                if end_uuid not in all_paths or path_score > all_paths[end_uuid]["score"]:
+                    all_paths[end_uuid] = {
+                        "uuid": end_uuid,
+                        "content": path["end_content"],
+                        "type": path["end_type"],
+                        "session_id": path["session_id"],
+                        "score": path_score,
+                        "proof_chain": path["edge_types"],
+                        "hops": path["hops"],
+                        "seed_uuid": seed_uuid,
+                    }
+
+        # Step 3: Also add seeds themselves (0-hop)
+        for seed in seeds:
+            seed_uuid = seed["uuid"]
+            seed_score = 1 - seed.get("_distance", 0)
+            if seed_uuid not in all_paths or seed_score > all_paths[seed_uuid]["score"]:
+                all_paths[seed_uuid] = {
+                    "uuid": seed_uuid,
+                    "content": seed["content"],
+                    "type": seed["type"],
+                    "session_id": seed.get("session_id"),
+                    "score": seed_score,
+                    "proof_chain": [],
+                    "hops": 0,
+                    "seed_uuid": seed_uuid,
+                }
+
+        # Step 4: Filter and sort by score
+        results = [
+            p for p in all_paths.values()
+            if p["score"] >= min_score
+        ]
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        log.info(f"Reasoning complete: {len(results)} conclusions found")
+        return results
+
+    def _score_path(
+        self,
+        path: dict[str, Any],
+        seed_score: float,
+    ) -> float:
+        """Calculate semantic score for a path.
+
+        Combines:
+        - Seed vector similarity
+        - Edge type weights (multiplicative)
+        - Temporal decay
+
+        Args:
+            path: Path info from get_paths()
+            seed_score: Vector similarity of seed node
+
+        Returns:
+            Combined path score
+        """
+        score = seed_score
+
+        # Multiply by edge weights
+        for edge_type in path.get("edge_types", []):
+            weight = RELATION_WEIGHTS.get(edge_type, 0.3)
+            score *= weight
+
+        # Temporal decay (λ = 1e-7 ≈ half-life of ~80 days)
+        created_at = path.get("created_at", 0)
+        if created_at > 0:
+            now = time.time()
+            age = now - created_at
+            decay = 1 / (1 + 1e-7 * age)
+            score *= decay
+
+        return score

@@ -306,6 +306,85 @@ class DatabaseManager:
         log.debug(f"Graph traversal returned {len(rows)} related nodes")
         return rows
 
+    def get_paths(
+        self,
+        from_uuid: str,
+        max_hops: int = 2,
+        direction: str = "outgoing",
+    ) -> list[dict[str, Any]]:
+        """Get paths from a node with full edge metadata.
+
+        Returns paths with node and edge information for scoring.
+
+        Args:
+            from_uuid: Starting memory UUID
+            max_hops: Maximum path length (1-3)
+            direction: 'outgoing', 'incoming', or 'both'
+
+        Returns:
+            List of paths with nodes, edge_types, and metadata
+        """
+        log.trace(f"Getting paths: from={from_uuid[:8]}..., max_hops={max_hops}")
+        max_hops = min(max(max_hops, 1), 3)
+
+        # KuzuDB uses slightly different syntax for variable-length paths
+        # NOTE: 'end' is a reserved keyword in KuzuDB, use 'target' instead
+        if direction == "outgoing":
+            pattern = f"(start:Memory {{uuid: $uuid}})-[r:RELATES_TO*1..{max_hops}]->(target:Memory)"
+        elif direction == "incoming":
+            pattern = f"(start:Memory {{uuid: $uuid}})<-[r:RELATES_TO*1..{max_hops}]-(target:Memory)"
+        else:
+            pattern = f"(start:Memory {{uuid: $uuid}})-[r:RELATES_TO*1..{max_hops}]-(target:Memory)"
+
+        # Query for paths - KuzuDB returns recursive rel as list
+        result = self.kuzu_conn.execute(
+            f"""
+            MATCH {pattern}
+            RETURN DISTINCT
+                target.uuid AS end_uuid,
+                target.content AS end_content,
+                target.type AS end_type,
+                target.session_id AS session_id,
+                target.created_at AS created_at,
+                r AS edges
+            """,
+            {"uuid": from_uuid},
+        )
+
+        paths = []
+        while result.has_next():
+            row = result.get_next()
+            # Extract edge info from the recursive relationship
+            edges_data = row[5]  # This is the list of edges
+
+            # Parse edge types and weights from the edges
+            # KuzuDB may return dicts or internal edge objects
+            edge_types = []
+            edge_weights = []
+            if edges_data:
+                for edge in edges_data:
+                    if isinstance(edge, dict):
+                        edge_types.append(edge.get("relation_type", "relates"))
+                        edge_weights.append(edge.get("weight", 1.0))
+                    else:
+                        # Try attribute access for KuzuDB edge objects
+                        edge_types.append(getattr(edge, "relation_type", "relates"))
+                        edge_weights.append(getattr(edge, "weight", 1.0))
+
+            paths.append({
+                "end_uuid": row[0],
+                "end_content": row[1],
+                "end_type": row[2],
+                "session_id": row[3],
+                "created_at": row[4] or 0,
+                "edge_types": edge_types,
+                "edge_weights": edge_weights,
+                "hops": len(edge_types) if edge_types else 1,
+            })
+
+        log.debug(f"Found {len(paths)} paths from {from_uuid[:8]}...")
+        return paths
+
     @property
     def write_lock(self) -> threading.Lock:
         """Get the write lock for two-phase commit."""

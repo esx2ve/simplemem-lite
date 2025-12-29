@@ -216,6 +216,54 @@ async def reset_all(confirm: bool = False) -> dict:
     return result
 
 
+@mcp.tool()
+async def reason_memories(
+    query: str,
+    max_hops: int = 2,
+    min_score: float = 0.1,
+) -> dict:
+    """Multi-hop reasoning over memory graph.
+
+    Combines vector search with graph traversal and semantic path scoring
+    to answer complex questions that require following chains of evidence.
+
+    Example queries:
+    - "What debugging patterns work for database issues?"
+    - "How did the authentication feature evolve?"
+    - "Find solutions related to connection timeouts"
+
+    Args:
+        query: Natural language query
+        max_hops: Maximum path length for traversal (1-3)
+        min_score: Minimum score threshold for results
+
+    Returns:
+        {conclusions: [{uuid, content, type, score, proof_chain, hops}]}
+    """
+    log.info(f"Tool: reason_memories called (query='{query[:50]}...', max_hops={max_hops})")
+
+    results = store.reason(
+        query=query,
+        max_hops=max_hops,
+        min_score=min_score,
+    )
+
+    log.info(f"Tool: reason_memories complete: {len(results)} conclusions")
+    return {
+        "conclusions": [
+            {
+                "uuid": r["uuid"],
+                "content": r["content"][:500],  # Truncate for response size
+                "type": r["type"],
+                "score": round(r["score"], 3),
+                "proof_chain": r["proof_chain"],
+                "hops": r["hops"],
+            }
+            for r in results[:10]  # Limit to top 10
+        ]
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESOURCES (4 Browsable Data Sources)
 # ═══════════════════════════════════════════════════════════════════════════════
