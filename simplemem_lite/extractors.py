@@ -57,8 +57,12 @@ async def extract_entities(text: str, config: Config | None = None) -> Extracted
 
     config = config or Config()
 
-    # Truncate text for efficiency
-    text_sample = text[:2000] if len(text) > 2000 else text
+    # Smart truncation: preserve start (context) and end (results/errors)
+    # Errors and key results often appear at the end of long outputs
+    if len(text) > 2000:
+        text_sample = text[:1000] + "\n...[truncated]...\n" + text[-1000:]
+    else:
+        text_sample = text
 
     try:
         response = await acompletion(

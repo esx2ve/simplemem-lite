@@ -347,9 +347,27 @@ class HierarchicalIndexer:
                 [m.content for m in interesting_msgs], self.config
             )
 
-            msg_items = [
-                MemoryItem(
-                    content=msg.content[:2000],  # Cap content length
+            msg_items = []
+            for msg, entities in zip(interesting_msgs, entities_list):
+                # Build searchable content with entity context appended
+                content = msg.content[:1800]  # Leave room for entity footer
+
+                # Append entity context for better semantic search
+                entity_parts = []
+                if entities.file_paths:
+                    entity_parts.append(f"Files: {', '.join(entities.file_paths[:5])}")
+                if entities.commands:
+                    entity_parts.append(f"Commands: {', '.join(entities.commands[:3])}")
+                if entities.errors:
+                    entity_parts.append(f"Errors: {', '.join(entities.errors[:2])}")
+                if entities.tools:
+                    entity_parts.append(f"Tools: {', '.join(entities.tools[:5])}")
+
+                if entity_parts:
+                    content += f"\n\n[Context: {' | '.join(entity_parts)}]"
+
+                msg_items.append(MemoryItem(
+                    content=content,
                     metadata={
                         "type": "message",
                         "session_id": session_id,
@@ -357,9 +375,7 @@ class HierarchicalIndexer:
                         "msg_type": msg.type,
                         **entities.to_metadata(),
                     },
-                )
-                for msg, entities in zip(interesting_msgs, entities_list)
-            ]
+                ))
 
             await report(85, f"Storing {len(msg_items)} messages...")
             message_ids = self.store.store_batch(msg_items)
@@ -486,30 +502,43 @@ class HierarchicalIndexer:
     ) -> str:
         """Prepare chunk content for summarization with token budget.
 
-        Prioritizes content by type: tool_result > assistant > user > tool_use
+        Maintains chronological order while prioritizing high-value content.
+        Skips low-priority messages when budget is tight, but never reorders.
 
         Args:
-            chunk: Messages in the chunk
+            chunk: Messages in the chunk (chronological order)
             max_tokens: Maximum token budget (~4 chars per token)
 
         Returns:
             Formatted content string within token budget
         """
-        # Priority order: tool results are most informative
-        priority_order = {"tool_result": 0, "assistant": 1, "user": 2, "tool_use": 3}
-        sorted_msgs = sorted(chunk, key=lambda m: priority_order.get(m.type, 99))
+        # Priority scores: lower = more important (keep)
+        priority_score = {"tool_result": 0, "assistant": 1, "user": 2, "tool_use": 3}
 
         content_parts = []
         estimated_tokens = 0
 
-        for msg in sorted_msgs:
-            msg_tokens = len(msg.content) // 4  # ~4 chars per token estimate
+        # First pass: calculate total tokens needed
+        total_needed = sum(len(m.content) // 4 for m in chunk)
+
+        # If we're over budget, we'll skip low-priority messages
+        skip_threshold = 3 if total_needed > max_tokens * 1.5 else 99
+
+        for msg in chunk:  # Maintain chronological order!
+            msg_priority = priority_score.get(msg.type, 2)
+            msg_tokens = len(msg.content) // 4
+
+            # Skip low-priority if over budget
+            if msg_priority >= skip_threshold and estimated_tokens + msg_tokens > max_tokens * 0.8:
+                continue
+
             if estimated_tokens + msg_tokens > max_tokens:
                 # Add truncated version if we have budget
                 remaining = (max_tokens - estimated_tokens) * 4
                 if remaining > 100:
                     content_parts.append(f"[{msg.type}] {msg.content[:remaining]}...")
                 break
+
             content_parts.append(f"[{msg.type}] {msg.content}")
             estimated_tokens += msg_tokens
 
@@ -574,9 +603,21 @@ Focus on: what problem was being solved, what tools were used, what was the outc
         for msg in messages:
             type_counts[msg.type] = type_counts.get(msg.type, 0) + 1
 
-        # Format chunk summaries (limit to first 15 for context window)
+        # Select representative chunk summaries: first + middle + last
+        # This ensures we capture: session start, middle context, and resolution
+        n = len(chunk_summaries)
+        if n <= 15:
+            selected_summaries = chunk_summaries
+        else:
+            # First 5 (context), middle 5 (development), last 5 (resolution)
+            first = chunk_summaries[:5]
+            mid_start = (n - 5) // 2
+            middle = chunk_summaries[mid_start:mid_start + 5]
+            last = chunk_summaries[-5:]
+            selected_summaries = first + middle + last
+
         summaries_text = "\n".join(
-            f"- {s}" for s in chunk_summaries[:15]
+            f"- {s}" for s in selected_summaries
         )
 
         try:

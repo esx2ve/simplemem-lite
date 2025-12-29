@@ -120,3 +120,29 @@ Populate `message_ids` with filtered important messages
 - Changed from substring matching to word boundary regex patterns
 - Added negation detection to skip "no errors", "without exceptions", etc.
 - Added additional error patterns: `traceback`, `stack trace`
+
+---
+
+## Round 2 Fixes (2024-12-29) - Gemini 3 Pro Analysis
+
+Quality improved from 6.5/10 → 8/10. New issues identified and fixed:
+
+**HIGH: Temporal Context Destruction**
+- Problem: Sorting by priority scrambled chronological message order
+- Fix: Maintain chronological order, skip low-priority messages in-place when over budget
+- Location: `traces.py:_prepare_chunk_content()`
+
+**HIGH: Session Summary Amnesia**
+- Problem: `[:15]` ignored last 47% of chunks in 28-chunk session
+- Fix: Use first 5 + middle 5 + last 5 chunks for representative coverage
+- Location: `traces.py:_summarize_session()`
+
+**MEDIUM: Metadata Invisibility in Search**
+- Problem: Entity metadata not indexed in vector search
+- Fix: Append `[Context: Files: ... | Commands: ... | Errors: ...]` to content
+- Location: `traces.py:index_session()`
+
+**MEDIUM: Entity Extraction Truncation Blindness**
+- Problem: 2000 char head-only truncation missed errors at end of outputs
+- Fix: Use head (1000) + tail (1000) strategy to preserve both context and results
+- Location: `extractors.py:extract_entities()`
