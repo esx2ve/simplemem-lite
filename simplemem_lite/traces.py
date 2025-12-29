@@ -291,6 +291,12 @@ class HierarchicalIndexer:
         chunks = self._chunk_by_tool_sequences(messages)
         await report(10, f"Created {len(chunks)} chunks, starting summarization...")
 
+        # Track which chunk each message belongs to (for message→chunk relationships)
+        msg_to_chunk_idx: dict[str, int] = {}
+        for chunk_idx, chunk in enumerate(chunks):
+            for msg in chunk:
+                msg_to_chunk_idx[msg.uuid] = chunk_idx
+
         # 2. Summarize all chunks in parallel using asyncio.gather
         log.info(f"Summarizing {len(chunks)} chunks in parallel")
         import asyncio
@@ -330,6 +336,16 @@ class HierarchicalIndexer:
         await report(75, f"Batch embedding {len(chunk_items)} chunks...")
         chunk_ids = self.store.store_batch(chunk_items)
         log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
+
+        # 3b. Create chunk→chunk (follows) relationships for temporal sequence
+        follows_created = 0
+        for i in range(1, len(chunk_ids)):
+            try:
+                self.store.relate(chunk_ids[i], chunk_ids[i - 1], "follows")
+                follows_created += 1
+            except Exception as e:
+                log.warning(f"Failed to create chunk follows relation: {e}")
+        log.info(f"Created {follows_created} chunk→chunk follows relationships")
 
         # 4. Store interesting individual messages
         await report(80, "Identifying interesting messages...")
@@ -381,6 +397,27 @@ class HierarchicalIndexer:
             message_ids = self.store.store_batch(msg_items)
             log.info(f"Stored {len(message_ids)} interesting messages")
 
+            # 4b. Create message relationships
+            msg_relations_created = 0
+            for i, (msg, msg_id) in enumerate(zip(interesting_msgs, message_ids)):
+                # message→chunk (child_of) - link message to its parent chunk
+                chunk_idx = msg_to_chunk_idx.get(msg.uuid)
+                if chunk_idx is not None and chunk_idx < len(chunk_ids):
+                    try:
+                        self.store.relate(msg_id, chunk_ids[chunk_idx], "child_of")
+                        msg_relations_created += 1
+                    except Exception as e:
+                        log.warning(f"Failed to create message→chunk relation: {e}")
+
+                # message→message (follows) - temporal sequence
+                if i > 0:
+                    try:
+                        self.store.relate(msg_id, message_ids[i - 1], "follows")
+                        msg_relations_created += 1
+                    except Exception as e:
+                        log.warning(f"Failed to create message follows relation: {e}")
+            log.info(f"Created {msg_relations_created} message relationships")
+
         # 5. Generate session summary using chunk summaries (Map-Reduce)
         await report(90, "Generating session summary...")
         session_summary = await self._summarize_session(messages, chunk_summaries)
@@ -397,6 +434,16 @@ class HierarchicalIndexer:
                 relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
             )
         )
+
+        # 5b. Create chunk→session (child_of) relationships for bi-directional traversal
+        child_of_created = 0
+        for cid in chunk_ids:
+            try:
+                self.store.relate(cid, session_summary_id, "child_of")
+                child_of_created += 1
+            except Exception as e:
+                log.warning(f"Failed to create chunk→session child_of relation: {e}")
+        log.info(f"Created {child_of_created} chunk→session child_of relationships")
 
         await report(100, "Complete!")
         return SessionIndex(

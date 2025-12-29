@@ -590,8 +590,8 @@ class MemoryStore:
             seed_uuid = seed["uuid"]
             seed_score = 1 - seed.get("_distance", 0)  # Vector similarity
 
-            # Get paths from this seed
-            paths = self.db.get_paths(seed_uuid, max_hops=max_hops)
+            # Get paths from this seed (use "both" for bi-directional traversal)
+            paths = self.db.get_paths(seed_uuid, max_hops=max_hops, direction="both")
 
             for path in paths:
                 end_uuid = path["end_uuid"]
