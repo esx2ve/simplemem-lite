@@ -310,31 +310,27 @@ class HierarchicalIndexer:
             )
             chunk_summaries.extend(batch_summaries)
 
-        await report(70, f"Generated {len(chunk_summaries)} summaries, storing...")
+        await report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
 
-        # 3. Store all chunk summaries (embeddings happen here)
-        chunk_ids = []
+        # 3. Batch store all chunk summaries (single embedding call!)
         message_ids = []
 
-        for i, (chunk, summary) in enumerate(zip(chunks, chunk_summaries)):
-            progress = 70 + int((i / len(chunks)) * 20)
-            await report(progress, f"Storing chunk {i+1}/{len(chunks)}...")
-
-            chunk_id = self.store.store(
-                MemoryItem(
-                    content=summary,
-                    metadata={
-                        "type": "chunk_summary",
-                        "session_id": session_id,
-                        "source": "claude_trace",
-                        "message_count": len(chunk),
-                    },
-                )
+        chunk_items = [
+            MemoryItem(
+                content=summary,
+                metadata={
+                    "type": "chunk_summary",
+                    "session_id": session_id,
+                    "source": "claude_trace",
+                    "message_count": len(chunk),
+                },
             )
-            chunk_ids.append(chunk_id)
-            log.debug(f"Chunk {i+1} stored: {chunk_id[:8]}...")
+            for chunk, summary in zip(chunks, chunk_summaries)
+        ]
 
-        log.info(f"Stored {len(chunk_ids)} chunk summaries")
+        await report(75, f"Batch embedding {len(chunk_items)} chunks...")
+        chunk_ids = self.store.store_batch(chunk_items)
+        log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
 
         # 4. Generate session summary
         await report(90, "Generating session summary...")

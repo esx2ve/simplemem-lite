@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from simplemem_lite.config import Config
 from simplemem_lite.db import DatabaseManager
-from simplemem_lite.embeddings import embed, init_embeddings
+from simplemem_lite.embeddings import embed, embed_batch, init_embeddings
 from simplemem_lite.logging import get_logger
 
 log = get_logger("memory")
@@ -157,6 +157,100 @@ class MemoryStore:
 
         log.info(f"Memory stored: {memory_uuid[:8]}... ({mem_type})")
         return memory_uuid
+
+    def store_batch(self, items: list[MemoryItem]) -> list[str]:
+        """Store multiple memories with batch embedding for efficiency.
+
+        Uses a single embedding call for all items, significantly faster
+        than calling store() individually.
+
+        Args:
+            items: List of MemoryItem to store
+
+        Returns:
+            List of UUIDs for stored memories
+
+        Raises:
+            Exception: If storage fails (with automatic rollback)
+        """
+        if not items:
+            return []
+
+        log.info(f"Batch storing {len(items)} memories")
+
+        # 1. Prepare all metadata upfront
+        batch_data = []
+        contents = []
+        for item in items:
+            memory_uuid = str(uuid4())
+            mem_type = item.metadata.get("type", "fact")
+            source = item.metadata.get("source", "user")
+            session_id = item.metadata.get("session_id")
+            created_at = int(time.time())
+
+            batch_data.append({
+                "uuid": memory_uuid,
+                "content": item.content,
+                "type": mem_type,
+                "source": source,
+                "session_id": session_id,
+                "created_at": created_at,
+                "relations": item.relations,
+            })
+            contents.append(item.content)
+
+        # 2. Batch embed all content at once
+        log.debug(f"Batch embedding {len(contents)} items")
+        embeddings = embed_batch(contents, self.config)
+        log.debug(f"Batch embedding complete: {len(embeddings)} embeddings")
+
+        # 3. Store all to graph + vectors
+        uuids = []
+        with self.db.write_lock:
+            try:
+                for i, (data, embedding) in enumerate(zip(batch_data, embeddings)):
+                    # Phase 1: Write to graph
+                    self.db.add_memory_node(
+                        uuid=data["uuid"],
+                        content=data["content"],
+                        mem_type=data["type"],
+                        source=data["source"],
+                        session_id=data["session_id"],
+                        created_at=data["created_at"],
+                    )
+
+                    # Phase 2: Write to vectors
+                    self.db.add_memory_vector(
+                        uuid=data["uuid"],
+                        vector=embedding,
+                        content=data["content"],
+                        mem_type=data["type"],
+                        session_id=data["session_id"],
+                    )
+
+                    uuids.append(data["uuid"])
+
+                # Phase 3: Create relationships (after all nodes exist)
+                for data in batch_data:
+                    for rel in data["relations"]:
+                        self.db.add_relationship(
+                            from_uuid=data["uuid"],
+                            to_uuid=rel["target_id"],
+                            relation_type=rel.get("type", "relates"),
+                        )
+
+            except Exception as e:
+                log.error(f"Batch storage failed: {e}, rolling back")
+                # Rollback: delete all created nodes
+                for uuid in uuids:
+                    try:
+                        self.db.delete_memory_node(uuid)
+                    except Exception:
+                        pass
+                raise e
+
+        log.info(f"Batch stored {len(uuids)} memories")
+        return uuids
 
     def search(
         self,
