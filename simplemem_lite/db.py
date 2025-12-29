@@ -583,3 +583,128 @@ class DatabaseManager:
             "relations": relation_count,
             "entity_types": entity_breakdown,
         }
+
+    def get_pagerank_scores(
+        self,
+        uuids: list[str] | None = None,
+        max_iterations: int = 20,
+        damping_factor: float = 0.85,
+    ) -> dict[str, float]:
+        """Compute PageRank scores for Memory nodes.
+
+        Uses FalkorDB's built-in PageRank algorithm to compute node importance
+        based on graph structure. Nodes with more high-quality incoming edges
+        get higher scores.
+
+        Args:
+            uuids: Optional list of UUIDs to get scores for (None = all)
+            max_iterations: PageRank iterations (default: 20)
+            damping_factor: PageRank damping factor (default: 0.85)
+
+        Returns:
+            Dictionary mapping UUID -> PageRank score (0.0 to 1.0)
+        """
+        log.trace("Computing PageRank scores")
+
+        try:
+            # Call FalkorDB's PageRank algorithm
+            # Note: FalkorDB uses algo.pageRank procedure
+            result = self.graph.query(
+                """
+                CALL algo.pageRank('Memory', 'RELATES_TO', {
+                    maxIterations: $max_iter,
+                    dampingFactor: $damping
+                })
+                YIELD node, score
+                MATCH (m:Memory) WHERE id(m) = id(node)
+                RETURN m.uuid AS uuid, score
+                """,
+                {
+                    "max_iter": max_iterations,
+                    "damping": damping_factor,
+                },
+            )
+
+            scores = {}
+            for record in result.result_set:
+                scores[record[0]] = record[1]
+
+            log.debug(f"PageRank computed for {len(scores)} nodes")
+
+            # Filter to requested UUIDs if specified
+            if uuids:
+                scores = {uuid: scores.get(uuid, 0.0) for uuid in uuids}
+
+            return scores
+
+        except Exception as e:
+            log.warning(f"PageRank computation failed (may not be supported): {e}")
+            # Return empty dict if PageRank not available
+            return {}
+
+    def get_pagerank_for_nodes(
+        self,
+        uuids: list[str],
+    ) -> dict[str, float]:
+        """Get PageRank scores for specific nodes.
+
+        Computes PageRank on the full graph and filters to requested nodes.
+        Falls back to degree-based scoring if PageRank is unavailable.
+
+        Args:
+            uuids: List of UUIDs to get scores for
+
+        Returns:
+            Dictionary mapping UUID -> PageRank score
+        """
+        log.trace(f"Getting PageRank for {len(uuids)} nodes")
+
+        try:
+            # Get PageRank for the whole graph
+            all_scores = self.get_pagerank_scores()
+
+            if all_scores:
+                # Filter for the requested UUIDs
+                scores = {uuid: all_scores.get(uuid, 0.0) for uuid in uuids}
+                log.debug(f"PageRank retrieved for {len(scores)} of {len(uuids)} nodes")
+                return scores
+
+            # Empty result, fall through to fallback
+            log.debug("PageRank returned no scores, using fallback")
+            return self._get_degree_scores(uuids)
+
+        except Exception as e:
+            log.warning(f"PageRank failed, using degree-based fallback: {e}")
+            # Fallback: use in-degree as a proxy for importance
+            return self._get_degree_scores(uuids)
+
+    def _get_degree_scores(self, uuids: list[str]) -> dict[str, float]:
+        """Fallback: compute importance scores based on in-degree.
+
+        Args:
+            uuids: List of UUIDs
+
+        Returns:
+            Normalized in-degree scores
+        """
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)
+            WHERE m.uuid IN $uuids
+            OPTIONAL MATCH (other)-[r]->(m)
+            WITH m.uuid AS uuid, count(r) AS in_degree
+            RETURN uuid, in_degree
+            """,
+            {"uuids": uuids},
+        )
+
+        # Get raw degrees
+        degrees = {}
+        max_degree = 1
+        for record in result.result_set:
+            degrees[record[0]] = record[1]
+            max_degree = max(max_degree, record[1])
+
+        # Normalize to 0-1 range
+        scores = {uuid: degrees.get(uuid, 0) / max_degree for uuid in uuids}
+        return scores

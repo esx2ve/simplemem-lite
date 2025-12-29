@@ -260,6 +260,7 @@ async def reason_memories(
                 "content": r["content"][:500],  # Truncate for response size
                 "type": r["type"],
                 "score": round(r["score"], 3),
+                "pagerank": r.get("pagerank", 0.0),
                 "proof_chain": r["proof_chain"],
                 "hops": r["hops"],
                 "cross_session": r.get("cross_session", False),
@@ -269,6 +270,46 @@ async def reason_memories(
         ],
         "cross_session_count": cross_session_count,
     }
+
+
+@mcp.tool()
+async def ask_memories(
+    query: str,
+    max_memories: int = 8,
+    max_hops: int = 2,
+) -> dict:
+    """Ask a question and get an LLM-synthesized answer from memory graph.
+
+    Retrieves relevant memories via multi-hop graph traversal, then uses
+    an LLM to synthesize a coherent answer grounded in the evidence.
+
+    The answer includes citations [1], [2], etc. referencing specific memories.
+    Cross-session insights (patterns found across different work sessions) are
+    highlighted as especially valuable.
+
+    Example queries:
+    - "What was the solution to the database connection issue?"
+    - "How did we implement the authentication feature?"
+    - "What patterns have worked for debugging async code?"
+
+    Args:
+        query: Natural language question
+        max_memories: Maximum memories to include in context (default: 8)
+        max_hops: Maximum graph traversal depth (default: 2)
+
+    Returns:
+        {answer, memories_used, cross_session_insights, confidence, sources}
+    """
+    log.info(f"Tool: ask_memories called (query='{query[:50]}...')")
+
+    result = await store.ask_memories(
+        query=query,
+        max_memories=max_memories,
+        max_hops=max_hops,
+    )
+
+    log.info(f"Tool: ask_memories complete: confidence={result['confidence']}")
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

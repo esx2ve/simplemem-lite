@@ -306,7 +306,8 @@ class MemoryStore:
 
         # Add vector results with similarity scores
         for r in vector_results:
-            vector_score = 1 - r.get("_distance", 0)  # Convert distance to similarity
+            # Normalize cosine distance (0-2) to similarity (0-1)
+            vector_score = max(0, 1 - r.get("_distance", 0) / 2)
             all_results[r["uuid"]] = {
                 "data": r,
                 "vector_score": vector_score,
@@ -521,7 +522,12 @@ class MemoryStore:
         }
 
     def _format_vector_results(self, results: list[dict]) -> list[Memory]:
-        """Format vector search results as Memory objects."""
+        """Format vector search results as Memory objects.
+
+        Note: LanceDB returns L2/cosine distance. For normalized embeddings,
+        cosine distance ranges 0-2 (0=identical, 2=opposite).
+        We convert to similarity: sim = max(0, 1 - distance/2)
+        """
         return [
             Memory(
                 uuid=r["uuid"],
@@ -529,7 +535,7 @@ class MemoryStore:
                 type=r["type"],
                 session_id=r["session_id"] if r.get("session_id") else None,
                 created_at=0,  # Not stored in vector table
-                score=1 - r.get("_distance", 0),
+                score=max(0, 1 - r.get("_distance", 0) / 2),  # Normalize cosine distance to 0-1
             )
             for r in results
         ]
@@ -573,22 +579,27 @@ class MemoryStore:
         seed_limit: int = 5,
         max_hops: int = 2,
         min_score: float = 0.1,
+        use_pagerank: bool = True,
     ) -> list[dict[str, Any]]:
         """Multi-hop reasoning over memory graph.
 
         Combines vector search with graph traversal and semantic path scoring
         to find conclusions supported by chains of evidence.
 
+        Uses PageRank to boost scores of structurally important nodes (those
+        with many high-quality incoming edges).
+
         Args:
             query: Natural language query
             seed_limit: Number of seed nodes from vector search
             max_hops: Maximum path length for traversal
             min_score: Minimum score threshold for results
+            use_pagerank: Whether to incorporate PageRank scores (default: True)
 
         Returns:
             List of conclusions with scores and proof chains
         """
-        log.info(f"Reasoning: query='{query[:50]}...', max_hops={max_hops}")
+        log.info(f"Reasoning: query='{query[:50]}...', max_hops={max_hops}, pagerank={use_pagerank}")
 
         # Step 1: Vector search for seed nodes
         log.trace("Step 1: Finding seed nodes via vector search")
@@ -605,7 +616,8 @@ class MemoryStore:
 
         for seed in seeds:
             seed_uuid = seed["uuid"]
-            seed_score = 1 - seed.get("_distance", 0)  # Vector similarity
+            # Normalize cosine distance (0-2) to similarity (0-1)
+            seed_score = max(0, 1 - seed.get("_distance", 0) / 2)
 
             # Get paths from this seed (use "both" for bi-directional traversal)
             paths = self.db.get_paths(seed_uuid, max_hops=max_hops, direction="both")
@@ -656,7 +668,8 @@ class MemoryStore:
         # Step 3: Also add seeds themselves (0-hop)
         for seed in seeds:
             seed_uuid = seed["uuid"]
-            seed_score = 1 - seed.get("_distance", 0)
+            # Normalize cosine distance (0-2) to similarity (0-1)
+            seed_score = max(0, 1 - seed.get("_distance", 0) / 2)
             if seed_uuid not in all_paths or seed_score > all_paths[seed_uuid]["score"]:
                 all_paths[seed_uuid] = {
                     "uuid": seed_uuid,
@@ -669,7 +682,25 @@ class MemoryStore:
                     "seed_uuid": seed_uuid,
                 }
 
-        # Step 4: Filter and sort by score
+        # Step 4: Apply PageRank boost if enabled
+        if use_pagerank and all_paths:
+            log.trace("Step 4: Applying PageRank boost")
+            uuids = list(all_paths.keys())
+            pagerank_scores = self.db.get_pagerank_for_nodes(uuids)
+
+            # Normalize PageRank scores to 0-1 range for this result set
+            if pagerank_scores:
+                max_pr = max(pagerank_scores.values()) or 1.0
+                for uuid, path_info in all_paths.items():
+                    pr_score = pagerank_scores.get(uuid, 0.0) / max_pr
+                    # PageRank boost: multiply by (1 + pr_score * 0.3)
+                    # This gives up to 30% boost for highest-ranked nodes
+                    path_info["score"] *= (1 + pr_score * 0.3)
+                    path_info["pagerank"] = round(pr_score, 3)
+
+                log.debug(f"PageRank applied to {len(pagerank_scores)} nodes")
+
+        # Step 5: Filter and sort by score
         results = [
             p for p in all_paths.values()
             if p["score"] >= min_score
@@ -714,3 +745,158 @@ class MemoryStore:
             score *= decay
 
         return score
+
+    async def ask_memories(
+        self,
+        query: str,
+        max_memories: int = 8,
+        max_hops: int = 2,
+        include_raw: bool = False,
+    ) -> dict[str, Any]:
+        """LLM-powered reasoning over graph-retrieved memories.
+
+        Retrieves relevant memories via multi-hop graph traversal, then uses
+        an LLM to synthesize a coherent answer grounded in the evidence.
+
+        Args:
+            query: Natural language question
+            max_memories: Maximum memories to include in context (default: 8)
+            max_hops: Maximum graph traversal depth (default: 2)
+            include_raw: Include raw memory data in response (default: False)
+
+        Returns:
+            Dictionary with:
+            - answer: LLM-synthesized answer with citations
+            - memories_used: Number of memories in context
+            - cross_session_insights: Count of cross-session memories
+            - confidence: high/medium/low based on memory scores
+            - sources: List of source memory metadata
+        """
+        from litellm import acompletion
+
+        log.info(f"ask_memories: query='{query[:50]}...', max_memories={max_memories}")
+
+        # Step 1: Retrieve memories via graph reasoning
+        memories = self.reason(query, max_hops=max_hops, min_score=0.05)[:max_memories]
+
+        if not memories:
+            log.info("ask_memories: No relevant memories found")
+            return {
+                "answer": "I don't have any relevant memories to answer this question.",
+                "memories_used": 0,
+                "cross_session_insights": 0,
+                "confidence": "none",
+                "sources": [],
+            }
+
+        # Step 2: Format memories for LLM context
+        formatted_memories = self._format_memories_for_llm(memories)
+        cross_session_count = sum(1 for m in memories if m.get("cross_session"))
+
+        # Step 3: Calculate confidence based on top scores
+        avg_score = sum(m["score"] for m in memories) / len(memories)
+        if avg_score >= 0.5:
+            confidence = "high"
+        elif avg_score >= 0.2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Step 4: Build the reasoning prompt
+        prompt = f'''You are a memory-augmented assistant that answers questions using retrieved evidence from past coding sessions.
+
+## Retrieved Memories (ranked by relevance)
+{formatted_memories}
+
+## Rules
+1. Answer ONLY using information from the memories above
+2. Cite sources using [1], [2], etc. when referencing specific information
+3. If the memories don't contain enough information, say "Based on available memories, I cannot fully answer this, but here's what I found: ..."
+4. Cross-session memories (marked with [cross-session]) are especially valuable - they show patterns across different work sessions
+5. Be concise and specific
+6. Focus on actionable insights and concrete details
+
+## Question
+{query}
+
+## Answer (with citations)'''
+
+        # Step 5: Call LLM for synthesis
+        try:
+            response = await acompletion(
+                model=self.config.summary_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.2,  # Low temperature for factual, grounded answers
+            )
+            answer = response.choices[0].message.content
+        except Exception as e:
+            log.error(f"ask_memories LLM call failed: {e}")
+            answer = f"Error generating answer: {e}"
+            confidence = "error"
+
+        log.info(f"ask_memories complete: {len(memories)} memories, confidence={confidence}")
+
+        result = {
+            "answer": answer,
+            "memories_used": len(memories),
+            "cross_session_insights": cross_session_count,
+            "confidence": confidence,
+            "sources": [
+                {
+                    "uuid": m["uuid"],
+                    "type": m["type"],
+                    "score": round(m["score"], 3),
+                    "hops": m["hops"],
+                    "cross_session": m.get("cross_session", False),
+                }
+                for m in memories
+            ],
+        }
+
+        if include_raw:
+            result["raw_memories"] = memories
+
+        return result
+
+    def _format_memories_for_llm(self, memories: list[dict[str, Any]]) -> str:
+        """Format memories with metadata for LLM context.
+
+        Args:
+            memories: List of memory dicts from reason()
+
+        Returns:
+            Formatted string with numbered memories and metadata
+        """
+        formatted = []
+        for i, m in enumerate(memories, 1):
+            # Build metadata string
+            meta_parts = [f"type: {m['type']}", f"score: {m['score']:.2f}"]
+
+            if m["hops"] > 0:
+                meta_parts.append(f"hops: {m['hops']}")
+                if m.get("proof_chain"):
+                    proof_chain = m["proof_chain"]
+                    # Show beginning and end for long chains to preserve context
+                    if len(proof_chain) > 3:
+                        path_str = f"{' -> '.join(proof_chain[:2])} -> ... -> {proof_chain[-1]}"
+                    else:
+                        path_str = " -> ".join(proof_chain)
+                    meta_parts.append(f"path: {path_str}")
+
+            if m.get("cross_session"):
+                meta_parts.append("[cross-session]")
+                bridge = m.get("bridge_entity", {})
+                if bridge:
+                    meta_parts.append(f"via {bridge.get('type', 'entity')}: {bridge.get('name', '?')}")
+
+            meta_str = ", ".join(meta_parts)
+
+            # Truncate content to fit more memories
+            content = m["content"][:600]
+            if len(m["content"]) > 600:
+                content += "..."
+
+            formatted.append(f"[MEMORY {i}] ({meta_str})\n{content}\n")
+
+        return "\n".join(formatted)
