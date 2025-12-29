@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterator
 
 from simplemem_lite.config import Config
+from simplemem_lite.extractors import extract_entities_batch
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import MemoryItem, MemoryStore
 
@@ -313,8 +314,6 @@ class HierarchicalIndexer:
         await report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
 
         # 3. Batch store all chunk summaries (single embedding call!)
-        message_ids = []
-
         chunk_items = [
             MemoryItem(
                 content=summary,
@@ -332,9 +331,43 @@ class HierarchicalIndexer:
         chunk_ids = self.store.store_batch(chunk_items)
         log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
 
-        # 4. Generate session summary
+        # 4. Store interesting individual messages
+        await report(80, "Identifying interesting messages...")
+        interesting_msgs = [m for m in messages if self._is_interesting(m)]
+        log.info(f"Found {len(interesting_msgs)} interesting messages")
+
+        message_ids = []
+        if interesting_msgs:
+            # Cap at 50 to control costs
+            interesting_msgs = interesting_msgs[:50]
+
+            # Extract entities from interesting messages
+            await report(82, f"Extracting entities from {len(interesting_msgs)} messages...")
+            entities_list = await extract_entities_batch(
+                [m.content for m in interesting_msgs], self.config
+            )
+
+            msg_items = [
+                MemoryItem(
+                    content=msg.content[:2000],  # Cap content length
+                    metadata={
+                        "type": "message",
+                        "session_id": session_id,
+                        "source": "claude_trace",
+                        "msg_type": msg.type,
+                        **entities.to_metadata(),
+                    },
+                )
+                for msg, entities in zip(interesting_msgs, entities_list)
+            ]
+
+            await report(85, f"Storing {len(msg_items)} messages...")
+            message_ids = self.store.store_batch(msg_items)
+            log.info(f"Stored {len(message_ids)} interesting messages")
+
+        # 5. Generate session summary using chunk summaries (Map-Reduce)
         await report(90, "Generating session summary...")
-        session_summary = await self._summarize_session(messages, len(chunks))
+        session_summary = await self._summarize_session(messages, chunk_summaries)
 
         await report(95, "Storing session summary...")
         session_summary_id = self.store.store(
@@ -412,8 +445,80 @@ class HierarchicalIndexer:
 
         return False
 
+    def _is_interesting(self, msg: TraceMessage) -> bool:
+        """Determine if message should be stored individually.
+
+        Interesting messages are those likely to be useful for future debugging:
+        - Tool results with substantial content
+        - Messages containing errors or exceptions
+        - Messages with code blocks
+
+        Args:
+            msg: Message to evaluate
+
+        Returns:
+            True if message should be stored
+        """
+        import re
+
+        # Tool results with substantial content
+        if msg.type == "tool_result" and len(msg.content) > 100:
+            return True
+
+        # Messages with errors - use word boundaries to avoid false positives
+        # (e.g., "error-free", "no errors", etc.)
+        content_lower = msg.content.lower()
+        error_pattern = r'\b(error|exception|failed|traceback|stack\s*trace)\b'
+        if re.search(error_pattern, content_lower):
+            # Additional check: skip if negated
+            negation_pattern = r'\b(no|without|zero|0)\s+(errors?|exceptions?|failures?)\b'
+            if not re.search(negation_pattern, content_lower):
+                return True
+
+        # Messages with code blocks
+        if "```" in msg.content:
+            return True
+
+        return False
+
+    def _prepare_chunk_content(
+        self, chunk: list[TraceMessage], max_tokens: int = 3000
+    ) -> str:
+        """Prepare chunk content for summarization with token budget.
+
+        Prioritizes content by type: tool_result > assistant > user > tool_use
+
+        Args:
+            chunk: Messages in the chunk
+            max_tokens: Maximum token budget (~4 chars per token)
+
+        Returns:
+            Formatted content string within token budget
+        """
+        # Priority order: tool results are most informative
+        priority_order = {"tool_result": 0, "assistant": 1, "user": 2, "tool_use": 3}
+        sorted_msgs = sorted(chunk, key=lambda m: priority_order.get(m.type, 99))
+
+        content_parts = []
+        estimated_tokens = 0
+
+        for msg in sorted_msgs:
+            msg_tokens = len(msg.content) // 4  # ~4 chars per token estimate
+            if estimated_tokens + msg_tokens > max_tokens:
+                # Add truncated version if we have budget
+                remaining = (max_tokens - estimated_tokens) * 4
+                if remaining > 100:
+                    content_parts.append(f"[{msg.type}] {msg.content[:remaining]}...")
+                break
+            content_parts.append(f"[{msg.type}] {msg.content}")
+            estimated_tokens += msg_tokens
+
+        return "\n\n".join(content_parts)
+
     async def _summarize_chunk(self, chunk: list[TraceMessage]) -> str:
         """Generate summary for a message chunk.
+
+        Uses token-based content preparation to maximize context within limits.
 
         Args:
             chunk: Messages in the chunk
@@ -423,12 +528,8 @@ class HierarchicalIndexer:
         """
         from litellm import acompletion
 
-        # Prepare content for summarization
-        content_parts = []
-        for msg in chunk[:10]:  # Limit messages
-            content_parts.append(f"[{msg.type}] {msg.content[:500]}")
-
-        content = "\n\n".join(content_parts)
+        # Use token-based content preparation
+        content = self._prepare_chunk_content(chunk, max_tokens=3000)
 
         try:
             response = await acompletion(
@@ -439,7 +540,7 @@ class HierarchicalIndexer:
                         "content": f"""Summarize this Claude Code interaction in 2-3 sentences.
 Focus on: what problem was being solved, what tools were used, what was the outcome.
 
-{content[:4000]}""",
+{content}""",
                     }
                 ],
                 max_tokens=150,
@@ -447,26 +548,36 @@ Focus on: what problem was being solved, what tools were used, what was the outc
             return response.choices[0].message.content
         except Exception as e:
             # Fallback: simple extraction
+            log.warning(f"Chunk summarization failed: {e}")
             return f"Chunk with {len(chunk)} messages. First: {chunk[0].content[:100]}..."
 
     async def _summarize_session(
-        self, messages: list[TraceMessage], num_chunks: int
+        self,
+        messages: list[TraceMessage],
+        chunk_summaries: list[str],
     ) -> str:
-        """Generate session-level summary.
+        """Generate session-level summary using Map-Reduce pattern.
+
+        Synthesizes chunk summaries instead of just looking at first/last message.
 
         Args:
-            messages: All messages in session
-            num_chunks: Number of chunks created
+            messages: All messages in session (for stats)
+            chunk_summaries: List of chunk summary texts
 
         Returns:
             Session summary text
         """
         from litellm import acompletion
 
-        # Count message types
+        # Count message types for stats
         type_counts = {}
         for msg in messages:
             type_counts[msg.type] = type_counts.get(msg.type, 0) + 1
+
+        # Format chunk summaries (limit to first 15 for context window)
+        summaries_text = "\n".join(
+            f"- {s}" for s in chunk_summaries[:15]
+        )
 
         try:
             response = await acompletion(
@@ -474,22 +585,23 @@ Focus on: what problem was being solved, what tools were used, what was the outc
                 messages=[
                     {
                         "role": "user",
-                        "content": f"""Summarize this Claude Code session in 3-5 sentences.
+                        "content": f"""Synthesize this Claude Code session from the activity summaries below.
 
 Session stats:
 - {len(messages)} total messages
-- {num_chunks} distinct activities
+- {len(chunk_summaries)} distinct activities
 - Message types: {type_counts}
 
-First message: {messages[0].content[:200]}
-Last message: {messages[-1].content[:200]}
+Activity summaries:
+{summaries_text}
 
-Focus on: main goal, key decisions, final outcome, errors resolved.""",
+Provide a 3-5 sentence overview covering: main goal, key accomplishments, final state, any unresolved issues.""",
                     }
                 ],
-                max_tokens=200,
+                max_tokens=250,
             )
             return response.choices[0].message.content
         except Exception as e:
             # Fallback: basic summary
-            return f"Session with {len(messages)} messages across {num_chunks} activities."
+            log.warning(f"Session summarization failed: {e}")
+            return f"Session with {len(messages)} messages across {len(chunk_summaries)} activities."
