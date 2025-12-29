@@ -1,0 +1,119 @@
+"""Embedding generation for SimpleMem Lite.
+
+Provides embedding generation via LiteLLM with optional local fallback.
+"""
+
+from functools import lru_cache
+from typing import TYPE_CHECKING
+
+from simplemem_lite.config import Config
+from simplemem_lite.logging import get_logger
+
+if TYPE_CHECKING:
+    pass
+
+log = get_logger("embeddings")
+
+# Global config reference (set during initialization)
+_config: Config | None = None
+
+
+def init_embeddings(config: Config) -> None:
+    """Initialize embeddings module with configuration."""
+    global _config
+    _config = config
+    log.debug(f"Embeddings initialized: model={config.embedding_model}, local={config.use_local_embeddings}")
+
+
+@lru_cache(maxsize=1000)
+def _cached_embed(text: str, model: str, use_local: bool) -> tuple[float, ...]:
+    """Cached embedding generation (returns tuple for hashability)."""
+    return tuple(_embed_impl(text, model, use_local))
+
+
+def _embed_impl(text: str, model: str, use_local: bool) -> list[float]:
+    """Actual embedding generation implementation."""
+    if use_local:
+        return _embed_local(text)
+    else:
+        return _embed_litellm(text, model)
+
+
+def _embed_litellm(text: str, model: str) -> list[float]:
+    """Generate embedding via LiteLLM."""
+    from litellm import embedding
+
+    response = embedding(model=model, input=[text])
+    return response.data[0]["embedding"]
+
+
+def _embed_local(text: str) -> list[float]:
+    """Generate embedding via local sentence-transformers."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers not installed. "
+            "Install with: pip install sentence-transformers"
+        )
+
+    # Use a small, fast model
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embedding = model.encode(text, convert_to_numpy=True)
+    return embedding.tolist()
+
+
+def embed(text: str, config: Config | None = None) -> list[float]:
+    """Generate embedding for text.
+
+    Args:
+        text: Text to embed
+        config: Optional config override (uses global if not provided)
+
+    Returns:
+        List of floats representing the embedding vector
+    """
+    cfg = config or _config
+    if cfg is None:
+        cfg = Config()
+
+    log.trace(f"Embedding text: {len(text)} chars, model={cfg.embedding_model}")
+    # Use cached version
+    result = _cached_embed(text, cfg.embedding_model, cfg.use_local_embeddings)
+    log.trace(f"Embedding complete: dim={len(result)}")
+    return list(result)
+
+
+def embed_batch(texts: list[str], config: Config | None = None) -> list[list[float]]:
+    """Generate embeddings for multiple texts.
+
+    Args:
+        texts: List of texts to embed
+        config: Optional config override
+
+    Returns:
+        List of embedding vectors
+    """
+    cfg = config or _config
+    if cfg is None:
+        cfg = Config()
+
+    if cfg.use_local_embeddings:
+        # Local models support batch encoding
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers not installed. "
+                "Install with: pip install sentence-transformers"
+            )
+
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = model.encode(texts, convert_to_numpy=True)
+        return [e.tolist() for e in embeddings]
+    else:
+        # LiteLLM: batch via API
+        from litellm import embedding
+
+        response = embedding(model=cfg.embedding_model, input=texts)
+        return [d["embedding"] for d in response.data]
