@@ -397,7 +397,28 @@ class HierarchicalIndexer:
             message_ids = self.store.store_batch(msg_items)
             log.info(f"Stored {len(message_ids)} interesting messages")
 
-            # 4b. Create message relationships
+            # 4b. Create entity references for cross-session linking
+            entity_refs_created = 0
+            for msg_id, entities in zip(message_ids, entities_list):
+                # Link to file entities
+                for file_path in entities.file_paths[:5]:
+                    if self.store.add_entity_reference(msg_id, file_path, "file"):
+                        entity_refs_created += 1
+                # Link to tool entities
+                for tool in entities.tools[:5]:
+                    if self.store.add_entity_reference(msg_id, tool, "tool"):
+                        entity_refs_created += 1
+                # Link to error entities
+                for error in entities.errors[:3]:
+                    if self.store.add_entity_reference(msg_id, error, "error"):
+                        entity_refs_created += 1
+                # Link to command entities
+                for cmd in entities.commands[:3]:
+                    if self.store.add_entity_reference(msg_id, cmd, "command"):
+                        entity_refs_created += 1
+            log.info(f"Created {entity_refs_created} entity references")
+
+            # 4c. Create message relationships
             msg_relations_created = 0
             for i, (msg, msg_id) in enumerate(zip(interesting_msgs, message_ids)):
                 # message→chunk (child_of) - link message to its parent chunk

@@ -68,6 +68,14 @@ class Config:
         default_factory=lambda: _get_env("LOCAL_MODEL", "all-MiniLM-L6-v2")
     )
 
+    # FalkorDB connection settings
+    falkor_host: str = field(
+        default_factory=lambda: _get_env("FALKOR_HOST", "localhost")
+    )
+    falkor_port: int = field(
+        default_factory=lambda: int(_get_env("FALKOR_PORT", "6379"))
+    )
+
     @property
     def embedding_dim(self) -> int:
         """Get embedding dimension based on model."""
@@ -98,11 +106,12 @@ class Config:
         log.debug(f"summary_model={self.summary_model}")
         log.debug(f"use_local_embeddings={self.use_local_embeddings}")
         log.debug(f"embedding_dim={self.embedding_dim}")
+        log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}")
         log.info(f"Config initialized: data_dir={self.data_dir}, traces={self.claude_traces_dir}")
 
     @property
     def graph_dir(self) -> Path:
-        """Directory for KuzuDB graph database."""
+        """Directory for graph database (legacy, kept for compatibility)."""
         return self.data_dir / "graph"
 
     @property

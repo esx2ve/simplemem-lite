@@ -20,6 +20,7 @@ RELATION_WEIGHTS = {
     "contains": 1.0,    # Hierarchical drill-down
     "child_of": 1.0,    # Reverse contains
     "supports": 0.8,    # Evidence for conclusion
+    "references": 0.7,  # Entity reference (cross-session)
     "follows": 0.6,     # Temporal sequence
     "mentions": 0.4,    # Reference
     "relates": 0.3,     # Generic/weak
@@ -371,6 +372,36 @@ class MemoryStore:
             log.error(f"Failed to create relation: {e}")
             return False
 
+    def add_entity_reference(
+        self,
+        memory_id: str,
+        entity_name: str,
+        entity_type: str,
+        weight: float = 0.7,
+    ) -> bool:
+        """Link a memory to an entity node for cross-session reasoning.
+
+        Creates the entity node if it doesn't exist, then creates a REFERENCES
+        relationship from the memory to the entity.
+
+        Args:
+            memory_id: Memory UUID
+            entity_name: Entity name (e.g., "src/main.py", "Read", "ImportError")
+            entity_type: Entity type (file, tool, error, concept)
+            weight: Relationship weight (default: 0.7)
+
+        Returns:
+            True if reference was created
+        """
+        log.debug(f"Creating entity reference: {memory_id[:8]}... --[references]--> {entity_type}:{entity_name}")
+        try:
+            self.db.add_entity_reference(memory_id, entity_name, entity_type, weight)
+            log.trace(f"Entity reference created: {entity_type}:{entity_name}")
+            return True
+        except Exception as e:
+            log.warning(f"Failed to create entity reference: {e}")
+            return False
+
     def get(self, uuid: str) -> Memory | None:
         """Retrieve a specific memory by UUID.
 
@@ -389,8 +420,8 @@ class MemoryStore:
             {"uuid": uuid},
         )
 
-        if result.has_next():
-            row = result.get_next()
+        if result.result_set:
+            row = result.result_set[0]
             log.trace(f"Found memory: type={row[2]}")
             return Memory(
                 uuid=row[0],
@@ -456,8 +487,7 @@ class MemoryStore:
         )
 
         memories = []
-        while result.has_next():
-            row = result.get_next()
+        for row in result.result_set:
             memories.append(
                 Memory(
                     uuid=row[0],
@@ -479,28 +509,15 @@ class MemoryStore:
         """
         log.debug("Getting memory store stats")
 
-        # Count memories
-        result = self.db.execute_graph("MATCH (m:Memory) RETURN count(m)")
-        total_memories = result.get_next()[0] if result.has_next() else 0
+        # Use db.get_stats() which properly handles FalkorDB QueryResult
+        db_stats = self.db.get_stats()
 
-        # Count relationships
-        result = self.db.execute_graph("MATCH ()-[r:RELATES_TO]->() RETURN count(r)")
-        total_relations = result.get_next()[0] if result.has_next() else 0
-
-        # Count by type
-        result = self.db.execute_graph(
-            "MATCH (m:Memory) RETURN m.type, count(m) ORDER BY count(m) DESC"
-        )
-        types_breakdown = {}
-        while result.has_next():
-            row = result.get_next()
-            types_breakdown[row[0]] = row[1]
-
-        log.info(f"Stats: {total_memories} memories, {total_relations} relations")
+        log.info(f"Stats: {db_stats['memories']} memories, {db_stats['relations']} relations")
         return {
-            "total_memories": total_memories,
-            "total_relations": total_relations,
-            "types_breakdown": types_breakdown,
+            "total_memories": db_stats["memories"],
+            "total_relations": db_stats["relations"],
+            "types_breakdown": db_stats.get("entity_types", {}),
+            "entities": db_stats.get("entities", 0),
         }
 
     def _format_vector_results(self, results: list[dict]) -> list[Memory]:
@@ -610,6 +627,30 @@ class MemoryStore:
                         "proof_chain": path["edge_types"],
                         "hops": path["hops"],
                         "seed_uuid": seed_uuid,
+                    }
+
+            # Also get cross-session paths via entity nodes
+            cross_session_paths = self.db.get_cross_session_paths(seed_uuid, max_hops=max_hops)
+            for path in cross_session_paths:
+                end_uuid = path["end_uuid"]
+                path_score = self._score_path(path, seed_score)
+
+                # Add bridge entity info to proof chain
+                bridge = path.get("bridge_entity", {})
+                proof_chain = path["edge_types"] + [f"via:{bridge.get('type', 'entity')}:{bridge.get('name', '?')}"]
+
+                if end_uuid not in all_paths or path_score > all_paths[end_uuid]["score"]:
+                    all_paths[end_uuid] = {
+                        "uuid": end_uuid,
+                        "content": path["end_content"],
+                        "type": path["end_type"],
+                        "session_id": path["session_id"],
+                        "score": path_score,
+                        "proof_chain": proof_chain,
+                        "hops": path["hops"],
+                        "seed_uuid": seed_uuid,
+                        "cross_session": True,
+                        "bridge_entity": bridge,
                     }
 
         # Step 3: Also add seeds themselves (0-hop)

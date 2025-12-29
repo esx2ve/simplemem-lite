@@ -249,6 +249,10 @@ async def reason_memories(
     )
 
     log.info(f"Tool: reason_memories complete: {len(results)} conclusions")
+
+    # Count cross-session results
+    cross_session_count = sum(1 for r in results if r.get("cross_session"))
+
     return {
         "conclusions": [
             {
@@ -258,9 +262,12 @@ async def reason_memories(
                 "score": round(r["score"], 3),
                 "proof_chain": r["proof_chain"],
                 "hops": r["hops"],
+                "cross_session": r.get("cross_session", False),
+                "bridge_entity": r.get("bridge_entity"),
             }
             for r in results[:10]  # Limit to top 10
-        ]
+        ],
+        "cross_session_count": cross_session_count,
     }
 
 
