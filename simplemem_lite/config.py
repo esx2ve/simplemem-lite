@@ -44,7 +44,7 @@ class Config:
         data_dir: Directory for storing databases (default: ~/.simplemem_lite)
         embedding_model: LiteLLM model for embeddings (default: text-embedding-3-small)
         embedding_dim: Embedding dimension (default: 1536)
-        summary_model: Cheap LLM for summarization (default: gemini/gemini-2.0-flash-lite)
+        summary_model: Cheap LLM for summarization (default: gemini/gemini-2.5-flash-lite)
         claude_traces_dir: Claude Code traces location (default: ~/.claude/projects)
         use_local_embeddings: Use sentence-transformers instead of API (default: False)
     """
@@ -56,7 +56,7 @@ class Config:
         default_factory=lambda: _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
     )
     summary_model: str = field(
-        default_factory=lambda: _get_env("SUMMARY_MODEL", "gemini/gemini-2.0-flash-lite")
+        default_factory=lambda: _get_env("SUMMARY_MODEL", "gemini/gemini-2.5-flash-lite")
     )
     claude_traces_dir: Path = field(
         default_factory=lambda: Path(_get_env("CLAUDE_TRACES_DIR", str(Path.home() / ".claude" / "projects")))
