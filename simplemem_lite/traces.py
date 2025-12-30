@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Iterator
 
 from simplemem_lite.config import Config
-from simplemem_lite.extractors import extract_entities_batch
+from simplemem_lite.extractors import (
+    extract_entities_batch,
+    extract_with_actions_batch,
+    extract_goal,
+    EnhancedExtraction,
+)
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import MemoryItem, MemoryStore
 
@@ -46,12 +51,14 @@ class SessionIndex:
         session_summary_id: UUID of session summary memory
         chunk_summary_ids: UUIDs of chunk summary memories
         message_ids: UUIDs of individual message memories
+        goal_id: UUID of extracted goal (if any)
     """
 
     session_id: str
     session_summary_id: str
     chunk_summary_ids: list[str]
     message_ids: list[str]
+    goal_id: str | None = None
 
 
 class TraceParser:
@@ -287,6 +294,27 @@ class HierarchicalIndexer:
 
         log.info(f"Parsed {len(messages)} messages from session {session_id}")
 
+        # 0. Extract goal from first user message
+        goal_id = None
+        first_user_msg = next((m for m in messages if m.type == "user"), None)
+        if first_user_msg:
+            await report(7, "Extracting session goal...")
+            goal_text = await extract_goal(first_user_msg.content, self.config)
+            if goal_text:
+                import uuid
+                goal_id = str(uuid.uuid4())
+                try:
+                    self.store.db.add_goal_node(
+                        goal_id=goal_id,
+                        intent=goal_text,
+                        session_id=session_id,
+                        status="active",
+                    )
+                    log.info(f"Created Goal node: {goal_text[:50]}...")
+                except Exception as e:
+                    log.warning(f"Failed to create Goal node: {e}")
+                    goal_id = None
+
         # 1. Chunk messages by tool sequences
         chunks = self._chunk_by_tool_sequences(messages)
         await report(10, f"Created {len(chunks)} chunks, starting summarization...")
@@ -353,31 +381,37 @@ class HierarchicalIndexer:
         log.info(f"Found {len(interesting_msgs)} interesting messages")
 
         message_ids = []
+        extractions_list: list[EnhancedExtraction] = []
         if interesting_msgs:
             # Cap at 50 to control costs
             interesting_msgs = interesting_msgs[:50]
 
-            # Extract entities from interesting messages
-            await report(82, f"Extracting entities from {len(interesting_msgs)} messages...")
-            entities_list = await extract_entities_batch(
+            # Extract entities WITH actions using enhanced LLM extraction
+            await report(82, f"Extracting entities with actions from {len(interesting_msgs)} messages...")
+            extractions_list = await extract_with_actions_batch(
                 [m.content for m in interesting_msgs], self.config
             )
 
             msg_items = []
-            for msg, entities in zip(interesting_msgs, entities_list):
+            for msg, extraction in zip(interesting_msgs, extractions_list):
                 # Build searchable content with entity context appended
                 content = msg.content[:1800]  # Leave room for entity footer
 
                 # Append entity context for better semantic search
                 entity_parts = []
-                if entities.file_paths:
-                    entity_parts.append(f"Files: {', '.join(entities.file_paths[:5])}")
-                if entities.commands:
-                    entity_parts.append(f"Commands: {', '.join(entities.commands[:3])}")
-                if entities.errors:
-                    entity_parts.append(f"Errors: {', '.join(entities.errors[:2])}")
-                if entities.tools:
-                    entity_parts.append(f"Tools: {', '.join(entities.tools[:5])}")
+                files = [e.name for e in extraction.entities if e.type == "file"]
+                tools = [e.name for e in extraction.entities if e.type == "tool"]
+                commands = [e.name for e in extraction.entities if e.type == "command"]
+                errors = [e.name for e in extraction.entities if e.type == "error"]
+
+                if files:
+                    entity_parts.append(f"Files: {', '.join(files[:5])}")
+                if commands:
+                    entity_parts.append(f"Commands: {', '.join(commands[:3])}")
+                if errors:
+                    entity_parts.append(f"Errors: {', '.join(errors[:2])}")
+                if tools:
+                    entity_parts.append(f"Tools: {', '.join(tools[:5])}")
 
                 if entity_parts:
                     content += f"\n\n[Context: {' | '.join(entity_parts)}]"
@@ -389,7 +423,7 @@ class HierarchicalIndexer:
                         "session_id": session_id,
                         "source": "claude_trace",
                         "msg_type": msg.type,
-                        **entities.to_metadata(),
+                        **extraction.to_metadata(),
                     },
                 ))
 
@@ -397,26 +431,21 @@ class HierarchicalIndexer:
             message_ids = self.store.store_batch(msg_items)
             log.info(f"Stored {len(message_ids)} interesting messages")
 
-            # 4b. Create entity references for cross-session linking
-            entity_refs_created = 0
-            for msg_id, entities in zip(message_ids, entities_list):
-                # Link to file entities
-                for file_path in entities.file_paths[:5]:
-                    if self.store.add_entity_reference(msg_id, file_path, "file"):
-                        entity_refs_created += 1
-                # Link to tool entities
-                for tool in entities.tools[:5]:
-                    if self.store.add_entity_reference(msg_id, tool, "tool"):
-                        entity_refs_created += 1
-                # Link to error entities
-                for error in entities.errors[:3]:
-                    if self.store.add_entity_reference(msg_id, error, "error"):
-                        entity_refs_created += 1
-                # Link to command entities
-                for cmd in entities.commands[:3]:
-                    if self.store.add_entity_reference(msg_id, cmd, "command"):
-                        entity_refs_created += 1
-            log.info(f"Created {entity_refs_created} entity references")
+            # 4b. Create verb-specific edges for cross-session linking
+            verb_edges_created = 0
+            for msg_id, extraction in zip(message_ids, extractions_list):
+                for entity in extraction.entities[:15]:  # Cap at 15 per message
+                    try:
+                        self.store.add_verb_edge(
+                            memory_uuid=msg_id,
+                            entity_name=entity.name,
+                            entity_type=entity.type,
+                            action=entity.action,
+                        )
+                        verb_edges_created += 1
+                    except Exception as e:
+                        log.warning(f"Failed to create verb edge: {e}")
+            log.info(f"Created {verb_edges_created} verb-specific edges (READS/MODIFIES/EXECUTES/TRIGGERED)")
 
             # 4c. Create message relationships
             msg_relations_created = 0
@@ -451,6 +480,7 @@ class HierarchicalIndexer:
                     "type": "session_summary",
                     "session_id": session_id,
                     "source": "claude_trace",
+                    "goal_id": goal_id,
                 },
                 relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
             )
@@ -466,12 +496,28 @@ class HierarchicalIndexer:
                 log.warning(f"Failed to create chunk→session child_of relation: {e}")
         log.info(f"Created {child_of_created} chunk→session child_of relationships")
 
+        # 5c. Link session to goal if extracted
+        if goal_id:
+            try:
+                self.store.db.link_session_to_goal(session_summary_id, goal_id)
+                log.info(f"Linked session to Goal: {goal_id[:8]}...")
+
+                # Also link interesting messages to goal (ACHIEVES)
+                for msg_id in message_ids[:10]:  # Cap to prevent too many edges
+                    try:
+                        self.store.db.link_memory_to_goal(msg_id, goal_id)
+                    except Exception as e:
+                        log.trace(f"Failed to link message to goal: {e}")
+            except Exception as e:
+                log.warning(f"Failed to link session to goal: {e}")
+
         await report(100, "Complete!")
         return SessionIndex(
             session_id=session_id,
             session_summary_id=session_summary_id,
             chunk_summary_ids=chunk_ids,
             message_ids=message_ids,
+            goal_id=goal_id,
         )
 
     def _chunk_by_tool_sequences(

@@ -260,6 +260,8 @@ class DatabaseManager:
     ) -> None:
         """Link a memory to an entity (creates entity if not exists).
 
+        DEPRECATED: Use add_verb_edge() for more specific relationship types.
+
         Args:
             memory_uuid: Memory UUID
             entity_name: Entity name
@@ -284,6 +286,267 @@ class DatabaseManager:
                 "weight": weight,
             },
         )
+
+    # Allowed verb edge types for security validation
+    ALLOWED_VERB_EDGES = {"READS", "MODIFIES", "EXECUTES", "TRIGGERED", "REFERENCES"}
+
+    def add_verb_edge(
+        self,
+        memory_uuid: str,
+        entity_name: str,
+        entity_type: str,
+        action: str,
+        timestamp: int | None = None,
+        change_summary: str | None = None,
+    ) -> None:
+        """Add a verb-specific edge between memory and entity.
+
+        Supports semantic edge types: READS, MODIFIES, EXECUTES, TRIGGERED.
+        Automatically increments entity version on MODIFIES.
+
+        Args:
+            memory_uuid: Memory UUID
+            entity_name: Entity name (will be canonicalized)
+            entity_type: Entity type (file, tool, command, error)
+            action: Action type (reads, modifies, executes, triggered)
+            timestamp: Optional timestamp for the action
+            change_summary: Optional summary of changes (for modifies)
+        """
+        import time
+
+        # Canonicalize entity name
+        canonical_name = self._canonicalize_entity(entity_name, entity_type)
+        safe_name = canonical_name.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+
+        # Map action to edge type with security validation
+        action_to_edge = {
+            "reads": "READS",
+            "modifies": "MODIFIES",
+            "executes": "EXECUTES",
+            "triggered": "TRIGGERED",
+        }
+        edge_type = action_to_edge.get(action.lower(), "REFERENCES")
+
+        # Security: validate edge type to prevent Cypher injection
+        if edge_type not in self.ALLOWED_VERB_EDGES:
+            log.error(f"Invalid edge type attempted: {edge_type}")
+            raise ValueError(f"Invalid edge type: {edge_type}")
+
+        # Ensure entity exists with version property
+        if action.lower() == "modifies":
+            # Increment version on MODIFIES
+            self.graph.query(
+                """
+                MERGE (e:Entity {name: $name, type: $type})
+                ON CREATE SET e.created_at = timestamp(), e.version = 1
+                ON MATCH SET e.version = COALESCE(e.version, 0) + 1, e.last_modified = timestamp()
+                """,
+                {"name": safe_name, "type": entity_type},
+            )
+        else:
+            # Just ensure entity exists
+            self.graph.query(
+                """
+                MERGE (e:Entity {name: $name, type: $type})
+                ON CREATE SET e.created_at = timestamp(), e.version = 1
+                """,
+                {"name": safe_name, "type": entity_type},
+            )
+
+        # Create the verb-specific edge
+        ts = timestamp or int(time.time())
+        if change_summary:
+            safe_summary = change_summary.replace("\\", "\\\\").replace("'", "\\'")[:500]
+            self.graph.query(
+                f"""
+                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
+                CREATE (m)-[:{edge_type} {{timestamp: $ts, change_summary: $summary}}]->(e)
+                """,
+                {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts, "summary": safe_summary},
+            )
+        else:
+            self.graph.query(
+                f"""
+                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
+                CREATE (m)-[:{edge_type} {{timestamp: $ts}}]->(e)
+                """,
+                {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts},
+            )
+
+        log.trace(f"Added {edge_type} edge: memory={memory_uuid[:8]}... -> {entity_type}:{canonical_name}")
+
+    def _canonicalize_entity(self, name: str, entity_type: str) -> str:
+        """Canonicalize entity name for consistent deduplication.
+
+        Args:
+            name: Raw entity name
+            entity_type: Entity type
+
+        Returns:
+            Canonicalized entity name
+        """
+        import os
+        import hashlib
+
+        if entity_type == "file":
+            # Normalize file paths - resolve to absolute, handle symlinks
+            try:
+                if os.path.isabs(name):
+                    return os.path.normpath(name)
+                # For relative paths, just normalize
+                return os.path.normpath(name)
+            except Exception:
+                return name
+
+        elif entity_type == "tool":
+            # Normalize tool names - lowercase, strip common prefixes
+            normalized = name.lower()
+            normalized = normalized.replace("mcp__", "").replace("__", ":")
+            return normalized
+
+        elif entity_type == "command":
+            # Extract base command (first word)
+            parts = name.strip().split()
+            return parts[0].lower() if parts else name
+
+        elif entity_type == "error":
+            # Hash error type + message prefix for deduplication
+            error_hash = hashlib.sha256(name[:200].encode()).hexdigest()[:16]
+            return f"error:{error_hash}"
+
+        return name
+
+    def add_goal_node(
+        self,
+        goal_id: str,
+        intent: str,
+        session_id: str,
+        status: str = "active",
+    ) -> None:
+        """Add a Goal node for intent-based retrieval.
+
+        Args:
+            goal_id: Unique goal identifier
+            intent: User's objective description
+            session_id: Associated session ID
+            status: Goal status (active, completed, abandoned)
+        """
+        safe_intent = intent.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')[:1000]
+
+        self.graph.query(
+            """
+            CREATE (g:Goal {
+                id: $goal_id,
+                intent: $intent,
+                session_id: $session_id,
+                status: $status,
+                created_at: timestamp()
+            })
+            """,
+            {
+                "goal_id": goal_id,
+                "intent": safe_intent,
+                "session_id": session_id,
+                "status": status,
+            },
+        )
+        log.trace(f"Created Goal node: {goal_id[:8]}... intent={intent[:50]}...")
+
+    def link_session_to_goal(
+        self,
+        session_summary_uuid: str,
+        goal_id: str,
+    ) -> None:
+        """Link a session summary to a goal with HAS_GOAL edge.
+
+        Args:
+            session_summary_uuid: Session summary memory UUID
+            goal_id: Goal node ID
+        """
+        self.graph.query(
+            """
+            MATCH (m:Memory {uuid: $uuid}), (g:Goal {id: $goal_id})
+            CREATE (m)-[:HAS_GOAL]->(g)
+            """,
+            {"uuid": session_summary_uuid, "goal_id": goal_id},
+        )
+
+    def link_memory_to_goal(
+        self,
+        memory_uuid: str,
+        goal_id: str,
+    ) -> None:
+        """Link a memory to a goal with ACHIEVES edge.
+
+        Args:
+            memory_uuid: Memory UUID that contributed to the goal
+            goal_id: Goal node ID
+        """
+        self.graph.query(
+            """
+            MATCH (m:Memory {uuid: $uuid}), (g:Goal {id: $goal_id})
+            CREATE (m)-[:ACHIEVES]->(g)
+            """,
+            {"uuid": memory_uuid, "goal_id": goal_id},
+        )
+
+    def migrate_references_to_verbs(self) -> dict[str, int]:
+        """Migrate existing REFERENCES edges to verb-specific edges.
+
+        Converts based on entity type:
+        - file -> READS (safe default)
+        - tool -> EXECUTES
+        - command -> EXECUTES
+        - error -> TRIGGERED
+
+        Returns:
+            Dictionary with migration counts
+        """
+        log.info("Starting migration of REFERENCES edges to verb-specific edges")
+
+        counts = {"reads": 0, "executes": 0, "triggered": 0, "total": 0}
+
+        # Get all REFERENCES edges with their entity types
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)-[r:REFERENCES]->(e:Entity)
+            RETURN m.uuid, e.name, e.type, r.weight
+            """
+        )
+
+        for record in result.result_set:
+            memory_uuid, entity_name, entity_type, weight = record
+            counts["total"] += 1
+
+            # Determine target edge type
+            if entity_type == "file":
+                edge_type = "READS"
+                counts["reads"] += 1
+            elif entity_type in ("tool", "command"):
+                edge_type = "EXECUTES"
+                counts["executes"] += 1
+            elif entity_type == "error":
+                edge_type = "TRIGGERED"
+                counts["triggered"] += 1
+            else:
+                edge_type = "READS"
+                counts["reads"] += 1
+
+            # Create new edge
+            safe_name = entity_name.replace("\\", "\\\\").replace("'", "\\'")
+            self.graph.query(
+                f"""
+                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
+                CREATE (m)-[:{edge_type} {{timestamp: timestamp(), migrated: true}}]->(e)
+                """,
+                {"uuid": memory_uuid, "name": safe_name, "type": entity_type},
+            )
+
+        # Delete old REFERENCES edges
+        self.graph.query("MATCH ()-[r:REFERENCES]->() DELETE r")
+
+        log.info(f"Migration complete: {counts}")
+        return counts
 
     def delete_memory_node(self, uuid: str) -> None:
         """Delete a memory node from the graph (for rollback).
