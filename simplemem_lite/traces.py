@@ -52,6 +52,7 @@ class SessionIndex:
         chunk_summary_ids: UUIDs of chunk summary memories
         message_ids: UUIDs of individual message memories
         goal_id: UUID of extracted goal (if any)
+        project_id: Project identifier (if any)
     """
 
     session_id: str
@@ -59,6 +60,7 @@ class SessionIndex:
     chunk_summary_ids: list[str]
     message_ids: list[str]
     goal_id: str | None = None
+    project_id: str | None = None
 
 
 class TraceParser:
@@ -204,10 +206,11 @@ class TraceParser:
         if entry.get("type") == "tool_use":
             tool_name = entry.get("name", "unknown")
             tool_input = entry.get("input", {})
+            # Increased from 200 to 2000 to preserve file paths for context merge
             if isinstance(tool_input, dict):
-                input_preview = str(tool_input)[:200]
+                input_preview = str(tool_input)[:2000]
             else:
-                input_preview = str(tool_input)[:200]
+                input_preview = str(tool_input)[:2000]
             return f"[Tool: {tool_name}] {input_preview}"
 
         if entry.get("type") == "tool_result":
@@ -380,16 +383,32 @@ class HierarchicalIndexer:
         interesting_msgs = [m for m in messages if self._is_interesting(m)]
         log.info(f"Found {len(interesting_msgs)} interesting messages")
 
+        # Build uuid→message lookup for context merging
+        msg_by_uuid: dict[str, TraceMessage] = {m.uuid: m for m in messages}
+
         message_ids = []
         extractions_list: list[EnhancedExtraction] = []
         if interesting_msgs:
             # Cap at 50 to control costs
             interesting_msgs = interesting_msgs[:50]
 
+            # Build extraction contents with context merge (tool_use + tool_result)
+            # This solves the "0 READS" issue by giving the LLM both filename AND content
+            extraction_contents = []
+            for msg in interesting_msgs:
+                content = msg.content
+                # If this is a tool_result, prepend the tool_use context
+                if msg.type == "tool_result" and msg.parent_uuid:
+                    parent = msg_by_uuid.get(msg.parent_uuid)
+                    if parent and parent.type == "tool_use":
+                        # Merge: LLM sees tool name + args + result together
+                        content = f"Tool call: {parent.content}\n\nResult:\n{msg.content}"
+                extraction_contents.append(content)
+
             # Extract entities WITH actions using enhanced LLM extraction
             await report(82, f"Extracting entities with actions from {len(interesting_msgs)} messages...")
             extractions_list = await extract_with_actions_batch(
-                [m.content for m in interesting_msgs], self.config
+                extraction_contents, self.config
             )
 
             msg_items = []
@@ -511,6 +530,24 @@ class HierarchicalIndexer:
             except Exception as e:
                 log.warning(f"Failed to link session to goal: {e}")
 
+        # 5d. Create Project node and link session (BELONGS_TO)
+        # Extract project ID from session path: ~/.claude/projects/{project_dir}/{session}.jsonl
+        project_dir = None
+        try:
+            project_dir = session_path.parent.name  # e.g., "-Users-shimon-repo-simplemem"
+            if project_dir and project_dir != "projects":
+                # Convert path-encoded directory back to readable form for display
+                project_path_display = project_dir.replace("-", "/").lstrip("/")
+                self.store.db.add_project_node(
+                    project_id=project_dir,  # Use raw dir name as unique ID
+                    project_path=project_path_display,  # Human-readable path
+                )
+                self.store.db.link_session_to_project(session_summary_id, project_dir)
+                log.info(f"Linked session to Project: {project_path_display}")
+        except Exception as e:
+            log.warning(f"Failed to create/link project: {e}")
+            project_dir = None
+
         await report(100, "Complete!")
         return SessionIndex(
             session_id=session_id,
@@ -518,6 +555,7 @@ class HierarchicalIndexer:
             chunk_summary_ids=chunk_ids,
             message_ids=message_ids,
             goal_id=goal_id,
+            project_id=project_dir,
         )
 
     def _chunk_by_tool_sequences(

@@ -353,12 +353,25 @@ class DatabaseManager:
         import hashlib
 
         if entity_type == "file":
-            # Normalize file paths - resolve to absolute, handle symlinks
+            # Normalize file paths for consistent deduplication
             try:
-                if os.path.isabs(name):
-                    return os.path.normpath(name)
-                # For relative paths, just normalize
-                return os.path.normpath(name)
+                # Clean up the path
+                clean_name = name.strip().strip("'\"")
+                normalized = os.path.normpath(clean_name)
+
+                # Strip home directory prefix to make paths project-relative
+                # This helps deduplicate: /Users/foo/repo/myproj/main.py → myproj/main.py
+                home = os.path.expanduser("~")
+                if normalized.startswith(home):
+                    # Remove home prefix, keep from first meaningful directory
+                    relative = normalized[len(home):].lstrip(os.sep)
+                    # Skip only definitive container directories (not project dirs like "src")
+                    parts = relative.split(os.sep)
+                    if len(parts) > 1 and parts[0] in ("repo", "repos", "projects", "dev", "work"):
+                        return os.sep.join(parts[1:])  # Skip the container prefix
+                    return relative
+
+                return normalized
             except Exception:
                 return name
 
@@ -369,13 +382,28 @@ class DatabaseManager:
             return normalized
 
         elif entity_type == "command":
-            # Extract base command (first word)
+            # Keep 2-word for common driver commands (git commit, npm install, etc.)
             parts = name.strip().split()
-            return parts[0].lower() if parts else name
+            if not parts:
+                return name
+            base = parts[0].lower()
+            # Common drivers where subcommand is semantically important
+            command_drivers = {"git", "npm", "pip", "docker", "kubectl", "python", "node", "yarn", "cargo", "go"}
+            if base in command_drivers and len(parts) > 1:
+                return f"{base} {parts[1].lower()}"
+            return base
 
         elif entity_type == "error":
-            # Hash error type + message prefix for deduplication
-            error_hash = hashlib.sha256(name[:200].encode()).hexdigest()[:16]
+            # Extract exception type for better deduplication
+            # "ValueError: invalid input" → "error:valueerror"
+            # "TypeError: cannot..." → "error:typeerror"
+            import re
+            # Match common exception patterns
+            match = re.match(r"^(\w+(?:Error|Exception|Warning|Failure))", name, re.IGNORECASE)
+            if match:
+                return f"error:{match.group(1).lower()}"
+            # Fallback: hash for unrecognized error formats
+            error_hash = hashlib.sha256(name[:200].encode()).hexdigest()[:12]
             return f"error:{error_hash}"
 
         return name
@@ -453,6 +481,51 @@ class DatabaseManager:
             """,
             {"uuid": memory_uuid, "goal_id": goal_id},
         )
+
+    def add_project_node(
+        self,
+        project_id: str,
+        project_path: str,
+    ) -> None:
+        """Add or update a Project node for session scoping.
+
+        Projects enable cross-session linking even without shared files.
+
+        Args:
+            project_id: Unique project identifier (derived from path)
+            project_path: Original project path
+        """
+        safe_path = project_path.replace("\\", "\\\\").replace("'", "\\'")[:500]
+
+        self.graph.query(
+            """
+            MERGE (p:Project {id: $project_id})
+            ON CREATE SET p.path = $path, p.created_at = timestamp(), p.session_count = 1
+            ON MATCH SET p.session_count = p.session_count + 1, p.last_updated = timestamp()
+            """,
+            {"project_id": project_id, "path": safe_path},
+        )
+        log.trace(f"Created/updated Project node: {project_id}")
+
+    def link_session_to_project(
+        self,
+        session_summary_uuid: str,
+        project_id: str,
+    ) -> None:
+        """Link a session summary to a project with BELONGS_TO edge.
+
+        Args:
+            session_summary_uuid: Session summary memory UUID
+            project_id: Project node ID
+        """
+        self.graph.query(
+            """
+            MATCH (m:Memory {uuid: $uuid}), (p:Project {id: $project_id})
+            CREATE (m)-[:BELONGS_TO]->(p)
+            """,
+            {"uuid": session_summary_uuid, "project_id": project_id},
+        )
+        log.trace(f"Linked session {session_summary_uuid[:8]}... to project {project_id}")
 
     def delete_memory_node(self, uuid: str) -> None:
         """Delete a memory node from the graph (for rollback).
@@ -739,6 +812,9 @@ class DatabaseManager:
         result = self.graph.query("MATCH (g:Goal) RETURN count(g)")
         goal_count = result.result_set[0][0] if result.result_set else 0
 
+        result = self.graph.query("MATCH (p:Project) RETURN count(p)")
+        project_count = result.result_set[0][0] if result.result_set else 0
+
         result = self.graph.query("MATCH ()-[r]->() RETURN count(r)")
         relation_count = result.result_set[0][0] if result.result_set else 0
 
@@ -760,6 +836,7 @@ class DatabaseManager:
             "memories": memory_count,
             "entities": entity_count,
             "goals": goal_count,
+            "projects": project_count,
             "relations": relation_count,
             "entity_types": entity_breakdown,
             "verb_edges": verb_edges,
