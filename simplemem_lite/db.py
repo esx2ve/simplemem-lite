@@ -251,42 +251,6 @@ class DatabaseManager:
             },
         )
 
-    def add_entity_reference(
-        self,
-        memory_uuid: str,
-        entity_name: str,
-        entity_type: str,
-        weight: float = 0.7,
-    ) -> None:
-        """Link a memory to an entity (creates entity if not exists).
-
-        DEPRECATED: Use add_verb_edge() for more specific relationship types.
-
-        Args:
-            memory_uuid: Memory UUID
-            entity_name: Entity name
-            entity_type: Entity type (file, tool, error, concept)
-            weight: Relationship weight
-        """
-        safe_name = entity_name.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-
-        # First ensure entity exists
-        self.add_entity_node(entity_name, entity_type)
-
-        # Then create the reference
-        self.graph.query(
-            """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:REFERENCES {weight: $weight}]->(e)
-            """,
-            {
-                "uuid": memory_uuid,
-                "name": safe_name,
-                "type": entity_type,
-                "weight": weight,
-            },
-        )
-
     # Allowed verb edge types for security validation
     ALLOWED_VERB_EDGES = {"READS", "MODIFIES", "EXECUTES", "TRIGGERED", "REFERENCES"}
 
@@ -489,64 +453,6 @@ class DatabaseManager:
             """,
             {"uuid": memory_uuid, "goal_id": goal_id},
         )
-
-    def migrate_references_to_verbs(self) -> dict[str, int]:
-        """Migrate existing REFERENCES edges to verb-specific edges.
-
-        Converts based on entity type:
-        - file -> READS (safe default)
-        - tool -> EXECUTES
-        - command -> EXECUTES
-        - error -> TRIGGERED
-
-        Returns:
-            Dictionary with migration counts
-        """
-        log.info("Starting migration of REFERENCES edges to verb-specific edges")
-
-        counts = {"reads": 0, "executes": 0, "triggered": 0, "total": 0}
-
-        # Get all REFERENCES edges with their entity types
-        result = self.graph.query(
-            """
-            MATCH (m:Memory)-[r:REFERENCES]->(e:Entity)
-            RETURN m.uuid, e.name, e.type, r.weight
-            """
-        )
-
-        for record in result.result_set:
-            memory_uuid, entity_name, entity_type, weight = record
-            counts["total"] += 1
-
-            # Determine target edge type
-            if entity_type == "file":
-                edge_type = "READS"
-                counts["reads"] += 1
-            elif entity_type in ("tool", "command"):
-                edge_type = "EXECUTES"
-                counts["executes"] += 1
-            elif entity_type == "error":
-                edge_type = "TRIGGERED"
-                counts["triggered"] += 1
-            else:
-                edge_type = "READS"
-                counts["reads"] += 1
-
-            # Create new edge
-            safe_name = entity_name.replace("\\", "\\\\").replace("'", "\\'")
-            self.graph.query(
-                f"""
-                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
-                CREATE (m)-[:{edge_type} {{timestamp: timestamp(), migrated: true}}]->(e)
-                """,
-                {"uuid": memory_uuid, "name": safe_name, "type": entity_type},
-            )
-
-        # Delete old REFERENCES edges
-        self.graph.query("MATCH ()-[r:REFERENCES]->() DELETE r")
-
-        log.info(f"Migration complete: {counts}")
-        return counts
 
     def delete_memory_node(self, uuid: str) -> None:
         """Delete a memory node from the graph (for rollback).
@@ -819,10 +725,10 @@ class DatabaseManager:
         }
 
     def get_stats(self) -> dict[str, Any]:
-        """Get graph statistics including entity counts.
+        """Get graph statistics including entity and verb edge counts.
 
         Returns:
-            Dictionary with memory, entity, and relationship counts
+            Dictionary with memory, entity, goal, and relationship counts
         """
         result = self.graph.query("MATCH (m:Memory) RETURN count(m)")
         memory_count = result.result_set[0][0] if result.result_set else 0
@@ -830,9 +736,13 @@ class DatabaseManager:
         result = self.graph.query("MATCH (e:Entity) RETURN count(e)")
         entity_count = result.result_set[0][0] if result.result_set else 0
 
+        result = self.graph.query("MATCH (g:Goal) RETURN count(g)")
+        goal_count = result.result_set[0][0] if result.result_set else 0
+
         result = self.graph.query("MATCH ()-[r]->() RETURN count(r)")
         relation_count = result.result_set[0][0] if result.result_set else 0
 
+        # Entity type breakdown
         result = self.graph.query(
             "MATCH (e:Entity) RETURN e.type, count(e) ORDER BY count(e) DESC"
         )
@@ -840,11 +750,19 @@ class DatabaseManager:
         for record in result.result_set:
             entity_breakdown[record[0]] = record[1]
 
+        # Verb edge breakdown
+        verb_edges = {}
+        for edge_type in ["READS", "MODIFIES", "EXECUTES", "TRIGGERED"]:
+            result = self.graph.query(f"MATCH ()-[r:{edge_type}]->() RETURN count(r)")
+            verb_edges[edge_type.lower()] = result.result_set[0][0] if result.result_set else 0
+
         return {
             "memories": memory_count,
             "entities": entity_count,
+            "goals": goal_count,
             "relations": relation_count,
             "entity_types": entity_breakdown,
+            "verb_edges": verb_edges,
         }
 
     def get_pagerank_scores(

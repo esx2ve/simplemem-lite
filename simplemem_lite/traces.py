@@ -436,7 +436,7 @@ class HierarchicalIndexer:
             for msg_id, extraction in zip(message_ids, extractions_list):
                 for entity in extraction.entities[:15]:  # Cap at 15 per message
                     try:
-                        self.store.add_verb_edge(
+                        self.store.db.add_verb_edge(
                             memory_uuid=msg_id,
                             entity_name=entity.name,
                             entity_type=entity.type,

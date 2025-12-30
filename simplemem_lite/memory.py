@@ -373,34 +373,45 @@ class MemoryStore:
             log.error(f"Failed to create relation: {e}")
             return False
 
-    def add_entity_reference(
+    def add_verb_edge(
         self,
         memory_id: str,
         entity_name: str,
         entity_type: str,
-        weight: float = 0.7,
+        action: str,
+        timestamp: int | None = None,
+        change_summary: str | None = None,
     ) -> bool:
-        """Link a memory to an entity node for cross-session reasoning.
+        """Link a memory to an entity with a verb-specific edge.
 
-        Creates the entity node if it doesn't exist, then creates a REFERENCES
-        relationship from the memory to the entity.
+        Creates the entity node if it doesn't exist, then creates a semantic
+        edge (READS, MODIFIES, EXECUTES, or TRIGGERED) from the memory to the entity.
 
         Args:
             memory_id: Memory UUID
             entity_name: Entity name (e.g., "src/main.py", "Read", "ImportError")
-            entity_type: Entity type (file, tool, error, concept)
-            weight: Relationship weight (default: 0.7)
+            entity_type: Entity type (file, tool, command, error)
+            action: Action type (reads, modifies, executes, triggered)
+            timestamp: Optional timestamp for the action
+            change_summary: Optional summary of changes (for modifies)
 
         Returns:
-            True if reference was created
+            True if edge was created
         """
-        log.debug(f"Creating entity reference: {memory_id[:8]}... --[references]--> {entity_type}:{entity_name}")
+        log.debug(f"Creating verb edge: {memory_id[:8]}... --[{action}]--> {entity_type}:{entity_name}")
         try:
-            self.db.add_entity_reference(memory_id, entity_name, entity_type, weight)
-            log.trace(f"Entity reference created: {entity_type}:{entity_name}")
+            self.db.add_verb_edge(
+                memory_uuid=memory_id,
+                entity_name=entity_name,
+                entity_type=entity_type,
+                action=action,
+                timestamp=timestamp,
+                change_summary=change_summary,
+            )
+            log.trace(f"Verb edge created: {action.upper()} -> {entity_type}:{entity_name}")
             return True
         except Exception as e:
-            log.warning(f"Failed to create entity reference: {e}")
+            log.warning(f"Failed to create verb edge: {e}")
             return False
 
     def get(self, uuid: str) -> Memory | None:
