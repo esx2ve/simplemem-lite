@@ -12,6 +12,91 @@ from simplemem_lite.logging import get_logger
 log = get_logger("extractors")
 
 
+async def _validate_entities_llm(
+    entities: list[dict],
+    config: Config,
+) -> list[dict]:
+    """Validate extracted entities using LLM to filter hallucinations.
+
+    Uses a lightweight LLM call to semantically identify and remove:
+    - Schema leakage (verb_edges.*, entity_types.*)
+    - Prompt examples (path/file.py, src/main.py)
+    - Placeholders (file, path, filename)
+    - Python functions misclassified as tools
+
+    Args:
+        entities: List of entity dicts with name, type, action
+        config: Config for LLM model
+
+    Returns:
+        Filtered list of valid entities
+    """
+    from litellm import acompletion
+    import json
+
+    if not entities:
+        return []
+
+    # Build entity list for validation
+    entity_json = json.dumps(entities, indent=2)
+
+    try:
+        response = await acompletion(
+            model=config.summary_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Review these extracted entities and REMOVE invalid ones.
+
+REMOVE entities that are:
+1. Schema/internal references (containing "verb_edges.", "entity_types.", etc.)
+2. Example paths from prompts (path/file.py, src/main.py, example.py, file.py)
+3. Generic placeholders (file, path, filename, filepath)
+4. Python functions/methods being edited (ending with "()" like add_verb_edge())
+   - KEEP actual tools: Read, Edit, Bash, Grep, Glob, Write, mcp__*, pal:*
+5. Single-word CLI drivers without subcommand (just "git" without "commit")
+
+Entities to validate:
+{entity_json}
+
+Return ONLY the valid entities as a JSON array. If all are invalid, return [].
+Return ONLY JSON, no explanation.""",
+                }
+            ],
+            max_tokens=500,
+        )
+
+        content = response.choices[0].message.content
+
+        # Extract JSON array from response
+        import re
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+        if json_match:
+            content = json_match.group()
+
+        validated = json.loads(content)
+
+        if not isinstance(validated, list):
+            log.warning("LLM validation returned non-list, using original")
+            return entities
+
+        # Filter to only dicts with required fields
+        result = []
+        for item in validated:
+            if isinstance(item, dict) and "name" in item and "type" in item:
+                result.append(item)
+
+        removed_count = len(entities) - len(result)
+        if removed_count > 0:
+            log.debug(f"LLM validation removed {removed_count} invalid entities")
+
+        return result
+
+    except Exception as e:
+        log.warning(f"LLM entity validation failed: {e}, using unfiltered entities")
+        return entities
+
+
 @dataclass
 class ExtractedEntity:
     """A single extracted entity with action type.
@@ -230,33 +315,38 @@ async def extract_with_actions(
             messages=[
                 {
                     "role": "user",
-                    "content": f"""Analyze this code interaction and extract entities with their actions.
+                    "content": f"""Extract entities from this code interaction.
 
-For each entity, determine the action type:
-- reads: File was opened/viewed but NOT changed
-- modifies: File was created/edited/written/deleted
+Action types:
+- reads: File opened/viewed but NOT changed
+- modifies: File created/edited/deleted
 - executes: Tool or command was run
-- triggered: Error/exception was caused by an action
+- triggered: Error was caused
 
 Entity types:
-- file: File paths (e.g., src/main.py, config.json)
-- tool: Tools/functions called (e.g., Read, Edit, Bash, Grep)
-- command: CLI commands (e.g., git commit, npm install)
+- file: Actual file paths from the project (NOT example paths)
+- tool: Agent tools that were INVOKED (Read, Edit, Bash, Grep, Glob, Write, mcp__*, pal:*)
+- command: CLI commands executed (git commit, npm install, docker build)
 - error: Error messages/exceptions
+
+IMPORTANT:
+- Only extract REAL entities from the text, not example paths
+- Tools are agent tools being CALLED, not Python functions in the code being edited
+- Do NOT include: path/file.py, src/main.py, example.py (these are examples, not real)
 
 Text:
 {text_sample}
 
 Return ONLY valid JSON:
-{{"entities": [{{"name": "path/file.py", "type": "file", "action": "modifies"}}, {{"name": "Read", "type": "tool", "action": "executes"}}]{goal_field}}}
+{{"entities": [{{"name": "actual/file.ts", "type": "file", "action": "modifies"}}]{goal_field}}}
 
 Rules:
-- Empty arrays if no entities found
-- Use lowercase for action values
-- For tools: action is always "executes"
-- For errors: action is always "triggered"
-- For files: determine if read-only ("reads") or modified ("modifies")
-- For commands: action is always "executes\"""",
+- Empty array if no real entities found
+- Lowercase action values
+- tools: action is always "executes"
+- errors: action is always "triggered"
+- files: "reads" if viewed only, "modifies" if changed
+- commands: action is always "executes\"""",
                 }
             ],
             max_tokens=400,
@@ -275,9 +365,9 @@ Rules:
             log.warning("Enhanced extraction returned non-dict")
             return EnhancedExtraction()
 
-        # Parse entities
-        entities = []
+        # Parse entities - first pass: extract and normalize
         raw_entities = data.get("entities", [])
+        parsed_entities = []
         if isinstance(raw_entities, list):
             for item in raw_entities[:20]:  # Cap at 20
                 if isinstance(item, dict):
@@ -300,7 +390,17 @@ Rules:
                         action = "reads"  # Default for files
 
                     if name:
-                        entities.append(ExtractedEntity(name=name, type=etype, action=action))
+                        parsed_entities.append({"name": name, "type": etype, "action": action})
+
+        # LLM-based validation: filter hallucinations and schema leakage
+        validated_entities = await _validate_entities_llm(parsed_entities, config)
+
+        # Convert to ExtractedEntity objects
+        entities = [
+            ExtractedEntity(name=e["name"], type=e["type"], action=e.get("action", "reads"))
+            for e in validated_entities
+            if isinstance(e, dict) and "name" in e and "type" in e
+        ]
 
         # Parse goal if requested
         goal = None

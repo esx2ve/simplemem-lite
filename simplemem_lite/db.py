@@ -339,6 +339,30 @@ class DatabaseManager:
 
         log.trace(f"Added {edge_type} edge: memory={memory_uuid[:8]}... -> {entity_type}:{canonical_name}")
 
+        # Infer READS from MODIFIES: you can't modify what you haven't read
+        # Only for files - tools/commands don't have this semantic
+        if edge_type == "MODIFIES" and entity_type == "file":
+            # Check if READS edge already exists for this memory->entity
+            check_result = self.graph.query(
+                """
+                MATCH (m:Memory {uuid: $uuid})-[r:READS]->(e:Entity {name: $name, type: $type})
+                RETURN count(r) as cnt
+                """,
+                {"uuid": memory_uuid, "name": safe_name, "type": entity_type},
+            )
+            reads_exists = check_result.result_set and check_result.result_set[0][0] > 0
+
+            if not reads_exists:
+                # Create implicit READS edge (before the modify)
+                self.graph.query(
+                    """
+                    MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+                    CREATE (m)-[:READS {timestamp: $ts, implicit: true}]->(e)
+                    """,
+                    {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts - 1},
+                )
+                log.trace(f"Added implicit READS edge for MODIFIES: {entity_type}:{canonical_name}")
+
     def _canonicalize_entity(self, name: str, entity_type: str) -> str:
         """Canonicalize entity name for consistent deduplication.
 
