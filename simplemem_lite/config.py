@@ -76,6 +76,17 @@ class Config:
         default_factory=lambda: int(_get_env("FALKOR_PORT", "6379"))
     )
 
+    # HTTP server settings (for hook communication)
+    http_enabled: bool = field(
+        default_factory=lambda: _get_env_bool("HTTP_ENABLED", True)
+    )
+    http_host: str = field(
+        default_factory=lambda: _get_env("HTTP_HOST", "127.0.0.1")
+    )
+    http_port: int = field(
+        default_factory=lambda: int(_get_env("HTTP_PORT", "0"))  # 0 = ephemeral
+    )
+
     # Code search settings
     code_index_enabled: bool = field(
         default_factory=lambda: _get_env_bool("CODE_INDEX_ENABLED", True)

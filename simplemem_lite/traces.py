@@ -4,12 +4,16 @@ Parses JSONL session traces and creates hierarchical memory indexes.
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from simplemem_lite.config import Config
+
+if TYPE_CHECKING:
+    from simplemem_lite.projects import ProjectManager
 from simplemem_lite.extractors import (
     extract_with_actions_batch,
     extract_goal,
@@ -196,19 +200,33 @@ class TraceParser:
         log.warning(f"Session {session_id} not found (checked {project_dirs_checked} project directories)")
         return None
 
-    def parse_session(self, session_path: Path) -> Iterator[TraceMessage]:
+    def parse_session(
+        self,
+        session_path: Path,
+        start_index: int = 0,
+    ) -> Iterator[tuple[int, TraceMessage]]:
         """Parse a JSONL trace file.
 
         Args:
             session_path: Path to trace file
+            start_index: Line index to start from (0-based)
 
         Yields:
-            TraceMessage objects for each relevant message
+            Tuple of (line_index, TraceMessage) for each relevant message
         """
-        log.debug(f"Parsing session: {session_path}")
+        log.debug(f"Parsing session: {session_path} (start_index={start_index})")
         message_count = 0
+        line_index = 0
+
         with open(session_path, "r", encoding="utf-8") as f:
             for line in f:
+                current_index = line_index
+                line_index += 1
+
+                # Skip lines before start_index
+                if current_index < start_index:
+                    continue
+
                 line = line.strip()
                 if not line:
                     continue
@@ -231,7 +249,7 @@ class TraceParser:
                     continue
 
                 message_count += 1
-                yield TraceMessage(
+                yield current_index, TraceMessage(
                     uuid=entry.get("uuid", ""),
                     session_id=entry.get("sessionId", ""),
                     type=msg_type,
@@ -239,7 +257,36 @@ class TraceParser:
                     timestamp=entry.get("timestamp", ""),
                     parent_uuid=entry.get("parentUuid"),
                 )
-        log.debug(f"Parsed {message_count} messages from {session_path.name}")
+        log.debug(f"Parsed {message_count} messages from {session_path.name} (starting from index {start_index})")
+
+    def get_file_inode(self, session_path: Path) -> int | None:
+        """Get the inode of a trace file.
+
+        Args:
+            session_path: Path to trace file
+
+        Returns:
+            Inode number, or None if file not found
+        """
+        try:
+            return session_path.stat().st_ino
+        except (OSError, FileNotFoundError):
+            return None
+
+    def count_lines(self, session_path: Path) -> int:
+        """Count total lines in a trace file.
+
+        Args:
+            session_path: Path to trace file
+
+        Returns:
+            Number of lines
+        """
+        try:
+            with open(session_path, "r", encoding="utf-8") as f:
+                return sum(1 for _ in f)
+        except (OSError, FileNotFoundError):
+            return 0
 
     def _extract_content(self, entry: dict) -> str:
         """Extract text content from various message formats.
@@ -338,7 +385,8 @@ class HierarchicalIndexer:
 
         await report(5, "Found session, parsing messages...")
         log.debug(f"Found session at {session_path}")
-        messages = list(self.parser.parse_session(session_path))
+        # Parse all messages (ignore line indices for full indexing)
+        messages = [msg for _, msg in self.parser.parse_session(session_path)]
         if not messages:
             log.warning(f"No messages found in session {session_id}")
             return None
@@ -605,6 +653,111 @@ class HierarchicalIndexer:
             goal_id=goal_id,
             project_id=project_dir,
         )
+
+    async def index_session_delta(
+        self,
+        session_id: str,
+        project_root: str,
+        project_manager: "ProjectManager",
+        transcript_path: str | None = None,
+    ) -> dict:
+        """Process only new messages in a session (delta indexing).
+
+        Uses project state to track last processed index and detect file rotation.
+        Much more efficient than full reindexing for active sessions.
+
+        Args:
+            session_id: Session UUID to index
+            project_root: Project root path
+            project_manager: ProjectManager for cursor tracking
+            transcript_path: Optional explicit path to transcript
+
+        Returns:
+            Dict with processing results
+        """
+        log.info(f"Delta indexing session: {session_id} for project: {project_root}")
+
+        # Find session file
+        if transcript_path:
+            session_path = Path(transcript_path)
+            if not session_path.exists():
+                return {"error": f"Transcript not found: {transcript_path}", "processed": 0}
+        else:
+            session_path = self.parser.find_session(session_id)
+            if not session_path:
+                return {"error": f"Session {session_id} not found", "processed": 0}
+
+        # Get project state for cursor info
+        state = project_manager.get_project_state(project_root)
+        last_index = 0
+        last_inode = None
+
+        if state and state.last_session_id == session_id:
+            last_index = state.last_processed_index
+            last_inode = state.last_trace_inode
+
+        # Check for file rotation (inode changed)
+        current_inode = self.parser.get_file_inode(session_path)
+        if last_inode is not None and current_inode != last_inode:
+            log.info(f"File rotation detected (inode {last_inode} -> {current_inode}), resetting cursor")
+            last_index = 0
+
+        # Parse only new messages
+        new_messages: list[tuple[int, TraceMessage]] = []
+        max_index = last_index
+
+        for idx, msg in self.parser.parse_session(session_path, start_index=last_index):
+            new_messages.append((idx, msg))
+            max_index = max(max_index, idx + 1)
+
+        if not new_messages:
+            log.info(f"No new messages since index {last_index}")
+            return {
+                "processed": 0,
+                "last_index": last_index,
+                "message": "No new messages to process",
+            }
+
+        log.info(f"Found {len(new_messages)} new messages (index {last_index} -> {max_index})")
+
+        # Extract just the messages (drop indices for processing)
+        messages = [msg for _, msg in new_messages]
+
+        # Store interesting messages
+        interesting = [m for m in messages if self._is_interesting(m)][:20]  # Cap at 20
+
+        stored_count = 0
+        if interesting:
+            msg_items = [
+                MemoryItem(
+                    content=msg.content[:2000],
+                    metadata={
+                        "type": "message",
+                        "session_id": session_id,
+                        "source": "claude_trace_delta",
+                        "msg_type": msg.type,
+                    },
+                )
+                for msg in interesting
+            ]
+            message_ids = self.store.store_batch(msg_items)
+            stored_count = len(message_ids)
+            log.info(f"Stored {stored_count} interesting messages from delta")
+
+        # Update cursor
+        project_manager.update_trace_cursor(
+            project_root=project_root,
+            session_id=session_id,
+            processed_index=max_index,
+            trace_inode=current_inode,
+        )
+
+        return {
+            "processed": len(new_messages),
+            "stored": stored_count,
+            "last_index": max_index,
+            "session_id": session_id,
+        }
 
     def _chunk_by_tool_sequences(
         self, messages: list[TraceMessage]

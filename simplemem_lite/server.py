@@ -1,19 +1,30 @@
 """MCP Server for SimpleMem Lite.
 
 Exposes memory operations via MCP protocol with tools, resources, and prompts.
+Also runs an HTTP server for hook communication.
 """
 
 import atexit
 import json
 import os
-from dataclasses import asdict
+import secrets
+import signal
+import threading
+from datetime import datetime
+from functools import partial
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from simplemem_lite.bootstrap import Bootstrap
 from simplemem_lite.code_index import CodeIndexer
 from simplemem_lite.config import Config
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
+from simplemem_lite.projects import ProjectManager
 from simplemem_lite.traces import HierarchicalIndexer, TraceParser
 from simplemem_lite.watcher import ProjectWatcherManager
 
@@ -41,6 +52,12 @@ log.debug("CodeIndexer initialized")
 watcher_manager = ProjectWatcherManager(code_indexer, config.code_patterns_list)
 log.debug("ProjectWatcherManager initialized")
 
+project_manager = ProjectManager(config)
+log.debug("ProjectManager initialized")
+
+bootstrap = Bootstrap(config, project_manager, code_indexer, watcher_manager)
+log.debug("Bootstrap initialized")
+
 
 def _cleanup_watchers() -> None:
     """Cleanup all watchers on server shutdown."""
@@ -50,6 +67,275 @@ def _cleanup_watchers() -> None:
 
 
 atexit.register(_cleanup_watchers)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTTP SERVER FOR HOOK COMMUNICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Server state
+_http_server: HTTPServer | None = None
+_http_thread: threading.Thread | None = None
+_auth_token: str | None = None
+
+
+def _get_lock_file_path() -> Path:
+    """Get path to the lock file."""
+    return config.data_dir / "server.lock"
+
+
+def _write_lock_file(port: int, token: str) -> None:
+    """Write lock file with server info."""
+    lock_data = {
+        "port": port,
+        "pid": os.getpid(),
+        "token": token,
+        "started_at": datetime.now().isoformat(),
+        "host": config.http_host,
+    }
+    lock_path = _get_lock_file_path()
+    lock_path.write_text(json.dumps(lock_data, indent=2))
+    log.info(f"Lock file written: {lock_path}")
+
+
+def _remove_lock_file() -> None:
+    """Remove lock file on shutdown."""
+    lock_path = _get_lock_file_path()
+    if lock_path.exists():
+        lock_path.unlink()
+        log.info(f"Lock file removed: {lock_path}")
+
+
+def _read_lock_file() -> dict[str, Any] | None:
+    """Read lock file if it exists."""
+    lock_path = _get_lock_file_path()
+    if lock_path.exists():
+        try:
+            return json.loads(lock_path.read_text())
+        except Exception as e:
+            log.warning(f"Failed to read lock file: {e}")
+    return None
+
+
+class HookHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP handler for hook endpoints."""
+
+    # Server reference set by HTTPServer
+    server: "HookHTTPServer"
+
+    def log_message(self, format: str, *args) -> None:
+        """Override to use our logger."""
+        log.debug(f"HTTP: {format % args}")
+
+    def _send_json_response(self, status: int, data: dict) -> None:
+        """Send a JSON response."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _verify_auth(self) -> bool:
+        """Verify auth token from request."""
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            if token == self.server.auth_token:
+                return True
+        log.warning("HTTP request with invalid/missing auth token")
+        return False
+
+    def _read_json_body(self) -> dict | None:
+        """Read and parse JSON body."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            return {}
+        try:
+            body = self.rfile.read(content_length)
+            return json.loads(body.decode())
+        except Exception as e:
+            log.error(f"Failed to parse JSON body: {e}")
+            return None
+
+    def do_GET(self) -> None:
+        """Handle GET requests."""
+        if self.path == "/health":
+            self._send_json_response(200, {
+                "status": "ok",
+                "pid": os.getpid(),
+                "uptime_seconds": (datetime.now() - self.server.started_at).total_seconds(),
+            })
+        else:
+            self._send_json_response(404, {"error": "Not found"})
+
+    def do_POST(self) -> None:
+        """Handle POST requests."""
+        # All POST endpoints require auth
+        if not self._verify_auth():
+            self._send_json_response(401, {"error": "Unauthorized"})
+            return
+
+        body = self._read_json_body()
+        if body is None:
+            self._send_json_response(400, {"error": "Invalid JSON"})
+            return
+
+        if self.path == "/hook/session-start":
+            self._handle_session_start(body)
+        elif self.path == "/hook/stop":
+            self._handle_stop(body)
+        else:
+            self._send_json_response(404, {"error": "Not found"})
+
+    def _handle_session_start(self, body: dict) -> None:
+        """Handle session-start hook.
+
+        Body expected: {cwd, session_id}
+        Returns: {should_bootstrap, project_root, context}
+        """
+        cwd = body.get("cwd", "")
+        session_id = body.get("session_id", "")
+        log.info(f"Hook: session-start cwd={cwd}, session={session_id[:8] if session_id else 'none'}...")
+
+        # Detect project root (use git root if available)
+        project_root = project_manager.detect_project_root(cwd)
+
+        # Get bootstrap status
+        status = bootstrap.get_bootstrap_status(project_root)
+
+        # Generate context injection
+        context = bootstrap.generate_context_injection(project_root)
+
+        self._send_json_response(200, {
+            "status": "ok",
+            "project_root": project_root,
+            "session_id": session_id,
+            "is_bootstrapped": status.get("is_bootstrapped", False),
+            "should_ask": status.get("should_ask", False),
+            "context": context,
+        })
+
+    def _handle_stop(self, body: dict) -> None:
+        """Handle stop hook.
+
+        Body expected: {cwd, session_id, transcript_path}
+        Returns: {status, processed}
+        """
+        import asyncio
+
+        cwd = body.get("cwd", "")
+        session_id = body.get("session_id", "")
+        transcript_path = body.get("transcript_path", "")
+        log.info(f"Hook: stop cwd={cwd}, session={session_id[:8] if session_id else 'none'}...")
+
+        if not session_id:
+            self._send_json_response(200, {
+                "status": "ok",
+                "message": "No session_id provided, skipping trace processing",
+            })
+            return
+
+        # Detect project root
+        project_root = project_manager.detect_project_root(cwd)
+
+        # Process trace delta asynchronously
+        try:
+            # Run the async delta indexer in a new event loop
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    indexer.index_session_delta(
+                        session_id=session_id,
+                        project_root=project_root,
+                        project_manager=project_manager,
+                        transcript_path=transcript_path if transcript_path else None,
+                    )
+                )
+            finally:
+                loop.close()
+
+            log.info(f"Delta processing result: {result}")
+            self._send_json_response(200, {
+                "status": "ok",
+                "session_id": session_id,
+                "project_root": project_root,
+                **result,
+            })
+        except Exception as e:
+            log.error(f"Delta processing failed: {e}")
+            self._send_json_response(200, {
+                "status": "error",
+                "session_id": session_id,
+                "error": str(e),
+            })
+
+
+class HookHTTPServer(HTTPServer):
+    """HTTP server with auth token storage."""
+
+    def __init__(self, server_address: tuple, handler_class: type, auth_token: str):
+        super().__init__(server_address, handler_class)
+        self.auth_token = auth_token
+        self.started_at = datetime.now()
+
+
+def _start_http_server() -> tuple[HTTPServer, threading.Thread] | None:
+    """Start HTTP server in a background thread.
+
+    Returns:
+        Tuple of (server, thread) if successful, None if disabled
+    """
+    global _auth_token
+
+    if not config.http_enabled:
+        log.info("HTTP server disabled by config")
+        return None
+
+    # Generate auth token
+    _auth_token = secrets.token_urlsafe(32)
+
+    # Create server (port 0 = let OS assign)
+    try:
+        server = HookHTTPServer(
+            (config.http_host, config.http_port),
+            HookHTTPHandler,
+            _auth_token,
+        )
+        actual_port = server.server_address[1]
+        log.info(f"HTTP server bound to {config.http_host}:{actual_port}")
+
+        # Write lock file
+        _write_lock_file(actual_port, _auth_token)
+
+        # Start server thread
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        log.info(f"HTTP server started on port {actual_port}")
+
+        return server, thread
+    except Exception as e:
+        log.error(f"Failed to start HTTP server: {e}")
+        return None
+
+
+def _stop_http_server() -> None:
+    """Stop HTTP server and cleanup."""
+    global _http_server, _http_thread
+
+    if _http_server is not None:
+        log.info("Stopping HTTP server...")
+        _http_server.shutdown()
+        _http_server = None
+
+    if _http_thread is not None:
+        _http_thread.join(timeout=5.0)
+        _http_thread = None
+
+    _remove_lock_file()
+    log.info("HTTP server stopped")
+
+
+atexit.register(_stop_http_server)
 
 # Debug info
 _debug_info = {
@@ -602,6 +888,96 @@ async def get_watcher_status() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# P4: PROJECT BOOTSTRAP (AUTO-DETECT & SETUP)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def bootstrap_project(
+    project_root: str,
+    index_code: bool = True,
+    start_watcher: bool = True,
+) -> dict:
+    """Bootstrap a project for SimpleMem features.
+
+    Detects project type, indexes code files, and starts file watcher.
+    This enables code search, memory features, and automatic index updates.
+
+    Args:
+        project_root: Absolute path to the project root directory
+        index_code: Whether to index code files (default: True)
+        start_watcher: Whether to start file watcher (default: True)
+
+    Returns:
+        Dict with bootstrap results including detected project info
+    """
+    log.info(f"Tool: bootstrap_project called (project={project_root})")
+    result = bootstrap.bootstrap_project(project_root, index_code, start_watcher)
+    log.info(f"Tool: bootstrap_project complete: success={result.get('success')}")
+    return result
+
+
+@mcp.tool()
+async def get_project_status(project_root: str) -> dict:
+    """Get bootstrap and watcher status for a project.
+
+    Args:
+        project_root: Absolute path to the project root directory
+
+    Returns:
+        Dict with:
+        - is_known: Whether project is tracked
+        - is_bootstrapped: Whether project has been bootstrapped
+        - is_watching: Whether file watcher is active
+        - project_name: Detected project name
+        - should_ask: Whether to prompt for bootstrap
+    """
+    log.info(f"Tool: get_project_status called (project={project_root})")
+    result = bootstrap.get_bootstrap_status(project_root)
+    log.info(f"Tool: get_project_status complete: bootstrapped={result.get('is_bootstrapped')}")
+    return result
+
+
+@mcp.tool()
+async def set_project_preference(
+    project_root: str,
+    never_ask: bool = True,
+) -> dict:
+    """Set user preference for a project.
+
+    Use this to mark a project as "never ask about bootstrap".
+
+    Args:
+        project_root: Absolute path to the project root directory
+        never_ask: If True, never prompt about bootstrapping this project
+
+    Returns:
+        Updated project state
+    """
+    log.info(f"Tool: set_project_preference called (project={project_root}, never_ask={never_ask})")
+    state = project_manager.set_never_ask(project_root, never_ask)
+    log.info(f"Tool: set_project_preference complete: never_ask={state.never_ask}")
+    return {
+        "project_root": state.project_root,
+        "never_ask": state.never_ask,
+        "is_bootstrapped": state.is_bootstrapped,
+    }
+
+
+@mcp.tool()
+async def list_tracked_projects() -> dict:
+    """List all tracked projects.
+
+    Returns:
+        List of projects with their bootstrap status
+    """
+    log.info("Tool: list_tracked_projects called")
+    projects = project_manager.list_projects()
+    log.info(f"Tool: list_tracked_projects complete: {len(projects)} projects")
+    return {"projects": projects, "count": len(projects)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RESOURCES (4 Browsable Data Sources)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -933,10 +1309,26 @@ def _memory_to_dict(memory: Memory) -> dict:
 
 
 def main():
-    """Run the MCP server."""
+    """Run the MCP server with HTTP hook support."""
+    global _http_server, _http_thread
+
+    log.info("Starting SimpleMem Lite server...")
+
+    # Start HTTP server for hook communication
+    result = _start_http_server()
+    if result:
+        _http_server, _http_thread = result
+        log.info("HTTP hook server ready")
+    else:
+        log.warning("HTTP hook server not started (hooks will not work)")
+
+    # Run MCP server (blocks until shutdown)
     log.info("Starting MCP server run loop")
-    mcp.run()
-    log.info("MCP server stopped")
+    try:
+        mcp.run()
+    finally:
+        log.info("MCP server stopped")
+        _stop_http_server()
 
 
 if __name__ == "__main__":
