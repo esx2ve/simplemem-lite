@@ -14,8 +14,9 @@ dependencies = [
     "pyarrow>=18.0.0",
     "python-dotenv>=1.0.0",
     "loguru>=0.7.0",
-    "json_repair>=0.30.0",  # Robust JSON parsing for LLM outputs
-    "watchdog>=4.0.0",  # File system watcher for P3 auto-capture
+    "json_repair>=0.30.0", # Robust JSON parsing for LLM outputs
+    "watchdog>=4.0.0", # File system watcher for P3 auto-capture
+    "pathspec>=0.12.1",
 ]
 
 [project.optional-dependencies]

@@ -11,6 +11,8 @@ import uuid as uuid_lib
 from pathlib import Path
 from typing import Any
 
+import pathspec
+
 from simplemem_lite.config import Config
 from simplemem_lite.db import DatabaseManager
 from simplemem_lite.embeddings import embed, embed_batch
@@ -34,22 +36,77 @@ _JS_PATTERNS = {
     "const_func": re.compile(r"^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=])\s*=>", re.MULTILINE),
 }
 
-# Directories to always exclude from indexing
-_EXCLUDE_DIRS = {
-    # Version control
-    ".git", ".svn", ".hg",
-    # Python
-    "__pycache__", ".venv", "venv", ".env", ".tox", ".pytest_cache",
-    ".mypy_cache", ".ruff_cache", "*.egg-info", "dist", "build", "eggs",
-    # Node.js
-    "node_modules", ".npm", ".yarn", "bower_components",
-    # IDE/Editor
-    ".idea", ".vscode", ".vs", ".settings",
-    # Build outputs
-    "target", "out", "bin", "obj",
-    # Coverage/Test
-    "coverage", ".coverage", "htmlcov",
-}
+# Built-in gitignore-style patterns (always excluded)
+# These use gitignore/glob syntax, not exact directory names
+_BUILTIN_IGNORE_PATTERNS = """
+# Version control
+.git/
+.svn/
+.hg/
+
+# Python virtual environments (catches venv, .venv, myenv, texify_venv, etc.)
+*venv*/
+*env/
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+.eggs/
+
+# Python site-packages (always noise)
+**/site-packages/
+**/lib/python*/
+
+# Node.js
+node_modules/
+.npm/
+.yarn/
+bower_components/
+.pnpm-store/
+
+# IDE/Editor
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+
+# Build outputs
+target/
+out/
+bin/
+obj/
+.next/
+.nuxt/
+
+# Coverage/Test
+coverage/
+.coverage
+htmlcov/
+.nyc_output/
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log
+"""
 
 
 class CodeIndexer:
@@ -68,25 +125,104 @@ class CodeIndexer:
         """
         self.db = db
         self.config = config
+        # Cache pathspec objects per project root
+        self._pathspec_cache: dict[str, pathspec.PathSpec] = {}
         log.info("CodeIndexer initialized")
 
-    def _should_exclude(self, path: Path) -> bool:
-        """Check if a path should be excluded from indexing.
+    def _load_gitignore(self, root: Path) -> list[str]:
+        """Load .gitignore patterns from project root and parent directories.
+
+        Args:
+            root: Project root directory
+
+        Returns:
+            List of gitignore pattern lines
+        """
+        patterns = []
+        gitignore_path = root / ".gitignore"
+        if gitignore_path.exists():
+            try:
+                content = gitignore_path.read_text(encoding="utf-8", errors="ignore")
+                patterns.extend(content.splitlines())
+                log.debug(f"Loaded {len(patterns)} patterns from {gitignore_path}")
+            except Exception as e:
+                log.warning(f"Failed to read .gitignore: {e}")
+        return patterns
+
+    def _build_pathspec(self, root: Path) -> pathspec.PathSpec:
+        """Build a PathSpec combining built-in patterns and .gitignore.
+
+        Results are cached per project root for efficiency.
+
+        Args:
+            root: Project root directory
+
+        Returns:
+            PathSpec object for matching files to exclude
+        """
+        root_str = str(root.resolve())
+        if root_str in self._pathspec_cache:
+            return self._pathspec_cache[root_str]
+
+        # Combine built-in patterns with project .gitignore
+        all_patterns = []
+
+        # Add built-in patterns (strip comments and empty lines for efficiency)
+        for line in _BUILTIN_IGNORE_PATTERNS.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                all_patterns.append(line)
+
+        # Add project-specific .gitignore
+        gitignore_patterns = self._load_gitignore(root)
+        for line in gitignore_patterns:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                all_patterns.append(line)
+
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", all_patterns)
+        self._pathspec_cache[root_str] = spec
+        log.info(f"Built pathspec with {len(all_patterns)} patterns for {root}")
+        return spec
+
+    def _should_exclude(self, path: Path, root: Path) -> bool:
+        """Check if a path should be excluded from indexing using pathspec.
+
+        Uses gitignore-style pattern matching for robust exclusion of
+        virtual environments, node_modules, build outputs, etc.
 
         Args:
             path: File or directory path to check
+            root: Project root for loading .gitignore
 
         Returns:
             True if path should be excluded
         """
-        # Check all path components for excluded directories
-        for part in path.parts:
-            if part in _EXCLUDE_DIRS:
+        spec = self._build_pathspec(root)
+
+        # Get path relative to root for matching
+        try:
+            rel_path = path.relative_to(root)
+        except ValueError:
+            # Path is not under root - shouldn't happen but be safe
+            return False
+
+        # Check if path matches any exclusion pattern
+        # We check both the file path and directory components
+        rel_str = str(rel_path)
+
+        # pathspec.match_file returns True if the path matches any pattern
+        if spec.match_file(rel_str):
+            log.trace(f"Excluding (pattern match): {rel_str}")
+            return True
+
+        # Also check if any parent directory matches (for directory patterns)
+        for parent in rel_path.parents:
+            parent_str = str(parent)
+            if parent_str and parent_str != "." and spec.match_file(parent_str + "/"):
+                log.trace(f"Excluding (parent match): {rel_str} (parent: {parent_str})")
                 return True
-            # Handle wildcard patterns like *.egg-info
-            for excl in _EXCLUDE_DIRS:
-                if "*" in excl and part.endswith(excl.replace("*", "")):
-                    return True
+
         return False
 
     def index_directory(
@@ -121,7 +257,7 @@ class CodeIndexer:
         files = []
         for pattern in patterns:
             for f in root.glob(pattern):
-                if f.is_file() and not self._should_exclude(f):
+                if f.is_file() and not self._should_exclude(f, root):
                     files.append(f)
 
         # Remove duplicates
