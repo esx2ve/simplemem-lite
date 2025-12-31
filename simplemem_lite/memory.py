@@ -158,9 +158,10 @@ class MemoryStore:
 
             except Exception as e:
                 log.error(f"Storage failed: {e}, rolling back")
-                # Rollback: delete from graph
+                # Rollback: delete from graph and vectors
                 try:
                     self.db.delete_memory_node(memory_uuid)
+                    self.db.delete_memory_vector(memory_uuid)
                     log.debug("Rollback successful")
                 except Exception as rollback_e:
                     log.warning(f"Rollback failed: {rollback_e}")
@@ -252,10 +253,14 @@ class MemoryStore:
 
             except Exception as e:
                 log.error(f"Batch storage failed: {e}, rolling back")
-                # Rollback: delete all created nodes
+                # Rollback: delete all created nodes and vectors
                 for uuid in uuids:
                     try:
                         self.db.delete_memory_node(uuid)
+                    except Exception:
+                        pass
+                    try:
+                        self.db.delete_memory_vector(uuid)
                     except Exception:
                         pass
                 raise e
@@ -269,6 +274,7 @@ class MemoryStore:
         limit: int = 10,
         use_graph: bool = True,
         type_filter: str | None = None,
+        project_id: str | None = None,
     ) -> list[Memory]:
         """Hybrid search combining vector similarity and graph expansion.
 
@@ -277,23 +283,33 @@ class MemoryStore:
             limit: Maximum results to return
             use_graph: Whether to expand results via graph (default: True)
             type_filter: Optional filter by memory type
+            project_id: Optional filter by project (for cross-project isolation)
 
         Returns:
             List of matching memories, sorted by relevance
         """
-        log.debug(f"Search: query='{query[:50]}...', limit={limit}, use_graph={use_graph}, type_filter={type_filter}")
+        log.debug(f"Search: query='{query[:50]}...', limit={limit}, use_graph={use_graph}, type_filter={type_filter}, project={project_id}")
 
         log.trace("Generating query embedding")
         query_embedding = embed(query, self.config)
 
         # Step 1: Vector search
         log.trace("Step 1: Vector search")
+        search_limit = limit * 3 if project_id else (limit * 2 if use_graph else limit)
         vector_results = self.db.search_vectors(
             query_vector=query_embedding,
-            limit=limit * 2 if use_graph else limit,
+            limit=search_limit,
             type_filter=type_filter,
         )
         log.debug(f"Vector search returned {len(vector_results)} results")
+
+        # Optional: Filter by project_id (via graph lookup)
+        if project_id and vector_results:
+            log.trace(f"Filtering by project: {project_id}")
+            uuids = [r["uuid"] for r in vector_results]
+            project_uuids = self.db.get_memories_in_project(project_id, uuids)
+            vector_results = [r for r in vector_results if r["uuid"] in project_uuids]
+            log.debug(f"After project filter: {len(vector_results)} results")
 
         if not use_graph or not vector_results:
             log.debug(f"Returning {min(len(vector_results), limit)} vector-only results")

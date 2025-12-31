@@ -41,10 +41,37 @@ _debug_info = {
 }
 log.info(f"Server initialized: traces_dir={config.claude_traces_dir}, exists={config.claude_traces_dir.exists()}")
 
-# Create MCP server
+# Create MCP server with detailed usage guidance
 mcp = FastMCP(
     "simplemem-lite",
-    instructions="Minimal hybrid memory MCP server with Claude Code trace processing",
+    instructions="""SimpleMem Lite: Long-term structured memory with cross-session learning.
+
+## WHEN TO USE MEMORY
+
+**At session START**: Recall relevant prior work
+- Use `ask_memories("context for {task}")` for LLM-synthesized answers with citations
+- Check what files/errors we've encountered before in similar work
+
+**When encountering ERRORS**: Check past solutions
+- `ask_memories("solution for {error}")` returns answers grounded in past sessions
+- Cross-session patterns reveal if this error appeared in other projects
+
+**Before complex DECISIONS**: Look for past approaches
+- `reason_memories` finds conclusions via multi-hop graph traversal
+- Shared entities (files, tools, errors) link knowledge across sessions
+
+**At session END**: Store key learnings
+- `store_memory` with type="lesson_learned" for valuable insights
+- Linked entities enable future cross-session discovery
+
+## KEY CAPABILITIES
+
+- `ask_memories`: LLM-synthesized answers with citations [1][2]
+- `reason_memories`: Multi-hop graph reasoning with proof chains
+- `search_memories`: Hybrid vector + graph search
+- `process_trace`: Index Claude Code sessions hierarchically
+- Cross-session insights via shared entities (files, tools, errors)
+""",
 )
 
 
@@ -59,6 +86,7 @@ async def store_memory(
     type: str = "fact",
     source: str = "user",
     relations: list[dict] | None = None,
+    project_id: str | None = None,
 ) -> str:
     """Store a memory with optional relationships.
 
@@ -67,15 +95,19 @@ async def store_memory(
         type: Memory type (fact, session_summary, chunk_summary, message)
         source: Source of memory (user, claude_trace, extracted)
         relations: Optional list of {target_id, type} relationships
+        project_id: Optional project identifier for cross-project isolation
 
     Returns:
         UUID of stored memory
     """
-    log.info(f"Tool: store_memory called (type={type}, source={source})")
+    log.info(f"Tool: store_memory called (type={type}, source={source}, project={project_id})")
     log.debug(f"Content preview: {text[:100]}...")
+    metadata = {"type": type, "source": source}
+    if project_id:
+        metadata["project_id"] = project_id
     item = MemoryItem(
         content=text,
-        metadata={"type": type, "source": source},
+        metadata=metadata,
         relations=relations or [],
     )
     result = store.store(item)
@@ -89,6 +121,7 @@ async def search_memories(
     limit: int = 10,
     use_graph: bool = True,
     type_filter: str | None = None,
+    project_id: str | None = None,
 ) -> list[dict]:
     """Hybrid search combining vector similarity and graph traversal.
 
@@ -100,16 +133,18 @@ async def search_memories(
         limit: Maximum results to return
         use_graph: Whether to expand results via graph relationships
         type_filter: Optional filter by memory type
+        project_id: Optional filter by project (for cross-project isolation)
 
     Returns:
         List of matching memories with scores
     """
-    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit})")
+    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id})")
     results = store.search(
         query=query,
         limit=limit,
         use_graph=use_graph,
         type_filter=type_filter,
+        project_id=project_id,
     )
     log.info(f"Tool: search_memories complete: {len(results)} results")
     return [_memory_to_dict(m) for m in results]
@@ -368,68 +403,257 @@ def explore_graph(uuid: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROMPTS (4 Interaction Templates)
+# P1: ENTITY-CENTRIC RESOURCES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.resource("entities://files")
+def list_file_entities() -> str:
+    """Browse all tracked files with action counts.
+
+    Returns files sorted by activity (reads + modifies), with:
+    - name: File path (canonicalized)
+    - version: Current version (incremented on modifies)
+    - reads: Number of read operations
+    - modifies: Number of modify operations
+    - sessions_count: Number of sessions this file appeared in
+    """
+    files = store.db.get_entities_by_type("file", limit=100)
+    return json.dumps(files, indent=2)
+
+
+@mcp.resource("entities://files/{name}")
+def get_file_history(name: str) -> str:
+    """Get complete history of a specific file.
+
+    Returns:
+    - entity: File metadata (name, version, timestamps)
+    - memories: All memories linked to this file with actions
+    - sessions: List of sessions that touched this file
+    - related_errors: Errors encountered while working with this file
+    """
+    history = store.db.get_entity_history(name, "file", limit=50)
+    return json.dumps(history, indent=2)
+
+
+@mcp.resource("entities://tools")
+def list_tool_usage() -> str:
+    """Browse tool usage patterns across sessions.
+
+    Returns tools sorted by execution count, with:
+    - tool: Tool name (canonicalized)
+    - executions: Number of times executed
+    - sessions_count: Number of sessions that used this tool
+    """
+    tools = store.db.get_tool_usage(limit=100)
+    return json.dumps(tools, indent=2)
+
+
+@mcp.resource("entities://tools/{name}")
+def get_tool_history(name: str) -> str:
+    """Get complete history of a specific tool.
+
+    Returns:
+    - entity: Tool metadata
+    - memories: All memories where this tool was executed
+    - sessions: Sessions that used this tool
+    - related_errors: Errors triggered by this tool
+    """
+    history = store.db.get_entity_history(name, "tool", limit=50)
+    return json.dumps(history, indent=2)
+
+
+@mcp.resource("entities://errors")
+def list_error_patterns() -> str:
+    """Browse common errors and their occurrence patterns.
+
+    Returns errors sorted by occurrence count, with:
+    - error: Error name/pattern (canonicalized)
+    - occurrences: Number of times this error was triggered
+    - sessions_count: Number of sessions that encountered this error
+    """
+    errors = store.db.get_error_patterns(limit=100)
+    return json.dumps(errors, indent=2)
+
+
+@mcp.resource("entities://errors/{pattern}")
+def get_error_history(pattern: str) -> str:
+    """Get complete history of a specific error pattern.
+
+    Returns:
+    - entity: Error metadata
+    - memories: All memories where this error was triggered
+    - sessions: Sessions that encountered this error
+    """
+    history = store.db.get_entity_history(pattern, "error", limit=50)
+    return json.dumps(history, indent=2)
+
+
+@mcp.resource("insights://cross-session")
+def get_cross_session_insights() -> str:
+    """Browse entities that appear across multiple sessions.
+
+    These are bridge entities - valuable for cross-session insights
+    as they link different work sessions together.
+
+    Returns entities sorted by session count (appearing in 2+ sessions), with:
+    - name: Entity name
+    - type: Entity type (file, tool, error, command)
+    - sessions_count: Number of sessions this entity appeared in
+    - session_ids: List of session IDs
+    """
+    entities = store.db.get_cross_session_entities(min_sessions=2, limit=50)
+    return json.dumps(entities, indent=2)
+
+
+@mcp.resource("insights://project/{project_id}")
+def get_project_insights(project_id: str) -> str:
+    """Get all learnings and insights for a specific project.
+
+    Returns:
+    - project: Project metadata (path, session count, timestamps)
+    - sessions: Session summaries belonging to this project
+    - top_files: Most frequently touched files
+    - errors: Errors encountered in this project
+    """
+    insights = store.db.get_project_insights(project_id, limit=50)
+    return json.dumps(insights, indent=2)
+
+
+@mcp.resource("insights://projects")
+def list_projects() -> str:
+    """Browse all tracked projects.
+
+    Returns projects sorted by session count.
+    """
+    projects = store.db.get_projects(limit=50)
+    return json.dumps(projects, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROMPTS (6 Workflow-Integrated Templates)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.prompt(title="Start with Context")
+def start_with_context(task: str) -> str:
+    """Gather relevant context before starting a task."""
+    return f'''Before starting: "{task}"
+
+1. Use ask_memories to find relevant prior work:
+   ask_memories("context for {task}")
+
+2. Check for related files we've worked with before
+
+3. Look for similar problems and their solutions
+
+Synthesize: What do we already know that helps here?
+
+Example output format:
+"Based on memories [1][2], this task relates to prior work on X.
+Key insight: [specific pattern or solution that worked].
+Files involved: [relevant files from past sessions]."'''
+
+
+@mcp.prompt(title="Smart Debug")
+def smart_debug(error: str, file_context: str = "") -> str:
+    """Debug using full memory graph and cross-session insights."""
+    file_note = f"\nContext: Error occurred in {file_context}" if file_context else ""
+    return f'''Debugging error: {error}{file_note}
+
+Steps:
+1. Use ask_memories("solutions for: {error}") to get LLM-synthesized answer with citations
+
+2. Check for similar error patterns across sessions - cross-session insights are especially valuable
+
+3. If file context provided, look for that file's modification history
+
+4. Provide solution based on what worked before, citing specific memories [1][2]
+
+Focus on actionable solutions with evidence from past sessions.'''
+
+
+@mcp.prompt(title="Store Session Learnings")
+def store_session_learnings() -> str:
+    """Capture key insights from the current session."""
+    return '''Before ending, preserve what we learned:
+
+Identify and store each of:
+1. **Problem solved**: What was the main challenge?
+2. **Solution that worked**: What approach succeeded?
+3. **Gotchas discovered**: Any non-obvious issues?
+4. **Patterns worth remembering**: Reusable techniques?
+
+For each insight, use store_memory with:
+- Descriptive content capturing the learning
+- type="lesson_learned" for cross-session discovery
+- Include relevant file/tool/command context
+
+Example:
+store_memory(
+    text="Fixed auth token expiry by checking refresh logic before API calls. Key: always validate token age, not just presence.",
+    type="lesson_learned"
+)'''
+
+
+@mcp.prompt(title="What Do We Know About")
+def entity_recall(entity_name: str, entity_type: str = "file") -> str:
+    """Recall everything we know about a specific entity."""
+    return f'''Retrieve all knowledge about {entity_type}: {entity_name}
+
+1. Search memories mentioning this entity:
+   search_memories("{entity_name}")
+
+2. Use reason_memories for deeper connections:
+   reason_memories("history and patterns for {entity_name}")
+
+3. Check cross-session patterns - has this entity appeared in other projects?
+
+Synthesize into a brief summary:
+- What operations were performed (reads/modifies)?
+- What issues were encountered?
+- What solutions worked?
+- Any patterns or best practices?'''
 
 
 @mcp.prompt(title="Reflect on Session")
 def reflect_on_session(session_id: str) -> str:
-    """Analyze a Claude Code session and extract learnings."""
-    return f"""Analyze Claude Code session {session_id} and extract learnings.
+    """Index and analyze a Claude Code session."""
+    return f'''Analyze Claude Code session {session_id}:
 
-Steps:
-1. First, use the process_trace tool to index this session
-2. Then search for key insights using search_memories
+1. First, index the session:
+   process_trace(session_id="{session_id}")
 
-Extract and store:
-- Key problems solved
-- Solutions that worked
-- Errors encountered and how they were fixed
-- Patterns worth remembering
+2. Then explore what was learned:
+   ask_memories("key learnings from session {session_id}")
 
-Store each learning as a separate memory with appropriate relationships."""
+3. Identify patterns worth preserving:
+   - Problems solved and their solutions
+   - Errors encountered and fixes applied
+   - Files modified and why
+   - Reusable patterns discovered
 
-
-@mcp.prompt(title="Debug with History")
-def debug_with_history(error: str) -> str:
-    """Debug using past solutions from memory."""
-    return f"""I'm encountering this error:
-
-{error}
-
-Please:
-1. Search memories for similar errors using search_memories
-2. Look for past solutions and their context
-3. Check if there are related memories via graph connections
-4. Suggest solutions based on what worked before"""
+Store significant learnings as type="lesson_learned" for future reference.'''
 
 
-@mcp.prompt(title="Project Summary")
-def summarize_project(project: str) -> str:
-    """Summarize everything known about a project."""
-    return f"""Summarize what we know about the "{project}" project based on stored memories.
+@mcp.prompt(title="Project Overview")
+def project_overview(project: str) -> str:
+    """Comprehensive summary of project knowledge."""
+    return f'''Summarize knowledge about project: "{project}"
 
-Use search_memories to find relevant information about:
-- Key architectural decisions
-- Common issues and solutions
-- Important patterns or conventions
-- Dependencies and integrations
+1. Get synthesized overview:
+   ask_memories("overview of {project} project")
 
-Provide a comprehensive overview of the project knowledge."""
+2. Find cross-session patterns:
+   reason_memories("patterns and decisions in {project}")
 
+3. Compile:
+   - **Architecture**: Key design decisions
+   - **Common Issues**: Recurring problems and solutions
+   - **Patterns**: Coding conventions and best practices
+   - **Dependencies**: Key integrations and their quirks
 
-@mcp.prompt(title="Find Similar Solutions")
-def find_similar_solutions(problem: str) -> str:
-    """Search for past solutions to similar problems."""
-    return f"""I need to solve this problem:
-
-{problem}
-
-Please:
-1. Search memories for similar problems using search_memories
-2. Expand search via graph to find related solutions
-3. Show me the most relevant past solutions with their context
-4. Suggest which approach might work best for my current situation"""
+Focus on actionable insights that help when working on this project.'''
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

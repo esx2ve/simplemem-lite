@@ -4,13 +4,13 @@ Parses JSONL session traces and creates hierarchical memory indexes.
 """
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from simplemem_lite.config import Config
 from simplemem_lite.extractors import (
-    extract_entities_batch,
     extract_with_actions_batch,
     extract_goal,
     EnhancedExtraction,
@@ -19,6 +19,54 @@ from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import MemoryItem, MemoryStore
 
 log = get_logger("traces")
+
+
+def _decode_project_path(encoded: str) -> str:
+    """Decode a path-encoded project directory name to human-readable form.
+
+    Claude Code encodes paths by replacing '/' with '-', e.g.:
+        -Users-shimon-repo-my-project -> /Users/shimon/repo/my-project
+
+    This decoding is LOSSY because project names can contain hyphens.
+    We use heuristics to identify path separators vs literal hyphens:
+
+    1. Leading hyphen indicates absolute path root
+    2. Known path prefixes (Users, home, var, etc.) help identify boundaries
+    3. The final component (project name) preserves its hyphens
+
+    Args:
+        encoded: Path-encoded directory name (e.g., "-Users-shimon-repo-my-project")
+
+    Returns:
+        Human-readable path (e.g., "/Users/shimon/repo/my-project")
+    """
+    if not encoded:
+        return encoded
+
+    # Pattern matches known path prefixes that indicate path boundaries
+    # These are directories that commonly appear at fixed positions in paths
+    path_prefix_pattern = re.compile(
+        r'^-?(Users|home|var|opt|usr|tmp|root|data|srv|mnt|Volumes|Applications|Library)'
+        r'(-[^-]+)*$',
+        re.IGNORECASE
+    )
+
+    # If it matches the pattern, use the old conversion for display
+    # Otherwise, treat the whole thing as a project name
+    if path_prefix_pattern.match(encoded):
+        # Convert hyphens to slashes, but be smarter about it:
+        # Split by known path components and rejoin with slashes
+        result = encoded.lstrip("-")
+
+        # Replace hyphens that follow common single-word path components
+        # This preserves hyphens in multi-word directory names
+        common_path_parts = r'(Users|home|var|opt|usr|tmp|root|data|srv|mnt|Volumes|Applications|Library|repo|projects|src|code|dev|work|Documents|Desktop|Downloads)'
+        result = re.sub(f'{common_path_parts}-', r'\1/', result, flags=re.IGNORECASE)
+
+        return "/" + result if encoded.startswith("-") else result
+    else:
+        # No recognized path pattern - treat as-is (just a project name)
+        return encoded.lstrip("-")
 
 
 @dataclass
@@ -536,8 +584,8 @@ class HierarchicalIndexer:
         try:
             project_dir = session_path.parent.name  # e.g., "-Users-shimon-repo-simplemem"
             if project_dir and project_dir != "projects":
-                # Convert path-encoded directory back to readable form for display
-                project_path_display = project_dir.replace("-", "/").lstrip("/")
+                # Decode path for human-readable display (preserves hyphens in project names)
+                project_path_display = _decode_project_path(project_dir)
                 self.store.db.add_project_node(
                     project_id=project_dir,  # Use raw dir name as unique ID
                     project_path=project_path_display,  # Human-readable path

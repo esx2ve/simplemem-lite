@@ -140,9 +140,7 @@ class DatabaseManager:
             created_at: Unix timestamp
         """
         log.trace(f"Adding memory node: uuid={uuid[:8]}..., type={mem_type}")
-        # Escape content for Cypher (replace quotes and backslashes)
-        safe_content = content.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-
+        # Parameterized queries handle escaping automatically
         self.graph.query(
             """
             CREATE (m:Memory {
@@ -156,7 +154,7 @@ class DatabaseManager:
             """,
             {
                 "uuid": uuid,
-                "content": safe_content[:5000],  # Limit content size
+                "content": content[:5000],  # Limit content size
                 "type": mem_type,
                 "source": source,
                 "session_id": session_id or "",
@@ -181,8 +179,6 @@ class DatabaseManager:
             Entity name (used as identifier)
         """
         log.trace(f"Adding/getting entity: {entity_type}:{name}")
-        safe_name = name.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-
         # MERGE creates if not exists, returns existing if exists
         self.graph.query(
             """
@@ -190,7 +186,7 @@ class DatabaseManager:
             ON CREATE SET e.created_at = timestamp()
             """,
             {
-                "name": safe_name,
+                "name": name,
                 "type": entity_type,
             },
         )
@@ -280,7 +276,6 @@ class DatabaseManager:
 
         # Canonicalize entity name
         canonical_name = self._canonicalize_entity(entity_name, entity_type)
-        safe_name = canonical_name.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
 
         # Map action to edge type with security validation
         action_to_edge = {
@@ -292,6 +287,7 @@ class DatabaseManager:
         edge_type = action_to_edge.get(action.lower(), "REFERENCES")
 
         # Security: validate edge type to prevent Cypher injection
+        # Edge type is used in f-string but is validated against allow-list
         if edge_type not in self.ALLOWED_VERB_EDGES:
             log.error(f"Invalid edge type attempted: {edge_type}")
             raise ValueError(f"Invalid edge type: {edge_type}")
@@ -305,7 +301,7 @@ class DatabaseManager:
                 ON CREATE SET e.created_at = timestamp(), e.version = 1
                 ON MATCH SET e.version = COALESCE(e.version, 0) + 1, e.last_modified = timestamp()
                 """,
-                {"name": safe_name, "type": entity_type},
+                {"name": canonical_name, "type": entity_type},
             )
         else:
             # Just ensure entity exists
@@ -314,19 +310,18 @@ class DatabaseManager:
                 MERGE (e:Entity {name: $name, type: $type})
                 ON CREATE SET e.created_at = timestamp(), e.version = 1
                 """,
-                {"name": safe_name, "type": entity_type},
+                {"name": canonical_name, "type": entity_type},
             )
 
         # Create the verb-specific edge
         ts = timestamp or int(time.time())
         if change_summary:
-            safe_summary = change_summary.replace("\\", "\\\\").replace("'", "\\'")[:500]
             self.graph.query(
                 f"""
                 MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
                 CREATE (m)-[:{edge_type} {{timestamp: $ts, change_summary: $summary}}]->(e)
                 """,
-                {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts, "summary": safe_summary},
+                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts, "summary": change_summary[:500]},
             )
         else:
             self.graph.query(
@@ -334,7 +329,7 @@ class DatabaseManager:
                 MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
                 CREATE (m)-[:{edge_type} {{timestamp: $ts}}]->(e)
                 """,
-                {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts},
+                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts},
             )
 
         log.trace(f"Added {edge_type} edge: memory={memory_uuid[:8]}... -> {entity_type}:{canonical_name}")
@@ -390,8 +385,9 @@ class DatabaseManager:
                     # Remove home prefix, keep from first meaningful directory
                     relative = normalized[len(home):].lstrip(os.sep)
                     # Skip only definitive container directories (not project dirs like "src")
+                    # Require at least 3 parts (container/project/file) to avoid over-stripping
                     parts = relative.split(os.sep)
-                    if len(parts) > 1 and parts[0] in ("repo", "repos", "projects", "dev", "work"):
+                    if len(parts) > 2 and parts[0] in ("repo", "repos", "projects", "dev", "work"):
                         return os.sep.join(parts[1:])  # Skip the container prefix
                     return relative
 
@@ -447,8 +443,6 @@ class DatabaseManager:
             session_id: Associated session ID
             status: Goal status (active, completed, abandoned)
         """
-        safe_intent = intent.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')[:1000]
-
         self.graph.query(
             """
             CREATE (g:Goal {
@@ -461,7 +455,7 @@ class DatabaseManager:
             """,
             {
                 "goal_id": goal_id,
-                "intent": safe_intent,
+                "intent": intent[:1000],
                 "session_id": session_id,
                 "status": status,
             },
@@ -519,15 +513,14 @@ class DatabaseManager:
             project_id: Unique project identifier (derived from path)
             project_path: Original project path
         """
-        safe_path = project_path.replace("\\", "\\\\").replace("'", "\\'")[:500]
-
+        # Parameterized queries handle escaping automatically
         self.graph.query(
             """
             MERGE (p:Project {id: $project_id})
             ON CREATE SET p.path = $path, p.created_at = timestamp(), p.session_count = 1
             ON MATCH SET p.session_count = p.session_count + 1, p.last_updated = timestamp()
             """,
-            {"project_id": project_id, "path": safe_path},
+            {"project_id": project_id, "path": project_path[:500]},
         )
         log.trace(f"Created/updated Project node: {project_id}")
 
@@ -561,6 +554,14 @@ class DatabaseManager:
             "MATCH (m:Memory {uuid: $uuid}) DETACH DELETE m",
             {"uuid": uuid},
         )
+
+    def delete_memory_vector(self, uuid: str) -> None:
+        """Delete a memory vector from LanceDB (for rollback).
+
+        Args:
+            uuid: Memory UUID to delete
+        """
+        self.lance_table.delete(f'uuid = "{uuid}"')
 
     def search_vectors(
         self,
@@ -990,3 +991,500 @@ class DatabaseManager:
         # Normalize to 0-1 range
         scores = {uuid: degrees.get(uuid, 0) / max_degree for uuid in uuids}
         return scores
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # ENTITY-CENTRIC QUERIES (P1 Resources Support)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def get_entities_by_type(
+        self,
+        entity_type: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get all entities of a specific type with action counts.
+
+        Args:
+            entity_type: Type of entity (file, tool, error, command)
+            limit: Maximum results to return
+
+        Returns:
+            List of entities with name, type, version, session_count, action counts
+        """
+        log.trace(f"Getting entities by type: {entity_type}")
+
+        result = self.graph.query(
+            """
+            MATCH (e:Entity {type: $type})
+            OPTIONAL MATCH (m:Memory)-[r:READS]->(e)
+            WITH e, count(DISTINCT r) AS reads_count, collect(DISTINCT m.session_id) AS read_sessions
+            OPTIONAL MATCH (m2:Memory)-[w:MODIFIES]->(e)
+            WITH e, reads_count, read_sessions, count(DISTINCT w) AS modifies_count, collect(DISTINCT m2.session_id) AS modify_sessions
+            OPTIONAL MATCH (m3:Memory)-[x:EXECUTES]->(e)
+            WITH e, reads_count, read_sessions, modifies_count, modify_sessions,
+                 count(DISTINCT x) AS executes_count, collect(DISTINCT m3.session_id) AS exec_sessions
+            RETURN
+                e.name AS name,
+                e.type AS type,
+                e.version AS version,
+                e.created_at AS created_at,
+                e.last_modified AS last_modified,
+                reads_count,
+                modifies_count,
+                executes_count,
+                read_sessions + modify_sessions + exec_sessions AS all_sessions
+            ORDER BY reads_count + modifies_count + executes_count DESC
+            LIMIT $limit
+            """,
+            {"type": entity_type, "limit": limit},
+        )
+
+        entities = []
+        for record in result.result_set:
+            # Deduplicate sessions
+            all_sessions = list(set(s for s in (record[8] or []) if s))
+            entities.append({
+                "name": record[0],
+                "type": record[1],
+                "version": record[2] or 1,
+                "created_at": record[3],
+                "last_modified": record[4],
+                "reads": record[5] or 0,
+                "modifies": record[6] or 0,
+                "executes": record[7] or 0,
+                "sessions_count": len(all_sessions),
+            })
+
+        log.debug(f"Found {len(entities)} entities of type {entity_type}")
+        return entities
+
+    def get_entity_history(
+        self,
+        name: str,
+        entity_type: str,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Get complete history of a specific entity.
+
+        Args:
+            name: Entity name (will be canonicalized)
+            entity_type: Entity type
+            limit: Maximum memories to return
+
+        Returns:
+            Entity details with all linked memories and actions
+        """
+        log.trace(f"Getting entity history: {entity_type}:{name}")
+
+        # Canonicalize the entity name for lookup
+        canonical_name = self._canonicalize_entity(name, entity_type)
+
+        # Get entity details
+        entity_result = self.graph.query(
+            """
+            MATCH (e:Entity {name: $name, type: $type})
+            RETURN e.name, e.type, e.version, e.created_at, e.last_modified
+            """,
+            {"name": canonical_name, "type": entity_type},
+        )
+
+        if not entity_result.result_set:
+            log.debug(f"Entity not found: {entity_type}:{canonical_name}")
+            return {"error": "Entity not found", "name": name, "type": entity_type}
+
+        record = entity_result.result_set[0]
+        entity = {
+            "name": record[0],
+            "type": record[1],
+            "version": record[2] or 1,
+            "created_at": record[3],
+            "last_modified": record[4],
+        }
+
+        # Get all memories linked to this entity with their actions
+        memories_result = self.graph.query(
+            """
+            MATCH (m:Memory)-[r]->(e:Entity {name: $name, type: $type})
+            WHERE type(r) IN ['READS', 'MODIFIES', 'EXECUTES', 'TRIGGERED', 'REFERENCES']
+            RETURN
+                m.uuid AS uuid,
+                m.content AS content,
+                m.type AS mem_type,
+                m.session_id AS session_id,
+                m.created_at AS created_at,
+                type(r) AS action,
+                r.timestamp AS action_timestamp,
+                r.change_summary AS change_summary
+            ORDER BY m.created_at DESC
+            LIMIT $limit
+            """,
+            {"name": canonical_name, "type": entity_type, "limit": limit},
+        )
+
+        memories = []
+        sessions = set()
+        for record in memories_result.result_set:
+            memories.append({
+                "uuid": record[0],
+                "content": record[1][:300] if record[1] else "",  # Truncate for display
+                "type": record[2],
+                "session_id": record[3],
+                "created_at": record[4],
+                "action": record[5],
+                "action_timestamp": record[6],
+                "change_summary": record[7],
+            })
+            if record[3]:
+                sessions.add(record[3])
+
+        # Get linked errors (for files/tools)
+        errors_result = self.graph.query(
+            """
+            MATCH (m:Memory)-[:READS|MODIFIES|EXECUTES]->(e:Entity {name: $name, type: $type})
+            MATCH (m)-[:TRIGGERED]->(err:Entity {type: 'error'})
+            RETURN DISTINCT err.name AS error_name, count(m) AS occurrences
+            ORDER BY occurrences DESC
+            LIMIT 10
+            """,
+            {"name": canonical_name, "type": entity_type},
+        )
+
+        errors = []
+        for record in errors_result.result_set:
+            errors.append({
+                "error": record[0],
+                "occurrences": record[1],
+            })
+
+        log.debug(f"Entity history: {len(memories)} memories, {len(sessions)} sessions, {len(errors)} errors")
+
+        return {
+            "entity": entity,
+            "memories": memories,
+            "sessions": list(sessions),
+            "sessions_count": len(sessions),
+            "related_errors": errors,
+        }
+
+    def get_cross_session_entities(
+        self,
+        min_sessions: int = 2,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get entities that appear across multiple sessions (bridge entities).
+
+        These are valuable for cross-session insights as they link
+        different work sessions together.
+
+        Args:
+            min_sessions: Minimum number of sessions the entity must appear in
+            limit: Maximum results to return
+
+        Returns:
+            List of entities with session count and linked sessions
+        """
+        log.trace(f"Getting cross-session entities (min_sessions={min_sessions})")
+
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)-[r]->(e:Entity)
+            WHERE type(r) IN ['READS', 'MODIFIES', 'EXECUTES', 'TRIGGERED', 'REFERENCES']
+              AND m.session_id IS NOT NULL AND m.session_id <> ''
+            WITH e, collect(DISTINCT m.session_id) AS sessions
+            WHERE size(sessions) >= $min_sessions
+            RETURN
+                e.name AS name,
+                e.type AS type,
+                e.version AS version,
+                sessions AS session_ids,
+                size(sessions) AS sessions_count
+            ORDER BY size(sessions) DESC
+            LIMIT $limit
+            """,
+            {"min_sessions": min_sessions, "limit": limit},
+        )
+
+        entities = []
+        for record in result.result_set:
+            entities.append({
+                "name": record[0],
+                "type": record[1],
+                "version": record[2] or 1,
+                "session_ids": record[3] or [],
+                "sessions_count": record[4] or 0,
+            })
+
+        log.debug(f"Found {len(entities)} cross-session entities")
+        return entities
+
+    def get_project_insights(
+        self,
+        project_id: str,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Get all learnings and insights for a specific project.
+
+        Args:
+            project_id: Project identifier
+            limit: Maximum items per category
+
+        Returns:
+            Project overview with sessions, entities, errors, and learnings
+        """
+        log.trace(f"Getting project insights: {project_id}")
+
+        # Get project node
+        project_result = self.graph.query(
+            """
+            MATCH (p:Project {id: $project_id})
+            RETURN p.id, p.path, p.session_count, p.created_at, p.last_updated
+            """,
+            {"project_id": project_id},
+        )
+
+        if not project_result.result_set:
+            return {"error": "Project not found", "project_id": project_id}
+
+        record = project_result.result_set[0]
+        project = {
+            "id": record[0],
+            "path": record[1],
+            "session_count": record[2] or 0,
+            "created_at": record[3],
+            "last_updated": record[4],
+        }
+
+        # Get sessions belonging to this project
+        sessions_result = self.graph.query(
+            """
+            MATCH (m:Memory)-[:BELONGS_TO]->(p:Project {id: $project_id})
+            WHERE m.type = 'session_summary'
+            RETURN m.uuid, m.content, m.session_id, m.created_at
+            ORDER BY m.created_at DESC
+            LIMIT $limit
+            """,
+            {"project_id": project_id, "limit": limit},
+        )
+
+        sessions = []
+        for record in sessions_result.result_set:
+            sessions.append({
+                "uuid": record[0],
+                "summary": record[1][:500] if record[1] else "",
+                "session_id": record[2],
+                "created_at": record[3],
+            })
+
+        # Get frequently touched files in this project
+        files_result = self.graph.query(
+            """
+            MATCH (m:Memory)-[:BELONGS_TO]->(p:Project {id: $project_id})
+            MATCH (m)-[:CONTAINS*0..2]->(chunk:Memory)
+            MATCH (chunk)-[:READS|MODIFIES]->(e:Entity {type: 'file'})
+            WITH e.name AS file_name, count(*) AS touch_count
+            RETURN file_name, touch_count
+            ORDER BY touch_count DESC
+            LIMIT $limit
+            """,
+            {"project_id": project_id, "limit": limit},
+        )
+
+        files = []
+        for record in files_result.result_set:
+            files.append({
+                "file": record[0],
+                "touches": record[1],
+            })
+
+        # Get errors encountered in this project
+        errors_result = self.graph.query(
+            """
+            MATCH (m:Memory)-[:BELONGS_TO]->(p:Project {id: $project_id})
+            MATCH (m)-[:CONTAINS*0..2]->(chunk:Memory)
+            MATCH (chunk)-[:TRIGGERED]->(e:Entity {type: 'error'})
+            WITH e.name AS error_name, count(*) AS occurrences
+            RETURN error_name, occurrences
+            ORDER BY occurrences DESC
+            LIMIT $limit
+            """,
+            {"project_id": project_id, "limit": limit},
+        )
+
+        errors = []
+        for record in errors_result.result_set:
+            errors.append({
+                "error": record[0],
+                "occurrences": record[1],
+            })
+
+        log.debug(f"Project insights: {len(sessions)} sessions, {len(files)} files, {len(errors)} errors")
+
+        return {
+            "project": project,
+            "sessions": sessions,
+            "top_files": files,
+            "errors": errors,
+        }
+
+    def get_error_patterns(
+        self,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get common errors and their resolution patterns.
+
+        Returns errors with occurrence counts and any linked solutions.
+
+        Args:
+            limit: Maximum results
+
+        Returns:
+            List of errors with occurrences and sessions
+        """
+        log.trace("Getting error patterns")
+
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)-[r:TRIGGERED]->(e:Entity {type: 'error'})
+            WITH e, collect(DISTINCT m.session_id) AS sessions, count(r) AS trigger_count
+            RETURN
+                e.name AS error_name,
+                trigger_count,
+                sessions,
+                size(sessions) AS sessions_count
+            ORDER BY trigger_count DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+        errors = []
+        for record in result.result_set:
+            errors.append({
+                "error": record[0],
+                "occurrences": record[1],
+                "sessions": [s for s in (record[2] or []) if s],
+                "sessions_count": record[3] or 0,
+            })
+
+        log.debug(f"Found {len(errors)} error patterns")
+        return errors
+
+    def get_tool_usage(
+        self,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Get tool usage patterns across sessions.
+
+        Args:
+            limit: Maximum results
+
+        Returns:
+            List of tools with execution counts and sessions
+        """
+        log.trace("Getting tool usage patterns")
+
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)-[r:EXECUTES]->(e:Entity {type: 'tool'})
+            WITH e, collect(DISTINCT m.session_id) AS sessions, count(r) AS exec_count
+            RETURN
+                e.name AS tool_name,
+                exec_count,
+                sessions,
+                size(sessions) AS sessions_count
+            ORDER BY exec_count DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+        tools = []
+        for record in result.result_set:
+            tools.append({
+                "tool": record[0],
+                "executions": record[1],
+                "sessions": [s for s in (record[2] or []) if s],
+                "sessions_count": record[3] or 0,
+            })
+
+        log.debug(f"Found {len(tools)} tool usage patterns")
+        return tools
+
+    def get_memories_in_project(
+        self,
+        project_id: str,
+        uuids: list[str],
+    ) -> set[str]:
+        """Filter memory UUIDs to only those belonging to a specific project.
+
+        A memory belongs to a project if:
+        1. It's a session_summary directly linked to the project (BELONGS_TO)
+        2. It's a child of a session_summary linked to the project (CONTAINS chain)
+
+        Args:
+            project_id: Project identifier
+            uuids: List of memory UUIDs to filter
+
+        Returns:
+            Set of UUIDs that belong to the project
+        """
+        log.trace(f"Filtering {len(uuids)} memories for project: {project_id}")
+
+        if not uuids:
+            return set()
+
+        result = self.graph.query(
+            """
+            MATCH (p:Project {id: $project_id})
+            OPTIONAL MATCH (session:Memory)-[:BELONGS_TO]->(p)
+            WITH collect(session.uuid) AS session_uuids
+
+            // Get all memories that are session summaries or children of session summaries
+            UNWIND $uuids AS uuid
+            MATCH (m:Memory {uuid: uuid})
+            WHERE m.uuid IN session_uuids
+               OR EXISTS {
+                   MATCH (session:Memory)-[:CONTAINS*1..3]->(m)
+                   WHERE session.uuid IN session_uuids
+               }
+            RETURN m.uuid
+            """,
+            {"project_id": project_id, "uuids": uuids},
+        )
+
+        project_uuids = {record[0] for record in result.result_set}
+        log.debug(f"Project filter: {len(project_uuids)}/{len(uuids)} memories belong to {project_id}")
+        return project_uuids
+
+    def get_projects(self, limit: int = 50) -> list[dict]:
+        """Get all tracked projects sorted by session count.
+
+        Args:
+            limit: Maximum number of projects to return
+
+        Returns:
+            List of project dicts with id, path, session_count, created_at, last_updated
+        """
+        log.trace(f"Fetching projects, limit={limit}")
+
+        result = self.graph.query(
+            """
+            MATCH (p:Project)
+            RETURN p.id, p.path, p.session_count, p.created_at, p.last_updated
+            ORDER BY p.session_count DESC
+            LIMIT $limit
+            """,
+            {"limit": limit},
+        )
+
+        projects = []
+        for record in result.result_set:
+            projects.append({
+                "id": record[0],
+                "path": record[1],
+                "session_count": record[2] or 0,
+                "created_at": record[3],
+                "last_updated": record[4],
+            })
+
+        log.debug(f"Retrieved {len(projects)} projects")
+        return projects
