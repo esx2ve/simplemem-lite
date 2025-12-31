@@ -37,6 +37,7 @@ class DatabaseManager:
     """
 
     VECTOR_TABLE_NAME = "memories"
+    CODE_TABLE_NAME = "code_chunks"
     GRAPH_NAME = "simplemem"
 
     def __init__(self, config: Config):
@@ -76,6 +77,11 @@ class DatabaseManager:
             # Create indexes for Entity nodes
             self.graph.query("CREATE INDEX FOR (e:Entity) ON (e.name)")
             self.graph.query("CREATE INDEX FOR (e:Entity) ON (e.type)")
+            # Create indexes for CodeChunk nodes (P1: entity linking)
+            self.graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.uuid)")
+            self.graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.filepath)")
+            # Create index for ProjectIndex nodes (P2: staleness detection)
+            self.graph.query("CREATE INDEX FOR (p:ProjectIndex) ON (p.project_root)")
             log.debug("FalkorDB indexes created")
         except Exception as e:
             # Indexes may already exist
@@ -105,6 +111,31 @@ class DatabaseManager:
             log.debug(f"LanceDB table '{self.VECTOR_TABLE_NAME}' already exists")
 
         self.lance_table = self.lance_db.open_table(self.VECTOR_TABLE_NAME)
+
+        # Initialize code search table if enabled
+        if self.config.code_index_enabled:
+            self._init_code_table()
+
+    def _init_code_table(self) -> None:
+        """Initialize LanceDB table for code chunks."""
+        log.trace("Checking code_chunks table")
+        if self.CODE_TABLE_NAME not in self.lance_db.table_names():
+            log.debug(f"Creating code_chunks table with embedding_dim={self.config.embedding_dim}")
+            schema = pa.schema([
+                pa.field("uuid", pa.string()),
+                pa.field("vector", pa.list_(pa.float32(), self.config.embedding_dim)),
+                pa.field("content", pa.string()),
+                pa.field("filepath", pa.string()),
+                pa.field("project_root", pa.string()),
+                pa.field("start_line", pa.int32()),
+                pa.field("end_line", pa.int32()),
+            ])
+            self.lance_db.create_table(self.CODE_TABLE_NAME, schema=schema)
+            log.info(f"LanceDB table '{self.CODE_TABLE_NAME}' created")
+        else:
+            log.debug(f"LanceDB table '{self.CODE_TABLE_NAME}' already exists")
+
+        self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
 
     def execute_graph(self, query: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a graph query with optional parameters.
@@ -588,6 +619,350 @@ class DatabaseManager:
         results = search.to_list()
         log.debug(f"Vector search returned {len(results)} results")
         return results
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # CODE SEARCH METHODS
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def add_code_chunks(self, chunks: list[dict[str, Any]]) -> int:
+        """Add code chunks to the code index.
+
+        Args:
+            chunks: List of dicts with keys: uuid, vector, content, filepath, project_root, start_line, end_line
+
+        Returns:
+            Number of chunks added
+        """
+        if not self.config.code_index_enabled:
+            log.warning("Code indexing disabled, skipping add_code_chunks")
+            return 0
+
+        if not chunks:
+            return 0
+
+        log.info(f"Adding {len(chunks)} code chunks to index")
+        self.code_table.add(chunks)
+        log.debug(f"Code chunks added successfully")
+        return len(chunks)
+
+    def search_code(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        project_root: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search for similar code chunks.
+
+        Args:
+            query_vector: Query embedding
+            limit: Maximum results
+            project_root: Optional filter by project root path
+
+        Returns:
+            List of matching code chunks with distance scores
+        """
+        if not self.config.code_index_enabled:
+            log.warning("Code indexing disabled, returning empty results")
+            return []
+
+        log.trace(f"Searching code: limit={limit}, project_root={project_root}")
+        search = self.code_table.search(query_vector).limit(limit)
+
+        if project_root:
+            search = search.where(f"project_root = '{project_root}'")
+
+        results = search.to_list()
+        log.debug(f"Code search returned {len(results)} results")
+        return results
+
+    def clear_code_index(self, project_root: str | None = None) -> int:
+        """Clear code index for a project or all projects.
+
+        Args:
+            project_root: If provided, only clear chunks from this project
+
+        Returns:
+            Number of chunks deleted
+        """
+        if not self.config.code_index_enabled:
+            return 0
+
+        if project_root:
+            log.info(f"Clearing code index for project: {project_root}")
+            # Count before delete
+            try:
+                count = len(self.code_table.search([0.0] * self.config.embedding_dim)
+                           .where(f"project_root = '{project_root}'")
+                           .limit(100000).to_list())
+            except Exception:
+                count = 0
+            self.code_table.delete(f"project_root = '{project_root}'")
+        else:
+            log.info("Clearing entire code index")
+            try:
+                count = self.code_table.count_rows()
+            except Exception:
+                count = 0
+            # Drop and recreate table
+            self.lance_db.drop_table(self.CODE_TABLE_NAME)
+            self._init_code_table()
+
+        log.info(f"Cleared {count} code chunks")
+        return count
+
+    def get_code_stats(self, project_root: str | None = None) -> dict[str, Any]:
+        """Get statistics about the code index.
+
+        Args:
+            project_root: Optional filter by project
+
+        Returns:
+            Dict with chunk_count and unique files
+        """
+        if not self.config.code_index_enabled:
+            return {"enabled": False, "chunk_count": 0}
+
+        try:
+            total = self.code_table.count_rows()
+            # Get sample to count unique files (approximate)
+            sample = self.code_table.search([0.0] * self.config.embedding_dim).limit(1000).to_list()
+            unique_files = len(set(r.get("filepath", "") for r in sample))
+            return {
+                "enabled": True,
+                "chunk_count": total,
+                "unique_files_sample": unique_files,
+                "project_root": project_root,
+            }
+        except Exception as e:
+            log.error(f"Failed to get code stats: {e}")
+            return {"enabled": True, "error": str(e)}
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # P1: ENTITY LINKING (CODE ↔ MEMORY BRIDGE)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def add_code_chunk_node(
+        self,
+        uuid: str,
+        filepath: str,
+        project_root: str,
+        start_line: int,
+        end_line: int,
+    ) -> None:
+        """Add a CodeChunk node to the graph for entity linking.
+
+        Args:
+            uuid: Unique identifier (matches LanceDB)
+            filepath: Relative file path
+            project_root: Project root path
+            start_line: Starting line number
+            end_line: Ending line number
+        """
+        log.trace(f"Adding CodeChunk node: {filepath}:{start_line}-{end_line}")
+        self.graph.query(
+            """
+            MERGE (c:CodeChunk {uuid: $uuid})
+            ON CREATE SET
+                c.filepath = $filepath,
+                c.project_root = $project_root,
+                c.start_line = $start_line,
+                c.end_line = $end_line,
+                c.created_at = timestamp()
+            """,
+            {
+                "uuid": uuid,
+                "filepath": filepath,
+                "project_root": project_root,
+                "start_line": start_line,
+                "end_line": end_line,
+            },
+        )
+
+    def link_code_to_entity(
+        self,
+        chunk_uuid: str,
+        entity_name: str,
+        entity_type: str,
+        relation: str = "DEFINES",
+    ) -> None:
+        """Link a CodeChunk to an Entity node.
+
+        Args:
+            chunk_uuid: CodeChunk UUID
+            entity_name: Entity name (function, class, import, etc.)
+            entity_type: Entity type (function, class, import, file)
+            relation: Relationship type (DEFINES, IMPORTS, CALLS, etc.)
+        """
+        log.trace(f"Linking code {chunk_uuid[:8]}... to {entity_type}:{entity_name}")
+        # Ensure entity exists
+        self.add_entity_node(entity_name, entity_type)
+        # Create relationship
+        self.graph.query(
+            """
+            MATCH (c:CodeChunk {uuid: $chunk_uuid}), (e:Entity {name: $entity_name, type: $entity_type})
+            MERGE (c)-[r:REFERENCES {relation: $relation}]->(e)
+            ON CREATE SET r.created_at = timestamp()
+            """,
+            {
+                "chunk_uuid": chunk_uuid,
+                "entity_name": entity_name,
+                "entity_type": entity_type,
+                "relation": relation,
+            },
+        )
+
+    def get_code_related_memories(
+        self,
+        chunk_uuid: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Find memories that share entities with a code chunk.
+
+        Args:
+            chunk_uuid: CodeChunk UUID
+            limit: Maximum results
+
+        Returns:
+            List of related memories with shared entity info
+        """
+        log.trace(f"Finding memories related to code chunk: {chunk_uuid[:8]}...")
+        result = self.graph.query(
+            """
+            MATCH (c:CodeChunk {uuid: $uuid})-[:REFERENCES]->(e:Entity)<-[:REFERENCES|READS|MODIFIES]-(m:Memory)
+            RETURN DISTINCT
+                m.uuid AS uuid,
+                m.content AS content,
+                m.type AS type,
+                m.session_id AS session_id,
+                collect(DISTINCT e.name) AS shared_entities
+            ORDER BY size(shared_entities) DESC
+            LIMIT $limit
+            """,
+            {"uuid": chunk_uuid, "limit": limit},
+        )
+
+        rows = []
+        for record in result.result_set:
+            rows.append({
+                "uuid": record[0],
+                "content": record[1],
+                "type": record[2],
+                "session_id": record[3],
+                "shared_entities": record[4],
+            })
+        log.debug(f"Found {len(rows)} memories related to code chunk")
+        return rows
+
+    def get_memory_related_code(
+        self,
+        memory_uuid: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Find code chunks that share entities with a memory.
+
+        Args:
+            memory_uuid: Memory UUID
+            limit: Maximum results
+
+        Returns:
+            List of related code chunks with shared entity info
+        """
+        log.trace(f"Finding code related to memory: {memory_uuid[:8]}...")
+        result = self.graph.query(
+            """
+            MATCH (m:Memory {uuid: $uuid})-[:REFERENCES|READS|MODIFIES]->(e:Entity)<-[:REFERENCES]-(c:CodeChunk)
+            RETURN DISTINCT
+                c.uuid AS uuid,
+                c.filepath AS filepath,
+                c.project_root AS project_root,
+                c.start_line AS start_line,
+                c.end_line AS end_line,
+                collect(DISTINCT e.name) AS shared_entities
+            ORDER BY size(shared_entities) DESC
+            LIMIT $limit
+            """,
+            {"uuid": memory_uuid, "limit": limit},
+        )
+
+        rows = []
+        for record in result.result_set:
+            rows.append({
+                "uuid": record[0],
+                "filepath": record[1],
+                "project_root": record[2],
+                "start_line": record[3],
+                "end_line": record[4],
+                "shared_entities": record[5],
+            })
+        log.debug(f"Found {len(rows)} code chunks related to memory")
+        return rows
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # P2: STALENESS DETECTION (PROJECT INDEX METADATA)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def set_project_index_metadata(
+        self,
+        project_root: str,
+        commit_hash: str | None,
+        file_count: int,
+        chunk_count: int,
+    ) -> None:
+        """Store/update project index metadata in graph.
+
+        Args:
+            project_root: Absolute path to project root
+            commit_hash: Git commit hash at time of indexing (None if not a git repo)
+            file_count: Number of files indexed
+            chunk_count: Number of chunks created
+        """
+        log.info(f"Setting project index metadata: {project_root} (hash={commit_hash[:8] if commit_hash else 'N/A'})")
+        self.graph.query(
+            """
+            MERGE (p:ProjectIndex {project_root: $project_root})
+            SET p.last_commit_hash = $commit_hash,
+                p.indexed_at = timestamp(),
+                p.file_count = $file_count,
+                p.chunk_count = $chunk_count
+            """,
+            {
+                "project_root": project_root,
+                "commit_hash": commit_hash,
+                "file_count": file_count,
+                "chunk_count": chunk_count,
+            },
+        )
+
+    def get_project_index_metadata(self, project_root: str) -> dict[str, Any] | None:
+        """Get project index metadata from graph.
+
+        Args:
+            project_root: Absolute path to project root
+
+        Returns:
+            Dict with project_root, last_commit_hash, indexed_at, file_count, chunk_count
+            or None if not indexed
+        """
+        log.trace(f"Getting project index metadata: {project_root}")
+        result = self.graph.query(
+            """
+            MATCH (p:ProjectIndex {project_root: $project_root})
+            RETURN p.project_root, p.last_commit_hash, p.indexed_at, p.file_count, p.chunk_count
+            """,
+            {"project_root": project_root},
+        )
+
+        if not result.result_set:
+            return None
+
+        row = result.result_set[0]
+        return {
+            "project_root": row[0],
+            "last_commit_hash": row[1],
+            "indexed_at": row[2],
+            "file_count": row[3],
+            "chunk_count": row[4],
+        }
 
     def get_related_nodes(
         self,
@@ -1441,12 +1816,11 @@ class DatabaseManager:
             // Get all memories that are session summaries or children of session summaries
             UNWIND $uuids AS uuid
             MATCH (m:Memory {uuid: uuid})
-            WHERE m.uuid IN session_uuids
-               OR EXISTS {
-                   MATCH (session:Memory)-[:CONTAINS*1..3]->(m)
-                   WHERE session.uuid IN session_uuids
-               }
-            RETURN m.uuid
+            OPTIONAL MATCH (parent:Memory)-[:CONTAINS*1..3]->(m)
+            WHERE parent.uuid IN session_uuids
+            WITH m, session_uuids, parent
+            WHERE m.uuid IN session_uuids OR parent IS NOT NULL
+            RETURN DISTINCT m.uuid
             """,
             {"project_id": project_id, "uuids": uuids},
         )

@@ -76,6 +76,20 @@ class Config:
         default_factory=lambda: int(_get_env("FALKOR_PORT", "6379"))
     )
 
+    # Code search settings
+    code_index_enabled: bool = field(
+        default_factory=lambda: _get_env_bool("CODE_INDEX_ENABLED", True)
+    )
+    code_index_patterns: str = field(
+        default_factory=lambda: _get_env("CODE_INDEX_PATTERNS", "**/*.py,**/*.ts,**/*.js,**/*.tsx,**/*.jsx")
+    )
+    code_chunk_size: int = field(
+        default_factory=lambda: int(_get_env("CODE_CHUNK_SIZE", "1200"))
+    )
+    code_chunk_overlap: int = field(
+        default_factory=lambda: int(_get_env("CODE_CHUNK_OVERLAP", "150"))
+    )
+
     @property
     def embedding_dim(self) -> int:
         """Get embedding dimension based on model."""
@@ -107,6 +121,8 @@ class Config:
         log.debug(f"use_local_embeddings={self.use_local_embeddings}")
         log.debug(f"embedding_dim={self.embedding_dim}")
         log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}")
+        log.debug(f"code_index_enabled={self.code_index_enabled}")
+        log.debug(f"code_index_patterns={self.code_index_patterns}")
         log.info(f"Config initialized: data_dir={self.data_dir}, traces={self.claude_traces_dir}")
 
     @property
@@ -118,3 +134,8 @@ class Config:
     def vectors_dir(self) -> Path:
         """Directory for LanceDB vector database."""
         return self.data_dir / "vectors"
+
+    @property
+    def code_patterns_list(self) -> list[str]:
+        """Get code patterns as a list."""
+        return [p.strip() for p in self.code_index_patterns.split(",") if p.strip()]

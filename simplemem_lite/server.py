@@ -9,6 +9,7 @@ from dataclasses import asdict
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from simplemem_lite.code_index import CodeIndexer
 from simplemem_lite.config import Config
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
@@ -31,6 +32,9 @@ log.debug("TraceParser initialized")
 
 indexer = HierarchicalIndexer(store, config)
 log.debug("HierarchicalIndexer initialized")
+
+code_indexer = CodeIndexer(store.db, config)
+log.debug("CodeIndexer initialized")
 
 # Debug info
 _debug_info = {
@@ -71,6 +75,14 @@ mcp = FastMCP(
 - `search_memories`: Hybrid vector + graph search
 - `process_trace`: Index Claude Code sessions hierarchically
 - Cross-session insights via shared entities (files, tools, errors)
+
+## CODE SEARCH
+
+- `search_code`: Semantic search over indexed codebases
+- `index_directory`: Index a directory for code search
+- `code_stats`: Get code index statistics
+
+Use `index_directory` once per project, then `search_code` to find implementations.
 """,
 )
 
@@ -344,6 +356,168 @@ async def ask_memories(
     )
 
     log.info(f"Tool: ask_memories complete: confidence={result['confidence']}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CODE SEARCH TOOLS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def search_code(
+    query: str,
+    limit: int = 10,
+    project_root: str | None = None,
+) -> dict:
+    """Search the code index for relevant code snippets.
+
+    Use this to find code implementations, patterns, or specific functionality.
+    Results are ranked by semantic similarity to the query.
+
+    Args:
+        query: Natural language description of what you're looking for
+        limit: Maximum number of results (default: 10)
+        project_root: Optional - filter to specific project directory
+
+    Returns:
+        List of matching code chunks with file paths and line numbers
+    """
+    log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit})")
+    results = code_indexer.search(query, limit, project_root)
+    log.info(f"Tool: search_code complete: {len(results)} results")
+    return {"results": results, "count": len(results)}
+
+
+@mcp.tool()
+async def index_directory(
+    path: str,
+    patterns: list[str] | None = None,
+    clear_existing: bool = True,
+) -> dict:
+    """Index a directory for code search.
+
+    Scans the directory for source files matching the patterns,
+    splits them into semantic chunks, and adds to the search index.
+
+    Args:
+        path: Directory path to index
+        patterns: Optional glob patterns (default: ['**/*.py', '**/*.ts', '**/*.js', '**/*.tsx', '**/*.jsx'])
+        clear_existing: Whether to clear existing index for this directory (default: True)
+
+    Returns:
+        Indexing statistics including files indexed and chunks created
+    """
+    log.info(f"Tool: index_directory called (path={path})")
+    result = code_indexer.index_directory(path, patterns, clear_existing)
+    log.info(f"Tool: index_directory complete: {result.get('files_indexed', 0)} files, {result.get('chunks_created', 0)} chunks")
+    return result
+
+
+@mcp.tool()
+async def code_stats(project_root: str | None = None) -> dict:
+    """Get statistics about the code index.
+
+    Args:
+        project_root: Optional - filter to specific project
+
+    Returns:
+        Statistics including chunk count and unique files
+    """
+    log.info(f"Tool: code_stats called (project_root={project_root})")
+    stats = store.db.get_code_stats(project_root)
+    log.info(f"Tool: code_stats complete: {stats}")
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P1: ENTITY LINKING (CODE ↔ MEMORY BRIDGE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def code_related_memories(
+    chunk_uuid: str,
+    limit: int = 10,
+) -> dict:
+    """Find memories related to a code chunk via shared entities.
+
+    Uses the entity graph to find memories that reference the same entities
+    (files, functions, modules) as the given code chunk.
+
+    Args:
+        chunk_uuid: UUID of the code chunk (from search_code results)
+        limit: Maximum memories to return (default: 10)
+
+    Returns:
+        Dict with related memories and their shared entities
+    """
+    log.info(f"Tool: code_related_memories called (chunk={chunk_uuid[:8]}...)")
+    memories = store.db.get_code_related_memories(chunk_uuid, limit)
+    log.info(f"Tool: code_related_memories complete: {len(memories)} memories found")
+    return {
+        "chunk_uuid": chunk_uuid,
+        "related_memories": memories,
+        "count": len(memories),
+    }
+
+
+@mcp.tool()
+async def memory_related_code(
+    memory_uuid: str,
+    limit: int = 10,
+) -> dict:
+    """Find code chunks related to a memory via shared entities.
+
+    Uses the entity graph to find code chunks that reference the same entities
+    (files, functions, modules) as the given memory.
+
+    Args:
+        memory_uuid: UUID of the memory (from search_memories results)
+        limit: Maximum code chunks to return (default: 10)
+
+    Returns:
+        Dict with related code chunks and their shared entities
+    """
+    log.info(f"Tool: memory_related_code called (memory={memory_uuid[:8]}...)")
+    code_chunks = store.db.get_memory_related_code(memory_uuid, limit)
+    log.info(f"Tool: memory_related_code complete: {len(code_chunks)} chunks found")
+    return {
+        "memory_uuid": memory_uuid,
+        "related_code": code_chunks,
+        "count": len(code_chunks),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P2: STALENESS DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def check_code_staleness(project_root: str) -> dict:
+    """Check if the code index is stale and needs refreshing.
+
+    Uses git to detect changes since last indexing. Returns staleness status
+    with details about changed files.
+
+    Args:
+        project_root: Absolute path to the project root directory
+
+    Returns:
+        Dict with:
+        - is_indexed: Whether project has been indexed
+        - is_stale: Whether index needs refresh
+        - is_git_repo: Whether project is a git repository
+        - indexed_hash: Commit hash when last indexed
+        - current_hash: Current HEAD commit hash
+        - changed_files: Files changed since last index
+        - uncommitted_files: Uncommitted changes
+        - reason: Human-readable explanation
+    """
+    log.info(f"Tool: check_code_staleness called (project={project_root})")
+    result = code_indexer.check_staleness(project_root)
+    log.info(f"Tool: check_code_staleness complete: is_stale={result.get('is_stale')}")
     return result
 
 

@@ -17,6 +17,25 @@ log = get_logger("embeddings")
 # Global config reference (set during initialization)
 _config: Config | None = None
 
+# Global model cache for local embeddings (avoids 2-3s reload per call)
+_local_model: "SentenceTransformer | None" = None  # type: ignore
+
+
+def _get_local_model() -> "SentenceTransformer":
+    """Get or create cached SentenceTransformer model."""
+    global _local_model
+    if _local_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers not installed. "
+                "Install with: pip install sentence-transformers"
+            )
+        log.info("Loading SentenceTransformer model (cached for session)")
+        _local_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _local_model
+
 
 def init_embeddings(config: Config) -> None:
     """Initialize embeddings module with configuration."""
@@ -49,16 +68,7 @@ def _embed_litellm(text: str, model: str) -> list[float]:
 
 def _embed_local(text: str) -> list[float]:
     """Generate embedding via local sentence-transformers."""
-    try:
-        from sentence_transformers import SentenceTransformer
-    except ImportError:
-        raise ImportError(
-            "sentence-transformers not installed. "
-            "Install with: pip install sentence-transformers"
-        )
-
-    # Use a small, fast model
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    model = _get_local_model()
     embedding = model.encode(text, convert_to_numpy=True)
     return embedding.tolist()
 
@@ -99,16 +109,8 @@ def embed_batch(texts: list[str], config: Config | None = None) -> list[list[flo
         cfg = Config()
 
     if cfg.use_local_embeddings:
-        # Local models support batch encoding
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "sentence-transformers not installed. "
-                "Install with: pip install sentence-transformers"
-            )
-
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        # Local models support batch encoding (using cached model)
+        model = _get_local_model()
         embeddings = model.encode(texts, convert_to_numpy=True)
         return [e.tolist() for e in embeddings]
     else:
