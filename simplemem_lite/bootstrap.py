@@ -335,6 +335,171 @@ class Bootstrap:
 
         log.info("Bootstrap orchestrator initialized")
 
+    def _get_hooks_dir(self) -> Path | None:
+        """Get the hooks directory path.
+
+        Returns:
+            Path to hooks directory, or None if not found
+        """
+        # Hooks are in the parent of the package directory
+        package_dir = Path(__file__).parent
+        hooks_dir = package_dir.parent / "hooks"
+        if hooks_dir.exists():
+            return hooks_dir
+
+        # Fallback: check if installed as package
+        import importlib.resources
+
+        try:
+            # For installed packages, hooks might be in package data
+            with importlib.resources.files("simplemem_lite").joinpath("../hooks") as p:
+                if p.exists():
+                    return Path(p)
+        except Exception:
+            pass
+
+        return None
+
+    def _check_hooks_installed(self) -> dict[str, Any]:
+        """Check if hooks are installed in Claude Code settings.
+
+        Returns:
+            Dict with:
+            - installed: bool
+            - settings_file: str (path to settings file)
+            - session_start_hook: bool
+            - stop_hook: bool
+        """
+        settings_file = Path.home() / ".claude" / "settings.json"
+        result = {
+            "installed": False,
+            "settings_file": str(settings_file),
+            "session_start_hook": False,
+            "stop_hook": False,
+        }
+
+        if not settings_file.exists():
+            return result
+
+        try:
+            settings = json.loads(settings_file.read_text())
+            hooks = settings.get("hooks", {})
+
+            # Check for simplemem hooks
+            session_start = hooks.get("SessionStart", [])
+            stop = hooks.get("Stop", [])
+
+            result["session_start_hook"] = any("simplemem" in str(h).lower() for h in session_start)
+            result["stop_hook"] = any("simplemem" in str(h).lower() for h in stop)
+            result["installed"] = result["session_start_hook"] and result["stop_hook"]
+
+        except Exception as e:
+            log.debug(f"Failed to read Claude settings: {e}")
+
+        return result
+
+    def _install_hooks(self) -> dict[str, Any]:
+        """Install hooks to Claude Code settings.
+
+        Returns:
+            Dict with:
+            - success: bool
+            - message: str
+            - hooks_installed: list[str]
+            - restart_required: bool
+        """
+        hooks_dir = self._get_hooks_dir()
+        if hooks_dir is None:
+            return {
+                "success": False,
+                "message": "Hooks directory not found",
+                "hooks_installed": [],
+                "restart_required": False,
+            }
+
+        session_start_hook = hooks_dir / "session-start.sh"
+        stop_hook = hooks_dir / "stop.sh"
+
+        if not session_start_hook.exists() or not stop_hook.exists():
+            return {
+                "success": False,
+                "message": "Hook scripts not found",
+                "hooks_installed": [],
+                "restart_required": False,
+            }
+
+        # Make hooks executable
+        import stat
+        for hook in [session_start_hook, stop_hook]:
+            hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        settings_file = Path.home() / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Load or create settings
+        if settings_file.exists():
+            try:
+                settings = json.loads(settings_file.read_text())
+            except Exception:
+                settings = {}
+        else:
+            settings = {}
+
+        # Initialize hooks structure
+        if "hooks" not in settings:
+            settings["hooks"] = {}
+        if "SessionStart" not in settings["hooks"]:
+            settings["hooks"]["SessionStart"] = []
+        if "Stop" not in settings["hooks"]:
+            settings["hooks"]["Stop"] = []
+
+        hooks_installed = []
+        already_installed = []
+
+        # Add session start hook if not present
+        session_start_path = str(session_start_hook)
+        if not any("simplemem" in str(h).lower() for h in settings["hooks"]["SessionStart"]):
+            settings["hooks"]["SessionStart"].append(session_start_path)
+            hooks_installed.append("SessionStart")
+        else:
+            already_installed.append("SessionStart")
+
+        # Add stop hook if not present
+        stop_path = str(stop_hook)
+        if not any("simplemem" in str(h).lower() for h in settings["hooks"]["Stop"]):
+            settings["hooks"]["Stop"].append(stop_path)
+            hooks_installed.append("Stop")
+        else:
+            already_installed.append("Stop")
+
+        # Write settings
+        try:
+            settings_file.write_text(json.dumps(settings, indent=2))
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Failed to write settings: {e}",
+                "hooks_installed": [],
+                "restart_required": False,
+            }
+
+        if hooks_installed:
+            return {
+                "success": True,
+                "message": f"Installed hooks: {', '.join(hooks_installed)}. Restart Claude Code to activate.",
+                "hooks_installed": hooks_installed,
+                "already_installed": already_installed,
+                "restart_required": True,
+            }
+        else:
+            return {
+                "success": True,
+                "message": "Hooks already installed",
+                "hooks_installed": [],
+                "already_installed": already_installed,
+                "restart_required": False,
+            }
+
     def detect_project_info(self, project_root: str) -> ProjectInfo:
         """Detect project info using the provider pipeline.
 
@@ -418,6 +583,21 @@ class Bootstrap:
                 log.error(f"Watcher start failed: {e}")
                 results["watcher"] = {"error": str(e)}
 
+        # Install hooks if not already installed
+        hook_status = self._check_hooks_installed()
+        if not hook_status["installed"]:
+            hook_result = self._install_hooks()
+            results["hooks"] = hook_result
+            if hook_result["restart_required"]:
+                log.info("Hooks installed - Claude Code restart required")
+        else:
+            results["hooks"] = {
+                "success": True,
+                "message": "Hooks already installed",
+                "hooks_installed": [],
+                "restart_required": False,
+            }
+
         # Mark project as bootstrapped
         state = self.project_manager.mark_bootstrapped(
             project_root=project_root,
@@ -430,6 +610,7 @@ class Bootstrap:
             "project_name": state.project_name,
         }
         results["success"] = True
+        results["restart_required"] = results["hooks"].get("restart_required", False)
 
         log.info(f"Bootstrap complete for: {project_root}")
         return results

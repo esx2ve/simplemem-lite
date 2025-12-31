@@ -34,6 +34,23 @@ _JS_PATTERNS = {
     "const_func": re.compile(r"^(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=])\s*=>", re.MULTILINE),
 }
 
+# Directories to always exclude from indexing
+_EXCLUDE_DIRS = {
+    # Version control
+    ".git", ".svn", ".hg",
+    # Python
+    "__pycache__", ".venv", "venv", ".env", ".tox", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "*.egg-info", "dist", "build", "eggs",
+    # Node.js
+    "node_modules", ".npm", ".yarn", "bower_components",
+    # IDE/Editor
+    ".idea", ".vscode", ".vs", ".settings",
+    # Build outputs
+    "target", "out", "bin", "obj",
+    # Coverage/Test
+    "coverage", ".coverage", "htmlcov",
+}
+
 
 class CodeIndexer:
     """Indexes code files for semantic search.
@@ -52,6 +69,25 @@ class CodeIndexer:
         self.db = db
         self.config = config
         log.info("CodeIndexer initialized")
+
+    def _should_exclude(self, path: Path) -> bool:
+        """Check if a path should be excluded from indexing.
+
+        Args:
+            path: File or directory path to check
+
+        Returns:
+            True if path should be excluded
+        """
+        # Check all path components for excluded directories
+        for part in path.parts:
+            if part in _EXCLUDE_DIRS:
+                return True
+            # Handle wildcard patterns like *.egg-info
+            for excl in _EXCLUDE_DIRS:
+                if "*" in excl and part.endswith(excl.replace("*", "")):
+                    return True
+        return False
 
     def index_directory(
         self,
@@ -81,13 +117,15 @@ class CodeIndexer:
             cleared = self.db.clear_code_index(str(root))
             log.info(f"Cleared {cleared} existing chunks")
 
-        # Find all matching files
+        # Find all matching files, excluding common non-source directories
         files = []
         for pattern in patterns:
-            files.extend(root.glob(pattern))
+            for f in root.glob(pattern):
+                if f.is_file() and not self._should_exclude(f):
+                    files.append(f)
 
-        # Remove duplicates and filter out non-files
-        files = sorted(set(f for f in files if f.is_file()))
+        # Remove duplicates
+        files = sorted(set(files))
         log.info(f"Found {len(files)} files to index")
 
         if not files:
