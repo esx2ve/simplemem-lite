@@ -19,7 +19,7 @@ from simplemem_lite.extractors import (
     extract_goal,
     EnhancedExtraction,
 )
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem, MemoryStore
 
 log = get_logger("traces")

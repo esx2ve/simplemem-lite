@@ -14,7 +14,7 @@ import litellm
 
 from simplemem_lite.code_index import CodeIndexer
 from simplemem_lite.config import Config
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 from simplemem_lite.projects import ProjectManager, ProjectState
 from simplemem_lite.watcher import ProjectWatcherManager
 

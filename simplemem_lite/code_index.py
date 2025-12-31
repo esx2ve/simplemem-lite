@@ -16,7 +16,7 @@ import pathspec
 from simplemem_lite.config import Config
 from simplemem_lite.db import DatabaseManager
 from simplemem_lite.embeddings import embed, embed_batch
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 
 log = get_logger("code_index")
 

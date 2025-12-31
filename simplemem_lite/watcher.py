@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 
 if TYPE_CHECKING:
     from simplemem_lite.code_index import CodeIndexer

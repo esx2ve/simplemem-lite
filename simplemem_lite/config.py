@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 
 log = get_logger("config")
 

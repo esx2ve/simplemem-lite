@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from simplemem_lite.config import Config
-from simplemem_lite.logging import get_logger
+from simplemem_lite.log_config import get_logger
 
 if TYPE_CHECKING:
     pass
