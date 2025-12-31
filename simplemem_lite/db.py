@@ -710,6 +710,67 @@ class DatabaseManager:
         log.info(f"Cleared {count} code chunks")
         return count
 
+    def delete_chunks_by_filepath(
+        self,
+        project_root: str,
+        filepath: str,
+    ) -> int:
+        """Delete all chunks for a specific file (for incremental updates).
+
+        Args:
+            project_root: Project root path
+            filepath: Relative file path within the project
+
+        Returns:
+            Number of chunks deleted
+        """
+        if not self.config.code_index_enabled:
+            return 0
+
+        log.info(f"Deleting chunks for file: {filepath} in {project_root}")
+
+        # Sanitize inputs to prevent issues with special characters
+        safe_project_root = project_root.replace("'", "''")
+        safe_filepath = filepath.replace("'", "''")
+        where_clause = f"project_root = '{safe_project_root}' AND filepath = '{safe_filepath}'"
+
+        with self._write_lock:
+            # Collect all chunk UUIDs using pagination (no arbitrary limit)
+            chunk_uuids: list[str] = []
+            try:
+                offset = 0
+                batch_size = 1000
+                while True:
+                    matches = self.code_table.search([0.0] * self.config.embedding_dim).where(
+                        where_clause
+                    ).limit(batch_size).to_list()
+                    if not matches:
+                        break
+                    chunk_uuids.extend(m.get("uuid") for m in matches if m.get("uuid"))
+                    if len(matches) < batch_size:
+                        break
+                    offset += batch_size
+            except Exception:
+                chunk_uuids = []
+
+            count = len(chunk_uuids)
+            if count == 0:
+                log.debug(f"No chunks found for {filepath}")
+                return 0
+
+            # Delete from LanceDB
+            self.code_table.delete(where_clause)
+
+            # Delete CodeChunk nodes and their edges from FalkorDB
+            for uuid in chunk_uuids:
+                self.graph.query(
+                    "MATCH (c:CodeChunk {uuid: $uuid}) DETACH DELETE c",
+                    {"uuid": uuid},
+                )
+
+            log.info(f"Deleted {count} chunks for {filepath}")
+            return count
+
     def get_code_stats(self, project_root: str | None = None) -> dict[str, Any]:
         """Get statistics about the code index.
 

@@ -352,6 +352,106 @@ class CodeIndexer:
 
         return len(entities)
 
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # P3: SINGLE-FILE INDEXING (FOR INCREMENTAL UPDATES)
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def index_file(
+        self,
+        file_path: str | Path,
+        project_root: str | Path,
+    ) -> dict[str, Any]:
+        """Index or re-index a single file (incremental update).
+
+        Deletes existing chunks for this file, then re-indexes it.
+        Used by the file watcher for real-time updates.
+
+        Args:
+            file_path: Absolute path to the file
+            project_root: Project root directory
+
+        Returns:
+            Dict with chunks_created, filepath, and any errors
+        """
+        file_path = Path(file_path).resolve()
+        project_root = Path(project_root).resolve()
+
+        if not file_path.exists():
+            log.warning(f"File does not exist: {file_path}")
+            return {"error": f"File not found: {file_path}", "chunks_created": 0}
+
+        if not file_path.is_file():
+            log.warning(f"Not a file: {file_path}")
+            return {"error": f"Not a file: {file_path}", "chunks_created": 0}
+
+        try:
+            relative_path = str(file_path.relative_to(project_root))
+        except ValueError:
+            log.error(f"File {file_path} is not under project root {project_root}")
+            return {"error": "File not under project root", "chunks_created": 0}
+
+        log.info(f"Indexing single file: {relative_path}")
+
+        # Delete existing chunks for this file
+        deleted = self.db.delete_chunks_by_filepath(str(project_root), relative_path)
+        if deleted > 0:
+            log.debug(f"Deleted {deleted} existing chunks for {relative_path}")
+
+        # Re-index the file
+        try:
+            chunks_created = self._index_file(file_path, project_root)
+            log.info(f"Indexed {relative_path}: {chunks_created} chunks created")
+            return {
+                "filepath": relative_path,
+                "project_root": str(project_root),
+                "chunks_created": chunks_created,
+                "chunks_deleted": deleted,
+            }
+        except Exception as e:
+            log.error(f"Failed to index {relative_path}: {e}")
+            return {
+                "filepath": relative_path,
+                "project_root": str(project_root),
+                "error": str(e),
+                "chunks_created": 0,
+            }
+
+    def delete_file(
+        self,
+        file_path: str | Path,
+        project_root: str | Path,
+    ) -> dict[str, Any]:
+        """Remove a file from the index.
+
+        Used by the file watcher when files are deleted.
+
+        Args:
+            file_path: Absolute path to the file (or what it was)
+            project_root: Project root directory
+
+        Returns:
+            Dict with chunks_deleted count
+        """
+        file_path = Path(file_path)
+        project_root = Path(project_root).resolve()
+
+        try:
+            relative_path = str(file_path.relative_to(project_root))
+        except ValueError:
+            # If file_path is already relative, use it directly
+            relative_path = str(file_path)
+
+        log.info(f"Deleting file from index: {relative_path}")
+
+        deleted = self.db.delete_chunks_by_filepath(str(project_root), relative_path)
+        log.info(f"Deleted {deleted} chunks for {relative_path}")
+
+        return {
+            "filepath": relative_path,
+            "project_root": str(project_root),
+            "chunks_deleted": deleted,
+        }
+
     def search(
         self,
         query: str,

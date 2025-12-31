@@ -3,6 +3,7 @@
 Exposes memory operations via MCP protocol with tools, resources, and prompts.
 """
 
+import atexit
 import json
 import os
 from dataclasses import asdict
@@ -14,6 +15,7 @@ from simplemem_lite.config import Config
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
 from simplemem_lite.traces import HierarchicalIndexer, TraceParser
+from simplemem_lite.watcher import ProjectWatcherManager
 
 log = get_logger("server")
 
@@ -35,6 +37,19 @@ log.debug("HierarchicalIndexer initialized")
 
 code_indexer = CodeIndexer(store.db, config)
 log.debug("CodeIndexer initialized")
+
+watcher_manager = ProjectWatcherManager(code_indexer, config.code_patterns_list)
+log.debug("ProjectWatcherManager initialized")
+
+
+def _cleanup_watchers() -> None:
+    """Cleanup all watchers on server shutdown."""
+    log.info("Cleaning up file watchers...")
+    watcher_manager.stop_all()
+    log.info("File watchers cleaned up")
+
+
+atexit.register(_cleanup_watchers)
 
 # Debug info
 _debug_info = {
@@ -81,8 +96,17 @@ mcp = FastMCP(
 - `search_code`: Semantic search over indexed codebases
 - `index_directory`: Index a directory for code search
 - `code_stats`: Get code index statistics
+- `check_code_staleness`: Check if index needs refresh
 
 Use `index_directory` once per project, then `search_code` to find implementations.
+
+## FILE WATCHING (Auto-update)
+
+- `start_code_watching`: Start watching a directory for changes
+- `stop_code_watching`: Stop watching a directory
+- `get_watcher_status`: Show all active watchers
+
+Use `start_code_watching` after initial index to keep it up-to-date automatically.
 """,
 )
 
@@ -518,6 +542,62 @@ async def check_code_staleness(project_root: str) -> dict:
     log.info(f"Tool: check_code_staleness called (project={project_root})")
     result = code_indexer.check_staleness(project_root)
     log.info(f"Tool: check_code_staleness complete: is_stale={result.get('is_stale')}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P3: FILE WATCHER (AUTO-CAPTURE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def start_code_watching(project_root: str) -> dict:
+    """Start watching a project directory for file changes.
+
+    Automatically updates the code index when files are created, modified,
+    or deleted. Uses debouncing to coalesce rapid changes.
+
+    Args:
+        project_root: Absolute path to the project root directory
+
+    Returns:
+        Dict with status and project info
+    """
+    log.info(f"Tool: start_code_watching called (project={project_root})")
+    result = watcher_manager.start_watching(project_root)
+    log.info(f"Tool: start_code_watching complete: status={result.get('status', result.get('error'))}")
+    return result
+
+
+@mcp.tool()
+async def stop_code_watching(project_root: str) -> dict:
+    """Stop watching a project directory.
+
+    Args:
+        project_root: Absolute path to the project root directory
+
+    Returns:
+        Dict with status and final statistics
+    """
+    log.info(f"Tool: stop_code_watching called (project={project_root})")
+    result = watcher_manager.stop_watching(project_root)
+    log.info(f"Tool: stop_code_watching complete: status={result.get('status', result.get('error'))}")
+    return result
+
+
+@mcp.tool()
+async def get_watcher_status() -> dict:
+    """Get status of all active file watchers.
+
+    Returns:
+        Dict with:
+        - watching: Number of projects being watched
+        - patterns: File patterns being monitored
+        - projects: Dict of project status with stats per project
+    """
+    log.info("Tool: get_watcher_status called")
+    result = watcher_manager.get_status()
+    log.info(f"Tool: get_watcher_status complete: watching={result.get('watching', 0)} projects")
     return result
 
 
