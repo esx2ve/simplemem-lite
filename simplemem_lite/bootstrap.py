@@ -456,18 +456,43 @@ class Bootstrap:
         hooks_installed = []
         already_installed = []
 
-        # Add session start hook if not present
+        # Helper to check if simplemem hook already exists
+        def has_simplemem_hook(hook_list):
+            for item in hook_list:
+                if isinstance(item, dict) and "hooks" in item:
+                    for hook in item.get("hooks", []):
+                        if isinstance(hook, dict):
+                            cmd = hook.get("command", "")
+                            if "simplemem" in cmd.lower():
+                                return True
+            return False
+
+        # Add session start hook if not present (new format with matchers)
         session_start_path = str(session_start_hook)
-        if not any("simplemem" in str(h).lower() for h in settings["hooks"]["SessionStart"]):
-            settings["hooks"]["SessionStart"].append(session_start_path)
+        if not has_simplemem_hook(settings["hooks"]["SessionStart"]):
+            settings["hooks"]["SessionStart"].append({
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": session_start_path
+                    }
+                ]
+            })
             hooks_installed.append("SessionStart")
         else:
             already_installed.append("SessionStart")
 
-        # Add stop hook if not present
+        # Add stop hook if not present (new format with matchers)
         stop_path = str(stop_hook)
-        if not any("simplemem" in str(h).lower() for h in settings["hooks"]["Stop"]):
-            settings["hooks"]["Stop"].append(stop_path)
+        if not has_simplemem_hook(settings["hooks"]["Stop"]):
+            settings["hooks"]["Stop"].append({
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": stop_path
+                    }
+                ]
+            })
             hooks_installed.append("Stop")
         else:
             already_installed.append("Stop")
