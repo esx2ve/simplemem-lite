@@ -361,6 +361,9 @@ class HierarchicalIndexer:
     async def index_session(self, session_id: str, ctx=None) -> SessionIndex | None:
         """Index a Claude Code session with hierarchical summaries.
 
+        Uses UPSERT semantics: if session was previously indexed, all existing
+        memories for that session are deleted first to prevent duplicates.
+
         Args:
             session_id: Session UUID to index
             ctx: Optional MCP Context for progress reporting
@@ -370,6 +373,11 @@ class HierarchicalIndexer:
         """
         log.info(f"Indexing session: {session_id}")
         log.debug(f"Using parser with traces_dir={self.parser.traces_dir}")
+
+        # UPSERT: Clean up any existing index for this session
+        cleanup_result = self.store.db.delete_session_memories(session_id)
+        if cleanup_result["memories_deleted"] > 0:
+            log.info(f"UPSERT: Deleted {cleanup_result['memories_deleted']} existing memories for session {session_id}")
 
         async def report(progress: int, msg: str = ""):
             """Helper to report progress if ctx available."""

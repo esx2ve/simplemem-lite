@@ -594,6 +594,49 @@ class DatabaseManager:
         """
         self.lance_table.delete(f'uuid = "{uuid}"')
 
+    def delete_session_memories(self, session_id: str) -> dict:
+        """Delete all memories for a session (UPSERT semantics).
+
+        Removes all Memory nodes, their edges, and vectors for a given session_id.
+        Used to enable re-indexing without duplicates.
+
+        Args:
+            session_id: Session UUID to clean up
+
+        Returns:
+            dict with counts of deleted items
+        """
+        log.info(f"Deleting session memories: {session_id}")
+
+        # Get all memory UUIDs for this session from graph
+        result = self.graph.query(
+            "MATCH (m:Memory {session_id: $session_id}) RETURN m.uuid",
+            {"session_id": session_id},
+        )
+        uuids = [row[0] for row in result.result_set if row[0]]
+        log.debug(f"Found {len(uuids)} memories to delete for session {session_id}")
+
+        if not uuids:
+            return {"memories_deleted": 0, "vectors_deleted": 0}
+
+        # Delete from graph (with all relationships via DETACH DELETE)
+        self.graph.query(
+            "MATCH (m:Memory {session_id: $session_id}) DETACH DELETE m",
+            {"session_id": session_id},
+        )
+        log.debug(f"Deleted {len(uuids)} memory nodes from graph")
+
+        # Delete from vectors
+        # LanceDB delete requires SQL-style filter
+        for uuid in uuids:
+            try:
+                self.lance_table.delete(f'uuid = "{uuid}"')
+            except Exception as e:
+                log.trace(f"Vector delete failed (may not exist): {e}")
+
+        log.info(f"Session cleanup complete: deleted {len(uuids)} memories")
+        return {"memories_deleted": len(uuids), "vectors_deleted": len(uuids)}
+
     def search_vectors(
         self,
         query_vector: list[float],

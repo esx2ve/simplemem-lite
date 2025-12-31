@@ -22,6 +22,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from simplemem_lite.bootstrap import Bootstrap
 from simplemem_lite.code_index import CodeIndexer
 from simplemem_lite.config import Config
+from simplemem_lite.extractors import extract_with_actions
 from simplemem_lite.logging import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
 from simplemem_lite.projects import ProjectManager
@@ -434,6 +435,25 @@ async def store_memory(
     )
     result = store.store(item)
     log.info(f"Tool: store_memory complete: {result[:8]}...")
+
+    # ECL-LITE: Extract entities and link to memory (graph-first approach)
+    try:
+        extraction = await extract_with_actions(text, config)
+        if not extraction.is_empty():
+            linked_count = 0
+            for entity in extraction.entities:
+                success = store.add_verb_edge(
+                    memory_id=result,
+                    entity_name=entity.name,
+                    entity_type=entity.type,
+                    action=entity.action,
+                )
+                if success:
+                    linked_count += 1
+            log.info(f"ECL-LITE: Linked {linked_count} entities to memory {result[:8]}...")
+    except Exception as e:
+        log.warning(f"ECL-LITE entity extraction failed (non-fatal): {e}")
+
     return result
 
 
