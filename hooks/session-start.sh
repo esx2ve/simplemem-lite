@@ -7,18 +7,30 @@
 # Output: Context string for Claude (stdout)
 #
 # Install: Add to ~/.claude/settings.json hooks.SessionStart
+#
+# Race condition handling:
+# If MCP server isn't ready yet (no lock file), we write a pending session
+# file and output a CRITICAL message that instructs Claude to call
+# get_project_status, which will process the pending session.
 
 set -e
 
-# Lock file location
+# File locations
 LOCK_FILE="${HOME}/.simplemem_lite/server.lock"
+PENDING_FILE="${HOME}/.simplemem_lite/pending_session.json"
+DATA_DIR="${HOME}/.simplemem_lite"
 
 # Read input from stdin
 INPUT=$(cat)
 
-# Check if lock file exists
+# Ensure data directory exists
+mkdir -p "$DATA_DIR"
+
+# Check if lock file exists (server ready)
 if [[ ! -f "$LOCK_FILE" ]]; then
-    # Server not running - silent exit (don't break Claude)
+    # Server not ready - write pending session and inject deferred prompt
+    echo "$INPUT" > "$PENDING_FILE"
+    echo "[SimpleMem] CRITICAL: MCP server starting. You MUST call get_project_status(project_root=\"\${cwd}\") immediately to load session context."
     exit 0
 fi
 

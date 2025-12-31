@@ -931,9 +931,29 @@ async def get_project_status(project_root: str) -> dict:
         - is_watching: Whether file watcher is active
         - project_name: Detected project name
         - should_ask: Whether to prompt for bootstrap
+        - deferred_context: Context from pending session (if any)
     """
     log.info(f"Tool: get_project_status called (project={project_root})")
+
+    # Check for pending session from deferred hook execution
+    pending_file = Path.home() / ".simplemem_lite" / "pending_session.json"
+    deferred_context = None
+    if pending_file.exists():
+        try:
+            import json
+            pending_data = json.loads(pending_file.read_text())
+            pending_cwd = pending_data.get("cwd", "")
+            # Use project_root from pending if not provided, or validate match
+            effective_root = project_root or project_manager.detect_project_root(pending_cwd)
+            deferred_context = bootstrap.generate_context_injection(effective_root)
+            pending_file.unlink()  # Clean up pending file
+            log.info(f"Processed deferred session context for {effective_root}")
+        except Exception as e:
+            log.warning(f"Failed to process pending session: {e}")
+
     result = bootstrap.get_bootstrap_status(project_root)
+    if deferred_context:
+        result["deferred_context"] = deferred_context
     log.info(f"Tool: get_project_status complete: bootstrapped={result.get('is_bootstrapped')}")
     return result
 
