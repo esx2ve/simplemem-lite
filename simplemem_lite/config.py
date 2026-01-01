@@ -126,6 +126,26 @@ class Config:
         default_factory=lambda: int(_get_env("CROSS_SESSION_LIMIT", "50"))
     )
 
+    # Auto-indexer settings (P2: Active Session Handling)
+    auto_index_enabled: bool = field(
+        default_factory=lambda: _get_env_bool("AUTO_INDEX_ENABLED", False)
+    )
+    auto_index_poll_interval: int = field(
+        default_factory=lambda: int(_get_env("AUTO_INDEX_POLL_INTERVAL", "120"))  # 2 minutes
+    )
+    auto_index_max_file_mb: int = field(
+        default_factory=lambda: int(_get_env("AUTO_INDEX_MAX_FILE_MB", "5"))
+    )
+    auto_index_max_per_day: int = field(
+        default_factory=lambda: int(_get_env("AUTO_INDEX_MAX_PER_DAY", "10"))
+    )
+    auto_index_enabled_at: float = field(
+        default_factory=lambda: float(_get_env("AUTO_INDEX_ENABLED_AT", "0.0"))
+    )
+    auto_index_stability_cycles: int = field(
+        default_factory=lambda: int(_get_env("AUTO_INDEX_STABILITY_CYCLES", "2"))
+    )
+
     @property
     def embedding_dim(self) -> int:
         """Get embedding dimension based on model."""

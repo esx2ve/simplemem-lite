@@ -14,6 +14,7 @@ from simplemem_lite.config import Config
 
 if TYPE_CHECKING:
     from simplemem_lite.projects import ProjectManager
+    from simplemem_lite.session_state import SessionStateDB
 from simplemem_lite.extractors import (
     extract_with_actions_batch,
     extract_goal,
@@ -345,17 +346,24 @@ class HierarchicalIndexer:
             └── Message (many)
     """
 
-    def __init__(self, store: MemoryStore, config: Config | None = None):
+    def __init__(
+        self,
+        store: MemoryStore,
+        config: Config | None = None,
+        session_state_db: "SessionStateDB | None" = None,
+    ):
         """Initialize indexer.
 
         Args:
             store: Memory store for saving memories
             config: Optional configuration
+            session_state_db: Optional SessionStateDB for robust state tracking
         """
         log.debug("Initializing HierarchicalIndexer")
         self.store = store
         self.config = config or Config()
         self.parser = TraceParser(self.config.claude_traces_dir)
+        self.session_state_db = session_state_db
         log.info(f"HierarchicalIndexer initialized with traces_dir={self.config.claude_traces_dir}")
 
     async def index_session(self, session_id: str, ctx=None) -> SessionIndex | None:
@@ -671,13 +679,17 @@ class HierarchicalIndexer:
     ) -> dict:
         """Process only new messages in a session (delta indexing).
 
-        Uses project state to track last processed index and detect file rotation.
-        Much more efficient than full reindexing for active sessions.
+        Uses SessionStateDB (if available) for robust state tracking with:
+        - Per-session locking to prevent race conditions
+        - Content hash checking to skip unchanged files
+        - Byte offset tracking for efficient incremental reads
+
+        Falls back to ProjectManager-based tracking if SessionStateDB not available.
 
         Args:
             session_id: Session UUID to index
             project_root: Project root path
-            project_manager: ProjectManager for cursor tracking
+            project_manager: ProjectManager for cursor tracking (legacy)
             transcript_path: Optional explicit path to transcript
 
         Returns:
@@ -695,77 +707,133 @@ class HierarchicalIndexer:
             if not session_path:
                 return {"error": f"Session {session_id} not found", "processed": 0}
 
-        # Get project state for cursor info
-        state = project_manager.get_project_state(project_root)
-        last_index = 0
-        last_inode = None
+        # Use SessionStateDB if available (preferred), else fall back to ProjectManager
+        use_state_db = self.session_state_db is not None
+        lock_acquired = False
 
-        if state and state.last_session_id == session_id:
-            last_index = state.last_processed_index
-            last_inode = state.last_trace_inode
+        try:
+            # === Phase 1: Acquire lock (if using SessionStateDB) ===
+            if use_state_db:
+                lock_acquired = self.session_state_db.acquire_lock(session_id, timeout_seconds=30.0)
+                if not lock_acquired:
+                    log.warning(f"Could not acquire lock for session {session_id}, skipping")
+                    return {
+                        "error": "Session locked by another process",
+                        "processed": 0,
+                        "session_id": session_id,
+                    }
 
-        # Check for file rotation (inode changed)
-        current_inode = self.parser.get_file_inode(session_path)
-        if last_inode is not None and current_inode != last_inode:
-            log.info(f"File rotation detected (inode {last_inode} -> {current_inode}), resetting cursor")
+            # === Phase 2: Get current state and check for changes ===
+            current_inode = self.parser.get_file_inode(session_path)
             last_index = 0
+            last_inode = None
+            last_hash = None
 
-        # Parse only new messages
-        new_messages: list[tuple[int, TraceMessage]] = []
-        max_index = last_index
+            if use_state_db:
+                # Use SessionStateDB for state
+                from simplemem_lite.session_state import compute_content_hash
 
-        for idx, msg in self.parser.parse_session(session_path, start_index=last_index):
-            new_messages.append((idx, msg))
-            max_index = max(max_index, idx + 1)
+                state = self.session_state_db.get_session_state(session_id)
+                if state:
+                    last_index = state.indexed_byte_offset  # Note: now byte offset, not line index
+                    last_inode = state.inode
+                    last_hash = state.content_hash
 
-        if not new_messages:
-            log.info(f"No new messages since index {last_index}")
+                # Compute current content hash
+                current_hash = compute_content_hash(session_path)
+
+                # Skip if content unchanged (hash match)
+                if last_hash and current_hash == last_hash:
+                    log.info(f"Content unchanged (hash match), skipping session {session_id}")
+                    return {
+                        "processed": 0,
+                        "skipped": True,
+                        "reason": "content_unchanged",
+                        "session_id": session_id,
+                    }
+            else:
+                # Fall back to ProjectManager (legacy)
+                state = project_manager.get_project_state(project_root)
+                current_hash = None
+                if state and state.last_session_id == session_id:
+                    last_index = state.last_processed_index
+                    last_inode = state.last_trace_inode
+
+            # Check for file rotation (inode changed)
+            if last_inode is not None and current_inode != last_inode:
+                log.info(f"File rotation detected (inode {last_inode} -> {current_inode}), resetting cursor")
+                last_index = 0
+
+            # === Phase 3: Parse new messages ===
+            new_messages: list[tuple[int, TraceMessage]] = []
+            max_index = last_index
+
+            for idx, msg in self.parser.parse_session(session_path, start_index=last_index):
+                new_messages.append((idx, msg))
+                max_index = max(max_index, idx + 1)
+
+            if not new_messages:
+                log.info(f"No new messages since index {last_index}")
+                return {
+                    "processed": 0,
+                    "last_index": last_index,
+                    "message": "No new messages to process",
+                }
+
+            log.info(f"Found {len(new_messages)} new messages (index {last_index} -> {max_index})")
+
+            # === Phase 4: Store interesting messages ===
+            messages = [msg for _, msg in new_messages]
+            interesting = [m for m in messages if self._is_interesting(m)][:20]
+
+            stored_count = 0
+            if interesting:
+                msg_items = [
+                    MemoryItem(
+                        content=msg.content[:2000],
+                        metadata={
+                            "type": "message",
+                            "session_id": session_id,
+                            "source": "claude_trace_delta",
+                            "msg_type": msg.type,
+                        },
+                    )
+                    for msg in interesting
+                ]
+                message_ids = self.store.store_batch(msg_items)
+                stored_count = len(message_ids)
+                log.info(f"Stored {stored_count} interesting messages from delta")
+
+            # === Phase 5: Update state ===
+            if use_state_db:
+                self.session_state_db.update_session_state(
+                    session_id=session_id,
+                    file_path=str(session_path),
+                    byte_offset=max_index,  # Still using line index for now (parse_session uses lines)
+                    content_hash=current_hash or "",
+                    status="indexed",
+                    inode=current_inode,
+                )
+            else:
+                # Legacy: Update ProjectManager cursor
+                project_manager.update_trace_cursor(
+                    project_root=project_root,
+                    session_id=session_id,
+                    processed_index=max_index,
+                    trace_inode=current_inode,
+                )
+
             return {
-                "processed": 0,
-                "last_index": last_index,
-                "message": "No new messages to process",
+                "processed": len(new_messages),
+                "stored": stored_count,
+                "last_index": max_index,
+                "session_id": session_id,
             }
 
-        log.info(f"Found {len(new_messages)} new messages (index {last_index} -> {max_index})")
-
-        # Extract just the messages (drop indices for processing)
-        messages = [msg for _, msg in new_messages]
-
-        # Store interesting messages
-        interesting = [m for m in messages if self._is_interesting(m)][:20]  # Cap at 20
-
-        stored_count = 0
-        if interesting:
-            msg_items = [
-                MemoryItem(
-                    content=msg.content[:2000],
-                    metadata={
-                        "type": "message",
-                        "session_id": session_id,
-                        "source": "claude_trace_delta",
-                        "msg_type": msg.type,
-                    },
-                )
-                for msg in interesting
-            ]
-            message_ids = self.store.store_batch(msg_items)
-            stored_count = len(message_ids)
-            log.info(f"Stored {stored_count} interesting messages from delta")
-
-        # Update cursor
-        project_manager.update_trace_cursor(
-            project_root=project_root,
-            session_id=session_id,
-            processed_index=max_index,
-            trace_inode=current_inode,
-        )
-
-        return {
-            "processed": len(new_messages),
-            "stored": stored_count,
-            "last_index": max_index,
-            "session_id": session_id,
-        }
+        finally:
+            # === Always release lock ===
+            if use_state_db and lock_acquired:
+                self.session_state_db.release_lock(session_id)
 
     def _chunk_by_tool_sequences(
         self, messages: list[TraceMessage]

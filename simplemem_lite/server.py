@@ -4,6 +4,7 @@ Exposes memory operations via MCP protocol with tools, resources, and prompts.
 Also runs an HTTP server for hook communication.
 """
 
+import asyncio
 import atexit
 import json
 import os
@@ -29,6 +30,8 @@ from simplemem_lite.job_manager import JobManager, init_job_manager
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
 from simplemem_lite.projects import ProjectManager
+from simplemem_lite.session_indexer import SessionAutoIndexer
+from simplemem_lite.session_state import SessionStateDB
 from simplemem_lite.traces import HierarchicalIndexer, TraceParser
 from simplemem_lite.watcher import ProjectWatcherManager
 
@@ -59,12 +62,14 @@ class Dependencies:
         self._config: Config | None = None
         self._store: MemoryStore | None = None
         self._parser: TraceParser | None = None
+        self._session_state_db: SessionStateDB | None = None
         self._indexer: HierarchicalIndexer | None = None
         self._code_indexer: CodeIndexer | None = None
         self._watcher_manager: ProjectWatcherManager | None = None
         self._project_manager: ProjectManager | None = None
         self._bootstrap: Bootstrap | None = None
         self._job_manager: JobManager | None = None
+        self._auto_indexer: SessionAutoIndexer | None = None
         self._initialized = False
 
     def _ensure_initialized(self) -> None:
@@ -87,8 +92,15 @@ class Dependencies:
             self._parser = TraceParser(self._config.claude_traces_dir)
             log.debug("TraceParser initialized")
 
+        if self._session_state_db is None:
+            session_db_path = self._config.data_dir / "session_state.db"
+            self._session_state_db = SessionStateDB(session_db_path)
+            log.debug("SessionStateDB initialized")
+
         if self._indexer is None:
-            self._indexer = HierarchicalIndexer(self._store, self._config)
+            self._indexer = HierarchicalIndexer(
+                self._store, self._config, self._session_state_db
+            )
             log.debug("HierarchicalIndexer initialized")
 
         if self._code_indexer is None:
@@ -118,6 +130,17 @@ class Dependencies:
             self._job_manager = init_job_manager(self._config.data_dir)
             log.debug("JobManager initialized")
 
+        # Initialize auto-indexer if enabled (P2: Active Session Handling)
+        if self._auto_indexer is None and self._config.auto_index_enabled:
+            self._auto_indexer = SessionAutoIndexer(
+                config=self._config,
+                session_state_db=self._session_state_db,
+                indexer=self._indexer,
+                job_manager=self._job_manager,
+                project_manager=self._project_manager,
+            )
+            log.debug("SessionAutoIndexer initialized")
+
         self._initialized = True
 
     def configure_for_testing(
@@ -131,6 +154,7 @@ class Dependencies:
         project_manager: ProjectManager | None = None,
         bootstrap: Bootstrap | None = None,
         job_manager: JobManager | None = None,
+        auto_indexer: SessionAutoIndexer | None = None,
     ) -> None:
         """Configure dependencies for testing.
 
@@ -147,6 +171,7 @@ class Dependencies:
             project_manager: Optional mock ProjectManager
             bootstrap: Optional mock Bootstrap
             job_manager: Optional mock JobManager
+            auto_indexer: Optional mock SessionAutoIndexer
         """
         if self._initialized:
             log.warning("configure_for_testing called after initialization - resetting")
@@ -170,6 +195,8 @@ class Dependencies:
             self._bootstrap = bootstrap
         if job_manager is not None:
             self._job_manager = job_manager
+        if auto_indexer is not None:
+            self._auto_indexer = auto_indexer
 
     @property
     def config(self) -> Config:
@@ -191,6 +218,13 @@ class Dependencies:
         self._ensure_initialized()
         assert self._parser is not None
         return self._parser
+
+    @property
+    def session_state_db(self) -> SessionStateDB:
+        """Get SessionStateDB instance."""
+        self._ensure_initialized()
+        assert self._session_state_db is not None
+        return self._session_state_db
 
     @property
     def indexer(self) -> HierarchicalIndexer:
@@ -233,6 +267,42 @@ class Dependencies:
         self._ensure_initialized()
         assert self._job_manager is not None
         return self._job_manager
+
+    @property
+    def auto_indexer(self) -> SessionAutoIndexer | None:
+        """Get SessionAutoIndexer instance (if enabled).
+
+        Returns None if auto_index_enabled is False in config.
+        """
+        self._ensure_initialized()
+        return self._auto_indexer
+
+    async def start_auto_indexer(self) -> bool:
+        """Start the auto-indexer if configured and not already running.
+
+        Returns:
+            True if started, False if disabled or already running
+        """
+        self._ensure_initialized()
+        if self._auto_indexer is None:
+            return False
+        if self._auto_indexer.is_running:
+            return False
+        await self._auto_indexer.start()
+        return True
+
+    async def stop_auto_indexer(self) -> bool:
+        """Stop the auto-indexer if running.
+
+        Returns:
+            True if stopped, False if not running
+        """
+        if self._auto_indexer is None:
+            return False
+        if not self._auto_indexer.is_running:
+            return False
+        await self._auto_indexer.stop()
+        return True
 
 
 # Global dependency container
@@ -301,8 +371,15 @@ def _get_job_manager() -> JobManager:
 
 
 def _cleanup_watchers() -> None:
-    """Cleanup all watchers on server shutdown."""
+    """Cleanup all watchers and background services on server shutdown."""
     try:
+        # Stop auto-indexer if running
+        if _deps._auto_indexer is not None:
+            log.info("Stopping auto-indexer...")
+            _deps._auto_indexer.stop_sync()
+            log.info("Auto-indexer stopped")
+
+        # Stop file watchers
         log.info("Cleaning up file watchers...")
         _deps.watcher_manager.stop_all()
         log.info("File watchers cleaned up")
@@ -884,8 +961,8 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
         If background=False: {session_summary_id, chunk_count, message_count} or error
     """
     log.info(f"Tool: process_trace called (session_id={session_id}, background={background})")
-    log.debug(f"Using indexer with traces_dir={_deps.indexer._deps.parser.traces_dir}")
-    log.debug(f"traces_dir.exists()={_deps.indexer._deps.parser.traces_dir.exists()}")
+    log.debug(f"Using indexer with traces_dir={_deps.indexer.parser.traces_dir}")
+    log.debug(f"traces_dir.exists()={_deps.indexer.parser.traces_dir.exists()}")
 
     if background:
         # Submit to background job manager
@@ -934,6 +1011,272 @@ async def get_stats() -> dict:
     result = _deps.store.get_stats()
     log.info(f"Tool: get_stats complete: {result['total_memories']} memories")
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERSISTENT TODO SYSTEM (P4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def create_todo(
+    title: str,
+    description: str | None = None,
+    priority: str = "medium",
+    project_id: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Create a persistent todo item.
+
+    Unlike Claude's ephemeral TodoWrite, these todos persist across sessions
+    and can be searched semantically. Use this for important tasks that
+    should be tracked long-term.
+
+    Args:
+        title: Short description of the task
+        description: Detailed description (optional)
+        priority: Priority level - low, medium, high, or critical (default: medium)
+        project_id: Project scope for filtering (optional)
+        tags: List of tags for categorization (optional)
+
+    Returns:
+        Dict containing:
+        - uuid: Created todo's unique identifier
+        - title: The todo title
+        - status: Current status (always "pending" for new todos)
+        - priority: Priority level
+        - created_at: Creation timestamp
+    """
+    from simplemem_lite.todo import TodoStore
+
+    log.info(
+        f"Tool: create_todo called "
+        f"(title={title[:50]}..., priority={priority}, project={project_id})"
+    )
+
+    try:
+        todo_store = TodoStore(_deps.store)
+        todo = todo_store.create(
+            title=title,
+            description=description,
+            priority=priority,
+            project_id=project_id,
+            tags=tags or [],
+            source="user",
+        )
+
+        log.info(f"Tool: create_todo complete: {todo.uuid[:8]}...")
+
+        return {
+            "uuid": todo.uuid,
+            "title": todo.title,
+            "status": todo.status,
+            "priority": todo.priority,
+            "project_id": todo.project_id,
+            "created_at": todo.created_at,
+        }
+
+    except ValueError as e:
+        log.error(f"Tool: create_todo validation error: {e}")
+        return {"error": str(e)}
+    except Exception as e:
+        log.error(f"Tool: create_todo failed: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def list_todos(
+    project_id: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """List persistent todos with optional filters.
+
+    Returns todos matching the specified criteria, sorted by priority
+    and creation date.
+
+    Args:
+        project_id: Filter by project scope (optional)
+        status: Filter by status - pending, in_progress, completed, cancelled, blocked (optional)
+        priority: Filter by priority - low, medium, high, critical (optional)
+        limit: Maximum number to return (default: 20)
+
+    Returns:
+        Dict containing:
+        - todos: List of todo objects with uuid, title, status, priority, etc.
+        - total_count: Number of todos returned
+    """
+    from simplemem_lite.todo import TodoStore
+
+    log.info(
+        f"Tool: list_todos called "
+        f"(project={project_id}, status={status}, priority={priority}, limit={limit})"
+    )
+
+    try:
+        todo_store = TodoStore(_deps.store)
+        todos = todo_store.find(
+            project_id=project_id,
+            status=status,
+            priority=priority,
+            limit=limit,
+        )
+
+        result = {
+            "todos": [t.to_dict() for t in todos],
+            "total_count": len(todos),
+        }
+
+        log.info(f"Tool: list_todos complete: {len(todos)} todos found")
+        return result
+
+    except ValueError as e:
+        log.error(f"Tool: list_todos validation error: {e}")
+        return {"error": str(e), "todos": [], "total_count": 0}
+    except Exception as e:
+        log.error(f"Tool: list_todos failed: {e}", exc_info=True)
+        return {"error": str(e), "todos": [], "total_count": 0}
+
+
+@mcp.tool()
+async def update_todo(
+    todo_id: str,
+    status: str | None = None,
+    priority: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Update a persistent todo's fields.
+
+    Update any combination of fields. To mark a todo complete,
+    use status="completed". To cancel, use status="cancelled".
+
+    Args:
+        todo_id: UUID of the todo to update
+        status: New status - pending, in_progress, completed, cancelled, blocked (optional)
+        priority: New priority - low, medium, high, critical (optional)
+        title: New title (optional)
+        description: New description (optional)
+        tags: New tags list (optional)
+
+    Returns:
+        Dict containing:
+        - uuid: Updated todo's UUID (may change due to re-storage)
+        - title: Current title
+        - status: Current status
+        - priority: Current priority
+        - updated_at: Update timestamp
+        - success: Whether update succeeded
+    """
+    from simplemem_lite.todo import TodoStore
+
+    log.info(
+        f"Tool: update_todo called "
+        f"(todo_id={todo_id[:8]}..., status={status}, priority={priority})"
+    )
+
+    try:
+        todo_store = TodoStore(_deps.store)
+        todo = todo_store.update(
+            todo_id=todo_id,
+            status=status,
+            priority=priority,
+            title=title,
+            description=description,
+            tags=tags,
+        )
+
+        if not todo:
+            log.warning(f"Tool: update_todo not found: {todo_id[:8]}...")
+            return {"error": "Todo not found", "success": False}
+
+        log.info(f"Tool: update_todo complete: {todo.uuid[:8]}...")
+
+        return {
+            "uuid": todo.uuid,
+            "title": todo.title,
+            "status": todo.status,
+            "priority": todo.priority,
+            "updated_at": todo.updated_at,
+            "completed_at": todo.completed_at,
+            "success": True,
+        }
+
+    except ValueError as e:
+        log.error(f"Tool: update_todo validation error: {e}")
+        return {"error": str(e), "success": False}
+    except Exception as e:
+        log.error(f"Tool: update_todo failed: {e}", exc_info=True)
+        return {"error": str(e), "success": False}
+
+
+@mcp.tool()
+async def promote_todo(
+    title: str,
+    description: str | None = None,
+    priority: str = "medium",
+    project_id: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Promote an ephemeral todo to persistent storage.
+
+    Use this to persist an important task from Claude's ephemeral TodoWrite
+    to SimpleMem's persistent todo system. The todo will be searchable
+    across sessions and linked to relevant context.
+
+    Args:
+        title: The todo title (copy from TodoWrite)
+        description: Detailed description (optional)
+        priority: Priority level - low, medium, high, critical (default: medium)
+        project_id: Project scope for filtering (optional)
+        tags: List of tags for categorization (optional)
+
+    Returns:
+        Dict containing:
+        - uuid: Created todo's unique identifier
+        - title: The todo title
+        - status: Current status (always "pending")
+        - priority: Priority level
+        - source: Always "promoted"
+        - created_at: Creation timestamp
+    """
+    from simplemem_lite.todo import TodoStore
+
+    log.info(
+        f"Tool: promote_todo called "
+        f"(title={title[:50]}..., priority={priority}, project={project_id})"
+    )
+
+    try:
+        todo_store = TodoStore(_deps.store)
+        todo = todo_store.promote(
+            title=title,
+            description=description,
+            priority=priority,
+            project_id=project_id,
+            tags=tags or [],
+        )
+
+        log.info(f"Tool: promote_todo complete: {todo.uuid[:8]}...")
+
+        return {
+            "uuid": todo.uuid,
+            "title": todo.title,
+            "status": todo.status,
+            "priority": todo.priority,
+            "project_id": todo.project_id,
+            "source": todo.source,
+            "created_at": todo.created_at,
+        }
+
+    except ValueError as e:
+        log.error(f"Tool: promote_todo validation error: {e}")
+        return {"error": str(e)}
+    except Exception as e:
+        log.error(f"Tool: promote_todo failed: {e}", exc_info=True)
+        return {"error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1568,6 +1911,238 @@ async def run_cypher_query(
     except Exception as e:
         log.error(f"Tool: run_cypher_query failed: {e}")
         return {"error": str(e), "results": [], "row_count": 0, "truncated": False}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL SESSION DISCOVERY (P3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def discover_sessions(
+    days_back: int = 30,
+    group_by: str | None = None,
+    include_indexed: bool = True,
+) -> dict:
+    """Discover available Claude Code sessions for potential indexing.
+
+    Lightweight scan that reads file metadata only (no LLM calls).
+    Use this to explore historical sessions before batch indexing.
+
+    Args:
+        days_back: Only include sessions modified within this many days (default: 30)
+        group_by: Optional grouping - "project" or "date" (default: None, flat list)
+        include_indexed: Include already-indexed sessions in results (default: True)
+
+    Returns:
+        Dict containing:
+        - sessions: List of session metadata (or grouped dict if group_by specified)
+        - total_count: Total sessions found
+        - indexed_count: How many are already indexed
+        - unindexed_count: How many are not yet indexed
+    """
+    import asyncio
+    import time
+    from collections import defaultdict
+    from datetime import datetime
+
+    log.info(f"Tool: discover_sessions called (days_back={days_back}, group_by={group_by})")
+
+    # Validate group_by parameter
+    if group_by is not None and group_by not in ("project", "date"):
+        return {"error": "group_by must be 'project' or 'date'", "sessions": [], "total_count": 0}
+
+    try:
+        # Get all sessions from TraceParser (offload to thread to avoid blocking)
+        all_sessions = await asyncio.to_thread(_deps.indexer.parser.list_sessions)
+        log.debug(f"Found {len(all_sessions)} total sessions")
+
+        # Filter by days_back
+        cutoff_time = time.time() - (days_back * 24 * 60 * 60)
+        sessions = [s for s in all_sessions if s["modified"] >= cutoff_time]
+        log.debug(f"After days_back filter: {len(sessions)} sessions")
+
+        # Batch fetch indexed session IDs (avoids N+1 queries)
+        all_indexed = _deps.session_state_db.list_sessions(status="indexed", limit=10000)
+        indexed_ids = {s.session_id for s in all_indexed}
+
+        # Enrich session data
+        enriched = []
+        for s in sessions:
+            is_indexed = s["session_id"] in indexed_ids
+            if not include_indexed and is_indexed:
+                continue
+
+            enriched.append({
+                "session_id": s["session_id"],
+                "project": s["project"],
+                "path": s["path"],
+                "size_kb": s["size_kb"],
+                "modified_at": s["modified"],
+                "modified_date": datetime.fromtimestamp(s["modified"]).strftime("%Y-%m-%d"),
+                "is_indexed": is_indexed,
+            })
+
+        # Group if requested
+        if group_by == "project":
+            grouped = defaultdict(list)
+            for s in enriched:
+                grouped[s["project"]].append(s)
+            result_sessions = dict(grouped)
+        elif group_by == "date":
+            grouped = defaultdict(list)
+            for s in enriched:
+                grouped[s["modified_date"]].append(s)
+            result_sessions = dict(grouped)
+        else:
+            result_sessions = enriched
+
+        indexed_count = len(indexed_ids)
+        unindexed_count = len(sessions) - indexed_count
+
+        log.info(
+            f"Tool: discover_sessions complete: "
+            f"{len(enriched)} sessions returned, {indexed_count} indexed, {unindexed_count} unindexed"
+        )
+
+        return {
+            "sessions": result_sessions,
+            "total_count": len(sessions),
+            "indexed_count": indexed_count,
+            "unindexed_count": unindexed_count,
+            "days_back": days_back,
+            "group_by": group_by,
+        }
+
+    except Exception as e:
+        log.error(f"Tool: discover_sessions failed: {e}", exc_info=True)
+        return {"error": str(e), "sessions": [], "total_count": 0}
+
+
+@mcp.tool()
+async def index_sessions_batch(
+    session_ids: list[str] | None = None,
+    days_back: int | None = None,
+    max_sessions: int = 10,
+    skip_indexed: bool = True,
+) -> dict:
+    """Queue historical sessions for background indexing.
+
+    Use discover_sessions first to find available sessions, then use this
+    tool to batch index them. Reuses existing indexing infrastructure.
+
+    Args:
+        session_ids: Specific session IDs to index (optional)
+        days_back: Index all unindexed sessions from last N days (optional)
+        max_sessions: Maximum sessions to queue in this batch (default: 10)
+        skip_indexed: Skip sessions that are already indexed (default: True)
+
+    Returns:
+        Dict containing:
+        - queued: List of session IDs that were queued
+        - skipped: List of session IDs that were skipped (already indexed)
+        - errors: List of session IDs that failed to queue
+        - job_ids: Map of session_id -> job_id for tracking
+    """
+    import time
+
+    log.info(
+        f"Tool: index_sessions_batch called "
+        f"(session_ids={len(session_ids) if session_ids else 'None'}, "
+        f"days_back={days_back}, max_sessions={max_sessions})"
+    )
+
+    try:
+        # Get all sessions from TraceParser (offload to thread to avoid blocking)
+        all_sessions = await asyncio.to_thread(_deps.indexer.parser.list_sessions)
+
+        # Determine which sessions to process
+        if session_ids:
+            # Use provided session IDs
+            sessions_map = {s["session_id"]: s for s in all_sessions}
+            sessions_to_process = [
+                sessions_map[sid] for sid in session_ids if sid in sessions_map
+            ]
+        elif days_back is not None:
+            # Use days_back filter
+            cutoff_time = time.time() - (days_back * 24 * 60 * 60)
+            sessions_to_process = [s for s in all_sessions if s["modified"] >= cutoff_time]
+        else:
+            return {
+                "error": "Must provide either session_ids or days_back",
+                "queued": [],
+                "skipped": [],
+                "errors": [],
+            }
+
+        log.debug(f"Sessions to consider: {len(sessions_to_process)}")
+
+        # Batch fetch indexed session IDs (avoids N+1 queries)
+        indexed_ids: set[str] = set()
+        if skip_indexed:
+            all_indexed = _deps.session_state_db.list_sessions(status="indexed", limit=10000)
+            indexed_ids = {s.session_id for s in all_indexed}
+            log.debug(f"Found {len(indexed_ids)} already indexed sessions")
+
+        queued = []
+        skipped = []
+        errors = []
+        job_ids = {}
+
+        for session in sessions_to_process:
+            if len(queued) >= max_sessions:
+                log.info(f"Reached max_sessions limit ({max_sessions})")
+                break
+
+            session_id = session["session_id"]
+
+            # Check if already indexed (using pre-fetched set)
+            if skip_indexed and session_id in indexed_ids:
+                skipped.append(session_id)
+                continue
+
+            # Detect project root
+            project = session.get("project", "")
+            project_root = _deps.project_manager.detect_project_root(project)
+            if not project_root:
+                project_root = project
+
+            try:
+                # Queue for indexing via JobManager
+                job_id = await _deps.job_manager.submit_job(
+                    job_type="batch_index_session",
+                    coro=_deps.indexer.index_session_delta(
+                        session_id=session_id,
+                        project_root=project_root,
+                        project_manager=_deps.project_manager,
+                        transcript_path=session["path"],
+                    ),
+                )
+                queued.append(session_id)
+                job_ids[session_id] = job_id
+                log.info(f"Queued session {session_id[:8]}... as job {job_id[:8]}...")
+
+            except Exception as e:
+                log.error(f"Failed to queue session {session_id[:8]}...: {e}")
+                errors.append(session_id)
+
+        log.info(
+            f"Tool: index_sessions_batch complete: "
+            f"{len(queued)} queued, {len(skipped)} skipped, {len(errors)} errors"
+        )
+
+        return {
+            "queued": queued,
+            "skipped": skipped,
+            "errors": errors,
+            "job_ids": job_ids,
+            "queued_count": len(queued),
+            "skipped_count": len(skipped),
+        }
+
+    except Exception as e:
+        log.error(f"Tool: index_sessions_batch failed: {e}", exc_info=True)
+        return {"error": str(e), "queued": [], "skipped": [], "errors": []}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
