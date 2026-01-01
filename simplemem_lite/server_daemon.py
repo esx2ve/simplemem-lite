@@ -47,11 +47,34 @@ _client: DaemonClient | None = None
 
 
 async def get_client() -> DaemonClient:
-    """Get the daemon client, creating if needed."""
+    """Get the daemon client, creating if needed.
+
+    Validates connection with a ping and reconnects if stale.
+    Also ensures daemon is running if connection fails.
+    """
     global _client
+
     if _client is None:
+        # Ensure daemon is running before first connect
+        daemon_manager.ensure_running()
         _client = DaemonClient()
-    return _client
+        return _client
+
+    # Validate existing connection with ping
+    try:
+        await _client.ping()
+        return _client
+    except Exception as e:
+        log.warning(f"Client connection stale, reconnecting: {e}")
+        try:
+            await _client.close()
+        except Exception:
+            pass
+
+        # Ensure daemon is running before reconnect
+        daemon_manager.ensure_running()
+        _client = DaemonClient()
+        return _client
 
 
 def _cleanup_client() -> None:
