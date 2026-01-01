@@ -24,6 +24,13 @@ class DatabaseManager:
     2. Write to vectors (LanceDB) second
     3. Rollback graph if vector write fails
 
+    CONCURRENCY WARNING:
+    This class uses a threading.Lock for write operations which only protects
+    against concurrent access within a single process. Running multiple server
+    instances against the same database is NOT supported and may cause data
+    corruption. For multi-instance deployments, use a single server with the
+    daemon mode, or implement external distributed locking.
+
     Node Types:
     - Memory: session_summary, chunk_summary, message
     - Entity: file, tool, error, concept (for cross-session linking)
@@ -65,6 +72,79 @@ class DatabaseManager:
         self.lance_db = lancedb.connect(str(self.config.vectors_dir))
         self._init_lance_table()
         log.info(f"LanceDB initialized at {self.config.vectors_dir}")
+
+        # Track connection health
+        self._falkor_healthy = True
+        self._last_health_check = 0
+
+    def health_check(self) -> dict[str, Any]:
+        """Check health of database connections.
+
+        Returns:
+            Dict with health status for each database component
+        """
+        import time
+
+        result = {
+            "falkordb": {"healthy": False, "error": None},
+            "lancedb": {"healthy": False, "error": None},
+            "timestamp": time.time(),
+        }
+
+        # Check FalkorDB
+        try:
+            # Simple query to verify connection
+            self.graph.query("RETURN 1")
+            result["falkordb"]["healthy"] = True
+            self._falkor_healthy = True
+        except Exception as e:
+            result["falkordb"]["error"] = str(e)
+            self._falkor_healthy = False
+            log.warning(f"FalkorDB health check failed: {e}")
+
+        # Check LanceDB
+        try:
+            # Verify table is accessible
+            _ = self.lance_table.count_rows()
+            result["lancedb"]["healthy"] = True
+        except Exception as e:
+            result["lancedb"]["error"] = str(e)
+            log.warning(f"LanceDB health check failed: {e}")
+
+        self._last_health_check = result["timestamp"]
+        return result
+
+    def is_healthy(self) -> bool:
+        """Quick check if databases are healthy.
+
+        Returns:
+            True if all databases are healthy
+        """
+        health = self.health_check()
+        return health["falkordb"]["healthy"] and health["lancedb"]["healthy"]
+
+    def reconnect_falkordb(self) -> bool:
+        """Attempt to reconnect to FalkorDB.
+
+        Returns:
+            True if reconnection successful
+        """
+        try:
+            log.info("Attempting to reconnect to FalkorDB...")
+            self.falkor_db = FalkorDB(
+                host=self.config.falkor_host,
+                port=self.config.falkor_port,
+            )
+            self.graph = self.falkor_db.select_graph(self.GRAPH_NAME)
+            # Verify connection
+            self.graph.query("RETURN 1")
+            self._falkor_healthy = True
+            log.info("FalkorDB reconnection successful")
+            return True
+        except Exception as e:
+            log.error(f"FalkorDB reconnection failed: {e}")
+            self._falkor_healthy = False
+            return False
 
     def _init_graph_indexes(self) -> None:
         """Create indexes for efficient lookups."""
@@ -137,6 +217,9 @@ class DatabaseManager:
 
         self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
 
+    # Keywords that indicate mutation queries (used for validation)
+    MUTATION_KEYWORDS = frozenset({"CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DETACH"})
+
     def execute_graph(self, query: str, params: dict[str, Any] | None = None) -> Any:
         """Execute a graph query with optional parameters.
 
@@ -150,6 +233,313 @@ class DatabaseManager:
         if params:
             return self.graph.query(query, params)
         return self.graph.query(query)
+
+    def execute_validated_cypher(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        timeout_ms: int = 5000,
+        max_results: int = 100,
+        allow_mutations: bool = False,
+    ) -> dict[str, Any]:
+        """Execute Cypher with validation and resource limits.
+
+        Provides safe access to arbitrary Cypher queries with:
+        - Mutation blocking (default): Rejects CREATE, MERGE, DELETE, SET, REMOVE
+        - LIMIT injection: Adds LIMIT if not present
+        - Result truncation: Caps output size
+
+        Args:
+            query: Cypher query string
+            params: Optional query parameters (prevents injection)
+            timeout_ms: Query timeout in milliseconds (default: 5000)
+            max_results: Maximum results to return (default: 100)
+            allow_mutations: If False, blocks mutation queries (default: False)
+
+        Returns:
+            {results: [...], truncated: bool, execution_time_ms: float, row_count: int}
+
+        Raises:
+            ValueError: If mutation detected and allow_mutations=False
+        """
+        import re
+        import time
+
+        log.info(f"execute_validated_cypher: allow_mutations={allow_mutations}, timeout={timeout_ms}ms")
+        log.debug(f"Query preview: {query[:100]}...")
+
+        # Security: Check for mutation keywords
+        if not allow_mutations:
+            query_upper = query.upper()
+            for keyword in self.MUTATION_KEYWORDS:
+                # Match keyword as a word boundary to avoid false positives
+                # e.g., "DELETED" shouldn't match "DELETE"
+                if re.search(rf'\b{keyword}\b', query_upper):
+                    log.warning(f"Mutation keyword '{keyword}' detected in query, rejecting")
+                    raise ValueError(
+                        f"Mutation queries not allowed (found '{keyword}'). "
+                        "Use allow_mutations=True for admin access or use dedicated tools "
+                        "(store_memory, relate_memories) for data modifications."
+                    )
+
+        # Inject LIMIT if not present
+        query_stripped = query.strip().rstrip(';')
+        if not re.search(r'\bLIMIT\s+\d+', query_upper):
+            query_stripped = f"{query_stripped} LIMIT {max_results}"
+            log.debug(f"Injected LIMIT {max_results}")
+
+        # Execute with timing
+        start_time = time.time()
+        try:
+            if params:
+                result = self.graph.query(query_stripped, params)
+            else:
+                result = self.graph.query(query_stripped)
+            execution_time_ms = (time.time() - start_time) * 1000
+        except Exception as e:
+            execution_time_ms = (time.time() - start_time) * 1000
+            log.error(f"Cypher execution failed after {execution_time_ms:.1f}ms: {e}")
+            raise
+
+        # Process results
+        rows = []
+        if result.result_set:
+            # Get column names from header if available
+            header = result.header if hasattr(result, 'header') else None
+            column_names = [col[1] if isinstance(col, tuple) else str(col) for col in header] if header else None
+
+            for row in result.result_set:
+                if column_names and len(column_names) == len(row):
+                    rows.append(dict(zip(column_names, row)))
+                else:
+                    # Fallback to positional indexing
+                    rows.append({f"col_{i}": val for i, val in enumerate(row)})
+
+        truncated = len(rows) >= max_results
+        log.info(f"Cypher executed: {len(rows)} rows in {execution_time_ms:.1f}ms, truncated={truncated}")
+
+        return {
+            "results": rows,
+            "truncated": truncated,
+            "execution_time_ms": round(execution_time_ms, 2),
+            "row_count": len(rows),
+        }
+
+    def get_schema(self) -> dict[str, Any]:
+        """Get the graph schema for query generation.
+
+        Returns a complete schema including:
+        - node_labels: Dict of labels with their properties and indexes
+        - relationship_types: List of relationship type names
+        - common_queries: Example Cypher templates for common operations
+
+        Returns:
+            Complete schema dict for AI query generation
+        """
+        log.info("Getting graph schema")
+
+        # Hardcoded schema based on codebase knowledge
+        # This is more reliable than dynamic introspection and provides
+        # better documentation for the AI agent
+        schema = {
+            "node_labels": {
+                "Memory": {
+                    "description": "Stored memories from sessions, facts, and learnings",
+                    "properties": {
+                        "uuid": "string - Unique identifier",
+                        "content": "string - Memory text content",
+                        "type": "string - Memory type: fact, session_summary, chunk_summary, message, lesson_learned",
+                        "source": "string - Source: user, claude_trace, extracted",
+                        "session_id": "string - Associated session UUID (optional)",
+                        "created_at": "integer - Unix timestamp",
+                    },
+                    "indexes": ["uuid", "type", "session_id"],
+                },
+                "Entity": {
+                    "description": "Extracted entities for cross-session linking",
+                    "properties": {
+                        "name": "string - Canonicalized entity name",
+                        "type": "string - Entity type: file, tool, error, command, concept",
+                        "version": "integer - Version number (incremented on MODIFIES)",
+                        "created_at": "integer - Unix timestamp",
+                        "last_modified": "integer - Last modification timestamp",
+                    },
+                    "indexes": ["name", "type"],
+                },
+                "CodeChunk": {
+                    "description": "Indexed code snippets from project files",
+                    "properties": {
+                        "uuid": "string - Unique identifier",
+                        "filepath": "string - Relative file path",
+                        "project_root": "string - Absolute project root path",
+                        "start_line": "integer - Starting line number",
+                        "end_line": "integer - Ending line number",
+                        "created_at": "integer - Unix timestamp",
+                    },
+                    "indexes": ["uuid", "filepath"],
+                },
+                "Project": {
+                    "description": "Tracked project roots for session scoping",
+                    "properties": {
+                        "id": "string - Project identifier (derived from path)",
+                        "path": "string - Original project path",
+                        "session_count": "integer - Number of sessions",
+                        "created_at": "integer - Unix timestamp",
+                        "last_updated": "integer - Last update timestamp",
+                    },
+                    "indexes": ["id"],
+                },
+                "ProjectIndex": {
+                    "description": "Code index metadata for staleness detection",
+                    "properties": {
+                        "project_root": "string - Absolute project root path",
+                        "last_commit_hash": "string - Git commit hash when indexed",
+                        "indexed_at": "integer - Unix timestamp of last index",
+                        "file_count": "integer - Number of files indexed",
+                        "chunk_count": "integer - Number of chunks created",
+                    },
+                    "indexes": ["project_root"],
+                },
+                "Goal": {
+                    "description": "User objectives for intent-based retrieval",
+                    "properties": {
+                        "id": "string - Goal identifier",
+                        "intent": "string - User's objective description",
+                        "session_id": "string - Associated session UUID",
+                        "status": "string - Goal status: active, completed, abandoned",
+                        "created_at": "integer - Unix timestamp",
+                    },
+                    "indexes": ["id"],
+                },
+            },
+            "relationship_types": {
+                "RELATES_TO": {
+                    "description": "Generic semantic relationship between memories",
+                    "from": "Memory",
+                    "to": "Memory",
+                    "properties": ["relation_type", "weight"],
+                },
+                "CONTAINS": {
+                    "description": "Hierarchical containment (session -> chunk -> message)",
+                    "from": "Memory",
+                    "to": "Memory",
+                    "properties": [],
+                },
+                "CHILD_OF": {
+                    "description": "Reverse of CONTAINS",
+                    "from": "Memory",
+                    "to": "Memory",
+                    "properties": [],
+                },
+                "FOLLOWS": {
+                    "description": "Temporal sequence between memories",
+                    "from": "Memory",
+                    "to": "Memory",
+                    "properties": [],
+                },
+                "READS": {
+                    "description": "Memory reads an entity (file, etc.)",
+                    "from": "Memory",
+                    "to": "Entity",
+                    "properties": ["timestamp", "implicit"],
+                },
+                "MODIFIES": {
+                    "description": "Memory modifies an entity",
+                    "from": "Memory",
+                    "to": "Entity",
+                    "properties": ["timestamp", "change_summary"],
+                },
+                "EXECUTES": {
+                    "description": "Memory executes a tool/command",
+                    "from": "Memory",
+                    "to": "Entity",
+                    "properties": ["timestamp"],
+                },
+                "TRIGGERED": {
+                    "description": "Memory triggered an error",
+                    "from": "Memory",
+                    "to": "Entity",
+                    "properties": ["timestamp"],
+                },
+                "REFERENCES": {
+                    "description": "Generic reference to an entity",
+                    "from": "Memory|CodeChunk",
+                    "to": "Entity",
+                    "properties": ["relation", "created_at"],
+                },
+                "BELONGS_TO": {
+                    "description": "Session summary belongs to a project",
+                    "from": "Memory",
+                    "to": "Project",
+                    "properties": [],
+                },
+                "HAS_GOAL": {
+                    "description": "Session summary has a goal",
+                    "from": "Memory",
+                    "to": "Goal",
+                    "properties": [],
+                },
+                "ACHIEVES": {
+                    "description": "Memory contributes to achieving a goal",
+                    "from": "Memory",
+                    "to": "Goal",
+                    "properties": [],
+                },
+            },
+            "common_queries": [
+                {
+                    "name": "recent_memories",
+                    "description": "Get recent memories",
+                    "cypher": "MATCH (m:Memory) RETURN m.uuid, m.content, m.type, m.created_at ORDER BY m.created_at DESC LIMIT $limit",
+                    "params": {"limit": 10},
+                },
+                {
+                    "name": "entity_frequency",
+                    "description": "Find most referenced entities",
+                    "cypher": "MATCH (e:Entity)<-[r]-(m:Memory) RETURN e.name, e.type, count(r) as refs ORDER BY refs DESC LIMIT $limit",
+                    "params": {"limit": 20},
+                },
+                {
+                    "name": "cross_session_entities",
+                    "description": "Find entities appearing in multiple sessions",
+                    "cypher": "MATCH (m:Memory)-[r]->(e:Entity) WHERE m.session_id IS NOT NULL WITH e, collect(DISTINCT m.session_id) AS sessions WHERE size(sessions) >= $min_sessions RETURN e.name, e.type, size(sessions) as session_count ORDER BY session_count DESC",
+                    "params": {"min_sessions": 2},
+                },
+                {
+                    "name": "file_history",
+                    "description": "Get history of a specific file",
+                    "cypher": "MATCH (m:Memory)-[r:READS|MODIFIES]->(e:Entity {name: $filename, type: 'file'}) RETURN m.uuid, m.content, type(r) as action, r.timestamp ORDER BY r.timestamp DESC LIMIT $limit",
+                    "params": {"filename": "example.py", "limit": 20},
+                },
+                {
+                    "name": "error_solutions",
+                    "description": "Find memories related to an error type",
+                    "cypher": "MATCH (m:Memory)-[:TRIGGERED]->(e:Entity {type: 'error'}) WHERE e.name CONTAINS $error_pattern RETURN m.uuid, m.content, e.name as error, m.session_id LIMIT $limit",
+                    "params": {"error_pattern": "error:", "limit": 10},
+                },
+                {
+                    "name": "session_summary",
+                    "description": "Get session with its chunks",
+                    "cypher": "MATCH (s:Memory {type: 'session_summary', session_id: $session_id})-[:CONTAINS]->(c:Memory {type: 'chunk_summary'}) RETURN s.uuid, s.content, collect({uuid: c.uuid, content: c.content}) as chunks",
+                    "params": {"session_id": "example-uuid"},
+                },
+                {
+                    "name": "shortest_path",
+                    "description": "Find shortest path between two entities",
+                    "cypher": "MATCH path = shortestPath((a:Entity {name: $from_entity})-[*..5]-(b:Entity {name: $to_entity})) RETURN path",
+                    "params": {"from_entity": "redis", "to_entity": "auth"},
+                },
+                {
+                    "name": "graph_stats",
+                    "description": "Get graph statistics",
+                    "cypher": "MATCH (n) RETURN labels(n)[0] as label, count(n) as count ORDER BY count DESC",
+                    "params": {},
+                },
+            ],
+        }
+
+        log.debug(f"Schema returned: {len(schema['node_labels'])} labels, {len(schema['relationship_types'])} rel types")
+        return schema
 
     def add_memory_node(
         self,
@@ -185,7 +575,7 @@ class DatabaseManager:
             """,
             {
                 "uuid": uuid,
-                "content": content[:5000],  # Limit content size
+                "content": content[:self.config.memory_content_max_size],
                 "type": mem_type,
                 "source": source,
                 "session_id": session_id or "",
@@ -281,6 +671,54 @@ class DatabaseManager:
     # Allowed verb edge types for security validation
     ALLOWED_VERB_EDGES = {"READS", "MODIFIES", "EXECUTES", "TRIGGERED", "REFERENCES"}
 
+    # Pre-defined Cypher queries for each edge type (avoids f-string interpolation)
+    # Security: These are hardcoded to prevent any possibility of injection
+    _EDGE_QUERIES_WITH_SUMMARY = {
+        "READS": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:READS {timestamp: $ts, change_summary: $summary}]->(e)
+            """,
+        "MODIFIES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:MODIFIES {timestamp: $ts, change_summary: $summary}]->(e)
+            """,
+        "EXECUTES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:EXECUTES {timestamp: $ts, change_summary: $summary}]->(e)
+            """,
+        "TRIGGERED": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:TRIGGERED {timestamp: $ts, change_summary: $summary}]->(e)
+            """,
+        "REFERENCES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:REFERENCES {timestamp: $ts, change_summary: $summary}]->(e)
+            """,
+    }
+
+    _EDGE_QUERIES_NO_SUMMARY = {
+        "READS": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:READS {timestamp: $ts}]->(e)
+            """,
+        "MODIFIES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:MODIFIES {timestamp: $ts}]->(e)
+            """,
+        "EXECUTES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:EXECUTES {timestamp: $ts}]->(e)
+            """,
+        "TRIGGERED": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:TRIGGERED {timestamp: $ts}]->(e)
+            """,
+        "REFERENCES": """
+            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
+            CREATE (m)-[:REFERENCES {timestamp: $ts}]->(e)
+            """,
+    }
+
     def add_verb_edge(
         self,
         memory_uuid: str,
@@ -344,22 +782,18 @@ class DatabaseManager:
                 {"name": canonical_name, "type": entity_type},
             )
 
-        # Create the verb-specific edge
+        # Create the verb-specific edge using hardcoded queries (no f-string interpolation)
         ts = timestamp or int(time.time())
         if change_summary:
+            query = self._EDGE_QUERIES_WITH_SUMMARY[edge_type]
             self.graph.query(
-                f"""
-                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
-                CREATE (m)-[:{edge_type} {{timestamp: $ts, change_summary: $summary}}]->(e)
-                """,
-                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts, "summary": change_summary[:500]},
+                query,
+                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts, "summary": change_summary[:self.config.summary_max_size]},
             )
         else:
+            query = self._EDGE_QUERIES_NO_SUMMARY[edge_type]
             self.graph.query(
-                f"""
-                MATCH (m:Memory {{uuid: $uuid}}), (e:Entity {{name: $name, type: $type}})
-                CREATE (m)-[:{edge_type} {{timestamp: $ts}}]->(e)
-                """,
+                query,
                 {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts},
             )
 
@@ -486,7 +920,7 @@ class DatabaseManager:
             """,
             {
                 "goal_id": goal_id,
-                "intent": intent[:1000],
+                "intent": intent[:self.config.memory_content_max_size],
                 "session_id": session_id,
                 "status": status,
             },
@@ -551,7 +985,7 @@ class DatabaseManager:
             ON CREATE SET p.path = $path, p.created_at = timestamp(), p.session_count = 1
             ON MATCH SET p.session_count = p.session_count + 1, p.last_updated = timestamp()
             """,
-            {"project_id": project_id, "path": project_path[:500]},
+            {"project_id": project_id, "path": project_path[:self.config.summary_max_size]},
         )
         log.trace(f"Created/updated Project node: {project_id}")
 
@@ -626,13 +1060,16 @@ class DatabaseManager:
         )
         log.debug(f"Deleted {len(uuids)} memory nodes from graph")
 
-        # Delete from vectors
-        # LanceDB delete requires SQL-style filter
-        for uuid in uuids:
-            try:
-                self.lance_table.delete(f'uuid = "{uuid}"')
-            except Exception as e:
-                log.trace(f"Vector delete failed (may not exist): {e}")
+        # Delete from vectors using batch operation (avoids N+1 pattern)
+        # LanceDB delete requires SQL-style filter with IN clause
+        try:
+            # Escape UUIDs and build IN clause for batch delete
+            escaped_uuids = [uid.replace('"', '\\"') for uid in uuids]
+            uuid_list = ", ".join(f'"{uid}"' for uid in escaped_uuids)
+            self.lance_table.delete(f"uuid IN ({uuid_list})")
+            log.debug(f"Batch deleted {len(uuids)} vectors")
+        except Exception as e:
+            log.warning(f"Batch vector delete failed: {e}")
 
         log.info(f"Session cleanup complete: deleted {len(uuids)} memories")
         return {"memories_deleted": len(uuids), "vectors_deleted": len(uuids)}
@@ -1095,7 +1532,7 @@ class DatabaseManager:
             List of related memories
         """
         log.trace(f"Getting related nodes: uuid={uuid[:8]}..., hops={hops}, direction={direction}")
-        hops = min(max(hops, 1), 3)  # Clamp to 1-3
+        hops = min(max(hops, 1), self.config.max_graph_hops)
 
         if direction == "outgoing":
             pattern = f"(start:Memory {{uuid: $uuid}})-[r*1..{hops}]->(connected:Memory)"
@@ -1151,7 +1588,7 @@ class DatabaseManager:
             List of paths with nodes, edge_types, and metadata
         """
         log.trace(f"Getting paths: from={from_uuid[:8]}..., max_hops={max_hops}")
-        max_hops = min(max(max_hops, 1), 3)
+        max_hops = min(max(max_hops, 1), self.config.max_graph_hops)
 
         # FalkorDB Cypher for variable-length paths
         if direction == "outgoing":
@@ -1175,9 +1612,9 @@ class DatabaseManager:
                 [rel in relationships(path) | rel.relation_type] AS relation_types,
                 [rel in relationships(path) | rel.weight] AS weights,
                 length(path) AS hops
-            LIMIT 100
+            LIMIT $limit
             """,
-            {"uuid": from_uuid},
+            {"uuid": from_uuid, "limit": self.config.graph_path_limit},
         )
 
         paths = []
@@ -1241,9 +1678,9 @@ class DatabaseManager:
                 other.created_at AS created_at,
                 e.name AS entity_name,
                 e.type AS entity_type
-            LIMIT 50
+            LIMIT $limit
             """,
-            {"uuid": from_uuid},
+            {"uuid": from_uuid, "limit": self.config.cross_session_limit},
         )
 
         paths = []
@@ -1268,7 +1705,23 @@ class DatabaseManager:
 
     @property
     def write_lock(self) -> threading.Lock:
-        """Get the write lock for two-phase commit."""
+        """Get the write lock for two-phase commit.
+
+        IMPORTANT LIMITATION: This lock only provides protection for concurrent
+        operations within a single process. It does NOT protect against:
+
+        1. Multiple MCP server instances running simultaneously
+        2. Multiple processes accessing the same database files
+        3. External tools modifying LanceDB/FalkorDB directly
+
+        For production deployments with multiple writers, consider:
+        - Using a single server instance (recommended)
+        - External distributed locking (e.g., Redis-based)
+        - Database-level transactions (FalkorDB supports ACID)
+
+        LanceDB specifically is NOT thread-safe for concurrent write operations,
+        hence this lock is required even for single-process operation.
+        """
         return self._write_lock
 
     def reset_all(self) -> dict[str, int]:

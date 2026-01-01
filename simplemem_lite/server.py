@@ -10,6 +10,8 @@ import os
 import secrets
 import signal
 import threading
+import time
+from collections import defaultdict
 from datetime import datetime
 from functools import partial
 from http import HTTPStatus
@@ -32,43 +34,281 @@ from simplemem_lite.watcher import ProjectWatcherManager
 
 log = get_logger("server")
 
-# Initialize global state
-log.info("SimpleMem Lite MCP server starting...")
-log.debug(f"HOME={os.environ.get('HOME', 'NOT SET')}")
 
-config = Config()
-log.debug("Config initialized")
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEPENDENCY INJECTION CONTAINER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-store = MemoryStore(config)
-log.debug("MemoryStore initialized")
 
-parser = TraceParser(config.claude_traces_dir)
-log.debug("TraceParser initialized")
+class Dependencies:
+    """Dependency injection container for the MCP server.
 
-indexer = HierarchicalIndexer(store, config)
-log.debug("HierarchicalIndexer initialized")
+    Encapsulates all server dependencies for easier testing and configuration.
+    Dependencies are initialized on first access (lazy initialization).
 
-code_indexer = CodeIndexer(store.db, config)
-log.debug("CodeIndexer initialized")
+    Usage in tests:
+        deps = Dependencies()
+        deps.configure_for_testing(
+            config=mock_config,
+            store=mock_store,
+        )
+    """
 
-watcher_manager = ProjectWatcherManager(code_indexer, config.code_patterns_list)
-log.debug("ProjectWatcherManager initialized")
+    def __init__(self) -> None:
+        """Initialize empty container. Dependencies are created on first access."""
+        self._config: Config | None = None
+        self._store: MemoryStore | None = None
+        self._parser: TraceParser | None = None
+        self._indexer: HierarchicalIndexer | None = None
+        self._code_indexer: CodeIndexer | None = None
+        self._watcher_manager: ProjectWatcherManager | None = None
+        self._project_manager: ProjectManager | None = None
+        self._bootstrap: Bootstrap | None = None
+        self._job_manager: JobManager | None = None
+        self._initialized = False
 
-project_manager = ProjectManager(config)
-log.debug("ProjectManager initialized")
+    def _ensure_initialized(self) -> None:
+        """Initialize all dependencies on first access."""
+        if self._initialized:
+            return
 
-bootstrap = Bootstrap(config, project_manager, code_indexer, watcher_manager)
-log.debug("Bootstrap initialized")
+        log.info("SimpleMem Lite MCP server starting...")
+        log.debug(f"HOME={os.environ.get('HOME', 'NOT SET')}")
 
-job_manager = init_job_manager(config.data_dir)
-log.debug("JobManager initialized")
+        if self._config is None:
+            self._config = Config()
+            log.debug("Config initialized")
+
+        if self._store is None:
+            self._store = MemoryStore(self._config)
+            log.debug("MemoryStore initialized")
+
+        if self._parser is None:
+            self._parser = TraceParser(self._config.claude_traces_dir)
+            log.debug("TraceParser initialized")
+
+        if self._indexer is None:
+            self._indexer = HierarchicalIndexer(self._store, self._config)
+            log.debug("HierarchicalIndexer initialized")
+
+        if self._code_indexer is None:
+            self._code_indexer = CodeIndexer(self._store.db, self._config)
+            log.debug("CodeIndexer initialized")
+
+        if self._watcher_manager is None:
+            self._watcher_manager = ProjectWatcherManager(
+                self._code_indexer, self._config.code_patterns_list
+            )
+            log.debug("ProjectWatcherManager initialized")
+
+        if self._project_manager is None:
+            self._project_manager = ProjectManager(self._config)
+            log.debug("ProjectManager initialized")
+
+        if self._bootstrap is None:
+            self._bootstrap = Bootstrap(
+                self._config,
+                self._project_manager,
+                self._code_indexer,
+                self._watcher_manager,
+            )
+            log.debug("Bootstrap initialized")
+
+        if self._job_manager is None:
+            self._job_manager = init_job_manager(self._config.data_dir)
+            log.debug("JobManager initialized")
+
+        self._initialized = True
+
+    def configure_for_testing(
+        self,
+        config: Config | None = None,
+        store: MemoryStore | None = None,
+        parser: TraceParser | None = None,
+        indexer: HierarchicalIndexer | None = None,
+        code_indexer: CodeIndexer | None = None,
+        watcher_manager: ProjectWatcherManager | None = None,
+        project_manager: ProjectManager | None = None,
+        bootstrap: Bootstrap | None = None,
+        job_manager: JobManager | None = None,
+    ) -> None:
+        """Configure dependencies for testing.
+
+        Allows injecting mock dependencies for isolated testing.
+        Must be called BEFORE accessing any dependency properties.
+
+        Args:
+            config: Optional mock Config
+            store: Optional mock MemoryStore
+            parser: Optional mock TraceParser
+            indexer: Optional mock HierarchicalIndexer
+            code_indexer: Optional mock CodeIndexer
+            watcher_manager: Optional mock ProjectWatcherManager
+            project_manager: Optional mock ProjectManager
+            bootstrap: Optional mock Bootstrap
+            job_manager: Optional mock JobManager
+        """
+        if self._initialized:
+            log.warning("configure_for_testing called after initialization - resetting")
+            self._initialized = False
+
+        if config is not None:
+            self._config = config
+        if store is not None:
+            self._store = store
+        if parser is not None:
+            self._parser = parser
+        if indexer is not None:
+            self._indexer = indexer
+        if code_indexer is not None:
+            self._code_indexer = code_indexer
+        if watcher_manager is not None:
+            self._watcher_manager = watcher_manager
+        if project_manager is not None:
+            self._project_manager = project_manager
+        if bootstrap is not None:
+            self._bootstrap = bootstrap
+        if job_manager is not None:
+            self._job_manager = job_manager
+
+    @property
+    def config(self) -> Config:
+        """Get Config instance."""
+        self._ensure_initialized()
+        assert self._config is not None
+        return self._config
+
+    @property
+    def store(self) -> MemoryStore:
+        """Get MemoryStore instance."""
+        self._ensure_initialized()
+        assert self._store is not None
+        return self._store
+
+    @property
+    def parser(self) -> TraceParser:
+        """Get TraceParser instance."""
+        self._ensure_initialized()
+        assert self._parser is not None
+        return self._parser
+
+    @property
+    def indexer(self) -> HierarchicalIndexer:
+        """Get HierarchicalIndexer instance."""
+        self._ensure_initialized()
+        assert self._indexer is not None
+        return self._indexer
+
+    @property
+    def code_indexer(self) -> CodeIndexer:
+        """Get CodeIndexer instance."""
+        self._ensure_initialized()
+        assert self._code_indexer is not None
+        return self._code_indexer
+
+    @property
+    def watcher_manager(self) -> ProjectWatcherManager:
+        """Get ProjectWatcherManager instance."""
+        self._ensure_initialized()
+        assert self._watcher_manager is not None
+        return self._watcher_manager
+
+    @property
+    def project_manager(self) -> ProjectManager:
+        """Get ProjectManager instance."""
+        self._ensure_initialized()
+        assert self._project_manager is not None
+        return self._project_manager
+
+    @property
+    def bootstrap(self) -> Bootstrap:
+        """Get Bootstrap instance."""
+        self._ensure_initialized()
+        assert self._bootstrap is not None
+        return self._bootstrap
+
+    @property
+    def job_manager(self) -> JobManager:
+        """Get JobManager instance."""
+        self._ensure_initialized()
+        assert self._job_manager is not None
+        return self._job_manager
+
+
+# Global dependency container
+_deps = Dependencies()
+
+
+def get_dependencies() -> Dependencies:
+    """Get the global dependency container.
+
+    For testing, use `_deps.configure_for_testing()` before accessing dependencies.
+
+    Returns:
+        The global Dependencies instance
+    """
+    return _deps
+
+
+# Convenience accessors for the global dependencies
+# Use these in tool functions: store, config, etc.
+# For testing, configure via: _deps.configure_for_testing(...)
+
+
+def _get_config() -> Config:
+    """Get config from dependency container."""
+    return _deps.config
+
+
+def _get_store() -> MemoryStore:
+    """Get store from dependency container."""
+    return _deps.store
+
+
+def _get_parser() -> TraceParser:
+    """Get parser from dependency container."""
+    return _deps.parser
+
+
+def _get_indexer() -> HierarchicalIndexer:
+    """Get indexer from dependency container."""
+    return _deps.indexer
+
+
+def _get_code_indexer() -> CodeIndexer:
+    """Get code_indexer from dependency container."""
+    return _deps.code_indexer
+
+
+def _get_watcher_manager() -> ProjectWatcherManager:
+    """Get watcher_manager from dependency container."""
+    return _deps.watcher_manager
+
+
+def _get_project_manager() -> ProjectManager:
+    """Get project_manager from dependency container."""
+    return _deps.project_manager
+
+
+def _get_bootstrap() -> Bootstrap:
+    """Get bootstrap from dependency container."""
+    return _deps.bootstrap
+
+
+def _get_job_manager() -> JobManager:
+    """Get job_manager from dependency container."""
+    return _deps.job_manager
 
 
 def _cleanup_watchers() -> None:
     """Cleanup all watchers on server shutdown."""
-    log.info("Cleaning up file watchers...")
-    watcher_manager.stop_all()
-    log.info("File watchers cleaned up")
+    try:
+        log.info("Cleaning up file watchers...")
+        _deps.watcher_manager.stop_all()
+        log.info("File watchers cleaned up")
+    except (ValueError, OSError):
+        # Suppress logging errors if stdout is closed (e.g., during pytest cleanup)
+        pass
 
 
 atexit.register(_cleanup_watchers)
@@ -86,21 +326,31 @@ _auth_token: str | None = None
 
 def _get_lock_file_path() -> Path:
     """Get path to the lock file."""
-    return config.data_dir / "server.lock"
+    return _deps.config.data_dir / "server.lock"
 
 
 def _write_lock_file(port: int, token: str) -> None:
-    """Write lock file with server info."""
+    """Write lock file with server info.
+
+    Uses restricted permissions (0o600) to prevent token leakage on multi-user systems.
+    """
     lock_data = {
         "port": port,
         "pid": os.getpid(),
         "token": token,
         "started_at": datetime.now().isoformat(),
-        "host": config.http_host,
+        "host": _deps.config.http_host,
     }
     lock_path = _get_lock_file_path()
-    lock_path.write_text(json.dumps(lock_data, indent=2))
-    log.info(f"Lock file written: {lock_path}")
+    # Security: Use restricted permissions (read/write by owner only)
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(lock_data, f, indent=2)
+    except Exception:
+        os.close(fd)
+        raise
+    log.info(f"Lock file written with secure permissions: {lock_path}")
 
 
 def _remove_lock_file() -> None:
@@ -122,6 +372,55 @@ def _read_lock_file() -> dict[str, Any] | None:
     return None
 
 
+class RateLimiter:
+    """Simple token bucket rate limiter for HTTP requests.
+
+    Thread-safe implementation that tracks requests per client IP.
+    """
+
+    def __init__(self, requests_per_minute: int):
+        self.rate = requests_per_minute / 60.0  # tokens per second
+        self.max_tokens = requests_per_minute
+        self._tokens: dict[str, float] = defaultdict(lambda: self.max_tokens)
+        self._last_update: dict[str, float] = defaultdict(time.time)
+        self._lock = threading.Lock()
+
+    def is_allowed(self, client_ip: str) -> bool:
+        """Check if request is allowed and consume a token.
+
+        Returns:
+            True if request is allowed, False if rate limited
+        """
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_update[client_ip]
+            self._last_update[client_ip] = now
+
+            # Replenish tokens
+            self._tokens[client_ip] = min(
+                self.max_tokens,
+                self._tokens[client_ip] + elapsed * self.rate
+            )
+
+            # Check and consume
+            if self._tokens[client_ip] >= 1:
+                self._tokens[client_ip] -= 1
+                return True
+            return False
+
+
+# Global rate limiter instance (initialized with config)
+_rate_limiter: RateLimiter | None = None
+
+
+def _get_rate_limiter() -> RateLimiter:
+    """Get or create the rate limiter instance."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = RateLimiter(_deps.config.http_rate_limit)
+    return _rate_limiter
+
+
 class HookHTTPHandler(BaseHTTPRequestHandler):
     """HTTP handler for hook endpoints."""
 
@@ -132,6 +431,19 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
         """Override to use our logger."""
         log.debug(f"HTTP: {format % args}")
 
+    def _check_rate_limit(self) -> bool:
+        """Check if request is within rate limits.
+
+        Returns:
+            True if allowed, False if rate limited (response already sent)
+        """
+        client_ip = self.client_address[0]
+        if not _get_rate_limiter().is_allowed(client_ip):
+            log.warning(f"Rate limited request from {client_ip}")
+            self._send_json_response(429, {"error": "Too many requests"})
+            return False
+        return True
+
     def _send_json_response(self, status: int, data: dict) -> None:
         """Send a JSON response."""
         self.send_response(status)
@@ -140,11 +452,15 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
     def _verify_auth(self) -> bool:
-        """Verify auth token from request."""
+        """Verify auth token from request.
+
+        Uses constant-time comparison to prevent timing attacks.
+        """
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            if token == self.server.auth_token:
+            # Security: Use constant-time comparison to prevent timing attacks
+            if secrets.compare_digest(token, self.server.auth_token):
                 return True
         log.warning("HTTP request with invalid/missing auth token")
         return False
@@ -163,17 +479,30 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Handle GET requests."""
+        if not self._check_rate_limit():
+            return
+
         if self.path == "/health":
-            self._send_json_response(200, {
-                "status": "ok",
+            # Include database health check
+            db_health = _deps.store.db.health_check()
+            all_healthy = db_health["falkordb"]["healthy"] and db_health["lancedb"]["healthy"]
+            self._send_json_response(200 if all_healthy else 503, {
+                "status": "ok" if all_healthy else "degraded",
                 "pid": os.getpid(),
                 "uptime_seconds": (datetime.now() - self.server.started_at).total_seconds(),
+                "databases": {
+                    "falkordb": db_health["falkordb"],
+                    "lancedb": db_health["lancedb"],
+                },
             })
         else:
             self._send_json_response(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
         """Handle POST requests."""
+        if not self._check_rate_limit():
+            return
+
         # All POST endpoints require auth
         if not self._verify_auth():
             self._send_json_response(401, {"error": "Unauthorized"})
@@ -202,13 +531,13 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
         log.info(f"Hook: session-start cwd={cwd}, session={session_id[:8] if session_id else 'none'}...")
 
         # Detect project root (use git root if available)
-        project_root = project_manager.detect_project_root(cwd)
+        project_root = _deps.project_manager.detect_project_root(cwd)
 
         # Get bootstrap status
-        status = bootstrap.get_bootstrap_status(project_root)
+        status = _deps.bootstrap.get_bootstrap_status(project_root)
 
         # Generate context injection
-        context = bootstrap.generate_context_injection(project_root)
+        context = _deps.bootstrap.generate_context_injection(project_root)
 
         self._send_json_response(200, {
             "status": "ok",
@@ -240,7 +569,7 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
             return
 
         # Detect project root
-        project_root = project_manager.detect_project_root(cwd)
+        project_root = _deps.project_manager.detect_project_root(cwd)
 
         # Process trace delta asynchronously
         try:
@@ -249,10 +578,10 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
             asyncio.set_event_loop(loop)
             try:
                 result = loop.run_until_complete(
-                    indexer.index_session_delta(
+                    _deps.indexer.index_session_delta(
                         session_id=session_id,
                         project_root=project_root,
-                        project_manager=project_manager,
+                        project_manager=_deps.project_manager,
                         transcript_path=transcript_path if transcript_path else None,
                     )
                 )
@@ -292,7 +621,7 @@ def _start_http_server() -> tuple[HTTPServer, threading.Thread] | None:
     """
     global _auth_token
 
-    if not config.http_enabled:
+    if not _deps.config.http_enabled:
         log.info("HTTP server disabled by config")
         return None
 
@@ -302,12 +631,12 @@ def _start_http_server() -> tuple[HTTPServer, threading.Thread] | None:
     # Create server (port 0 = let OS assign)
     try:
         server = HookHTTPServer(
-            (config.http_host, config.http_port),
+            (_deps.config.http_host, _deps.config.http_port),
             HookHTTPHandler,
             _auth_token,
         )
         actual_port = server.server_address[1]
-        log.info(f"HTTP server bound to {config.http_host}:{actual_port}")
+        log.info(f"HTTP server bound to {_deps.config.http_host}:{actual_port}")
 
         # Write lock file
         _write_lock_file(actual_port, _auth_token)
@@ -327,17 +656,34 @@ def _stop_http_server() -> None:
     """Stop HTTP server and cleanup."""
     global _http_server, _http_thread
 
-    if _http_server is not None:
-        log.info("Stopping HTTP server...")
-        _http_server.shutdown()
-        _http_server = None
+    try:
+        if _http_server is not None:
+            log.info("Stopping HTTP server...")
+            _http_server.shutdown()
+            _http_server = None
 
-    if _http_thread is not None:
-        _http_thread.join(timeout=5.0)
-        _http_thread = None
+        if _http_thread is not None:
+            _http_thread.join(timeout=5.0)
+            _http_thread = None
 
-    _remove_lock_file()
-    log.info("HTTP server stopped")
+        _remove_lock_file()
+        log.info("HTTP server stopped")
+    except (ValueError, OSError):
+        # Suppress logging errors if stdout is closed (e.g., during pytest cleanup)
+        # Still attempt cleanup even if logging fails
+        if _http_server is not None:
+            try:
+                _http_server.shutdown()
+            except Exception:
+                pass
+            _http_server = None
+        if _http_thread is not None:
+            try:
+                _http_thread.join(timeout=5.0)
+            except Exception:
+                pass
+            _http_thread = None
+        _remove_lock_file()
 
 
 atexit.register(_stop_http_server)
@@ -345,11 +691,11 @@ atexit.register(_stop_http_server)
 # Debug info
 _debug_info = {
     "HOME": os.environ.get("HOME", "NOT SET"),
-    "data_dir": str(config.data_dir),
-    "claude_traces_dir": str(config.claude_traces_dir),
-    "traces_dir_exists": config.claude_traces_dir.exists(),
+    "data_dir": str(_deps.config.data_dir),
+    "claude_traces_dir": str(_deps.config.claude_traces_dir),
+    "traces_dir_exists": _deps.config.claude_traces_dir.exists(),
 }
-log.info(f"Server initialized: traces_dir={config.claude_traces_dir}, exists={config.claude_traces_dir.exists()}")
+log.info(f"Server initialized: traces_dir={_deps.config.claude_traces_dir}, exists={_deps.config.claude_traces_dir.exists()}")
 
 # Create MCP server with detailed usage guidance
 mcp = FastMCP(
@@ -437,16 +783,16 @@ async def store_memory(
         metadata=metadata,
         relations=relations or [],
     )
-    result = store.store(item)
+    result = _deps.store.store(item)
     log.info(f"Tool: store_memory complete: {result[:8]}...")
 
     # ECL-LITE: Extract entities and link to memory (graph-first approach)
     try:
-        extraction = await extract_with_actions(text, config)
+        extraction = await extract_with_actions(text, _deps.config)
         if not extraction.is_empty():
             linked_count = 0
             for entity in extraction.entities:
-                success = store.add_verb_edge(
+                success = _deps.store.add_verb_edge(
                     memory_id=result,
                     entity_name=entity.name,
                     entity_type=entity.type,
@@ -485,7 +831,7 @@ async def search_memories(
         List of matching memories with scores
     """
     log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id})")
-    results = store.search(
+    results = _deps.store.search(
         query=query,
         limit=limit,
         use_graph=use_graph,
@@ -513,7 +859,7 @@ async def relate_memories(
         True if relationship was created
     """
     log.info(f"Tool: relate_memories called ({from_id[:8]}... --[{relation_type}]--> {to_id[:8]}...)")
-    result = store.relate(from_id, to_id, relation_type)
+    result = _deps.store.relate(from_id, to_id, relation_type)
     log.info(f"Tool: relate_memories complete: {result}")
     return result
 
@@ -538,15 +884,15 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
         If background=False: {session_summary_id, chunk_count, message_count} or error
     """
     log.info(f"Tool: process_trace called (session_id={session_id}, background={background})")
-    log.debug(f"Using indexer with traces_dir={indexer.parser.traces_dir}")
-    log.debug(f"traces_dir.exists()={indexer.parser.traces_dir.exists()}")
+    log.debug(f"Using indexer with traces_dir={_deps.indexer._deps.parser.traces_dir}")
+    log.debug(f"traces_dir.exists()={_deps.indexer._deps.parser.traces_dir.exists()}")
 
     if background:
         # Submit to background job manager
         async def _process_trace_job(sid: str) -> dict:
             """Background job wrapper for process_trace."""
             log.info(f"Background job: process_trace starting for session {sid}")
-            result = await indexer.index_session(sid, ctx=None)
+            result = await _deps.indexer.index_session(sid, ctx=None)
             if result is None:
                 log.error(f"Background job: process_trace failed - session not found: {sid}")
                 raise ValueError(f"Session {sid} not found")
@@ -557,13 +903,13 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
                 "message_count": len(result.message_ids),
             }
 
-        job_id = await job_manager.submit("process_trace", _process_trace_job, session_id)
+        job_id = await _deps.job_manager.submit("process_trace", _process_trace_job, session_id)
         log.info(f"Tool: process_trace submitted as background job {job_id}")
         return {"job_id": job_id, "status": "submitted", "message": f"Use job_status('{job_id}') to check progress"}
 
     # Synchronous execution (may timeout for large sessions)
     log.warning("Tool: process_trace running synchronously - may timeout for large sessions")
-    result = await indexer.index_session(session_id, ctx=None)
+    result = await _deps.indexer.index_session(session_id, ctx=None)
 
     if result is None:
         log.error(f"Tool: process_trace failed - session not found: {session_id}")
@@ -585,7 +931,7 @@ async def get_stats() -> dict:
         {total_memories, total_relations, types_breakdown}
     """
     log.info("Tool: get_stats called")
-    result = store.get_stats()
+    result = _deps.store.get_stats()
     log.info(f"Tool: get_stats complete: {result['total_memories']} memories")
     return result
 
@@ -610,7 +956,7 @@ async def job_status(job_id: str) -> dict:
         status is one of: pending, running, completed, failed, cancelled
     """
     log.info(f"Tool: job_status called (job_id={job_id})")
-    result = job_manager.get_status(job_id)
+    result = _deps.job_manager.get_status(job_id)
     if result is None:
         log.warning(f"Tool: job_status - job not found: {job_id}")
         return {"error": f"Job {job_id} not found"}
@@ -630,7 +976,7 @@ async def list_jobs(include_completed: bool = True, limit: int = 20) -> dict:
         {jobs: [{id, type, status, progress, message}]}
     """
     log.info(f"Tool: list_jobs called (include_completed={include_completed}, limit={limit})")
-    jobs = job_manager.list_jobs(include_completed=include_completed, limit=limit)
+    jobs = _deps.job_manager.list_jobs(include_completed=include_completed, limit=limit)
     log.info(f"Tool: list_jobs complete: {len(jobs)} jobs returned")
     return {"jobs": jobs}
 
@@ -646,7 +992,7 @@ async def cancel_job(job_id: str) -> dict:
         {cancelled: bool, message: str}
     """
     log.info(f"Tool: cancel_job called (job_id={job_id})")
-    success = await job_manager.cancel(job_id)
+    success = await _deps.job_manager.cancel(job_id)
     if success:
         log.info(f"Tool: cancel_job - successfully cancelled job {job_id}")
         return {"cancelled": True, "message": f"Job {job_id} cancelled"}
@@ -677,7 +1023,7 @@ async def reset_all(confirm: bool = False) -> dict:
             "message": "Set confirm=True to actually delete all data. This is irreversible!",
         }
 
-    result = store.reset_all()
+    result = _deps.store.reset_all()
     log.warning(f"Tool: reset_all complete: {result}")
     return result
 
@@ -708,7 +1054,7 @@ async def reason_memories(
     """
     log.info(f"Tool: reason_memories called (query='{query[:50]}...', max_hops={max_hops})")
 
-    results = store.reason(
+    results = _deps.store.reason(
         query=query,
         max_hops=max_hops,
         min_score=min_score,
@@ -768,7 +1114,7 @@ async def ask_memories(
     """
     log.info(f"Tool: ask_memories called (query='{query[:50]}...')")
 
-    result = await store.ask_memories(
+    result = await _deps.store.ask_memories(
         query=query,
         max_memories=max_memories,
         max_hops=max_hops,
@@ -803,7 +1149,7 @@ async def search_code(
         List of matching code chunks with file paths and line numbers
     """
     log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit})")
-    results = code_indexer.search(query, limit, project_root)
+    results = _deps.code_indexer.search(query, limit, project_root)
     log.info(f"Tool: search_code complete: {len(results)} results")
     return {"results": results, "count": len(results)}
 
@@ -838,17 +1184,17 @@ async def index_directory(
         async def _index_directory_job(p: str, pats: list[str] | None, clear: bool) -> dict:
             """Background job wrapper for index_directory."""
             log.info(f"Background job: index_directory starting for path {p}")
-            result = code_indexer.index_directory(p, pats, clear)
+            result = _deps.code_indexer.index_directory(p, pats, clear)
             log.info(f"Background job: index_directory complete: {result.get('files_indexed', 0)} files")
             return result
 
-        job_id = await job_manager.submit("index_directory", _index_directory_job, path, patterns, clear_existing)
+        job_id = await _deps.job_manager.submit("index_directory", _index_directory_job, path, patterns, clear_existing)
         log.info(f"Tool: index_directory submitted as background job {job_id}")
         return {"job_id": job_id, "status": "submitted", "message": f"Use job_status('{job_id}') to check progress"}
 
     # Synchronous execution
     log.debug("Tool: index_directory running synchronously")
-    result = code_indexer.index_directory(path, patterns, clear_existing)
+    result = _deps.code_indexer.index_directory(path, patterns, clear_existing)
     log.info(f"Tool: index_directory complete: {result.get('files_indexed', 0)} files, {result.get('chunks_created', 0)} chunks")
     return result
 
@@ -864,7 +1210,7 @@ async def code_stats(project_root: str | None = None) -> dict:
         Statistics including chunk count and unique files
     """
     log.info(f"Tool: code_stats called (project_root={project_root})")
-    stats = store.db.get_code_stats(project_root)
+    stats = _deps.store.db.get_code_stats(project_root)
     log.info(f"Tool: code_stats complete: {stats}")
     return stats
 
@@ -892,7 +1238,7 @@ async def code_related_memories(
         Dict with related memories and their shared entities
     """
     log.info(f"Tool: code_related_memories called (chunk={chunk_uuid[:8]}...)")
-    memories = store.db.get_code_related_memories(chunk_uuid, limit)
+    memories = _deps.store.db.get_code_related_memories(chunk_uuid, limit)
     log.info(f"Tool: code_related_memories complete: {len(memories)} memories found")
     return {
         "chunk_uuid": chunk_uuid,
@@ -919,7 +1265,7 @@ async def memory_related_code(
         Dict with related code chunks and their shared entities
     """
     log.info(f"Tool: memory_related_code called (memory={memory_uuid[:8]}...)")
-    code_chunks = store.db.get_memory_related_code(memory_uuid, limit)
+    code_chunks = _deps.store.db.get_memory_related_code(memory_uuid, limit)
     log.info(f"Tool: memory_related_code complete: {len(code_chunks)} chunks found")
     return {
         "memory_uuid": memory_uuid,
@@ -955,7 +1301,7 @@ async def check_code_staleness(project_root: str) -> dict:
         - reason: Human-readable explanation
     """
     log.info(f"Tool: check_code_staleness called (project={project_root})")
-    result = code_indexer.check_staleness(project_root)
+    result = _deps.code_indexer.check_staleness(project_root)
     log.info(f"Tool: check_code_staleness complete: is_stale={result.get('is_stale')}")
     return result
 
@@ -979,7 +1325,7 @@ async def start_code_watching(project_root: str) -> dict:
         Dict with status and project info
     """
     log.info(f"Tool: start_code_watching called (project={project_root})")
-    result = watcher_manager.start_watching(project_root)
+    result = _deps.watcher_manager.start_watching(project_root)
     log.info(f"Tool: start_code_watching complete: status={result.get('status', result.get('error'))}")
     return result
 
@@ -995,7 +1341,7 @@ async def stop_code_watching(project_root: str) -> dict:
         Dict with status and final statistics
     """
     log.info(f"Tool: stop_code_watching called (project={project_root})")
-    result = watcher_manager.stop_watching(project_root)
+    result = _deps.watcher_manager.stop_watching(project_root)
     log.info(f"Tool: stop_code_watching complete: status={result.get('status', result.get('error'))}")
     return result
 
@@ -1011,7 +1357,7 @@ async def get_watcher_status() -> dict:
         - projects: Dict of project status with stats per project
     """
     log.info("Tool: get_watcher_status called")
-    result = watcher_manager.get_status()
+    result = _deps.watcher_manager.get_status()
     log.info(f"Tool: get_watcher_status complete: watching={result.get('watching', 0)} projects")
     return result
 
@@ -1041,7 +1387,7 @@ async def bootstrap_project(
         Dict with bootstrap results including detected project info
     """
     log.info(f"Tool: bootstrap_project called (project={project_root})")
-    result = bootstrap.bootstrap_project(project_root, index_code, start_watcher)
+    result = _deps.bootstrap.bootstrap_project(project_root, index_code, start_watcher)
     log.info(f"Tool: bootstrap_project complete: success={result.get('success')}")
     return result
 
@@ -1073,14 +1419,14 @@ async def get_project_status(project_root: str) -> dict:
             pending_data = json.loads(pending_file.read_text())
             pending_cwd = pending_data.get("cwd", "")
             # Use project_root from pending if not provided, or validate match
-            effective_root = project_root or project_manager.detect_project_root(pending_cwd)
-            deferred_context = bootstrap.generate_context_injection(effective_root)
+            effective_root = project_root or _deps.project_manager.detect_project_root(pending_cwd)
+            deferred_context = _deps.bootstrap.generate_context_injection(effective_root)
             pending_file.unlink()  # Clean up pending file
             log.info(f"Processed deferred session context for {effective_root}")
         except Exception as e:
             log.warning(f"Failed to process pending session: {e}")
 
-    result = bootstrap.get_bootstrap_status(project_root)
+    result = _deps.bootstrap.get_bootstrap_status(project_root)
     if deferred_context:
         result["deferred_context"] = deferred_context
     log.info(f"Tool: get_project_status complete: bootstrapped={result.get('is_bootstrapped')}")
@@ -1104,7 +1450,7 @@ async def set_project_preference(
         Updated project state
     """
     log.info(f"Tool: set_project_preference called (project={project_root}, never_ask={never_ask})")
-    state = project_manager.set_never_ask(project_root, never_ask)
+    state = _deps.project_manager.set_never_ask(project_root, never_ask)
     log.info(f"Tool: set_project_preference complete: never_ask={state.never_ask}")
     return {
         "project_root": state.project_root,
@@ -1121,9 +1467,107 @@ async def list_tracked_projects() -> dict:
         List of projects with their bootstrap status
     """
     log.info("Tool: list_tracked_projects called")
-    projects = project_manager.list_projects()
+    projects = _deps.project_manager.list_projects()
     log.info(f"Tool: list_tracked_projects complete: {len(projects)} projects")
     return {"projects": projects, "count": len(projects)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P5: GRAPH POWER TOOLS (RAW CYPHER ACCESS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def get_graph_schema() -> dict:
+    """Get the complete graph schema for zero-discovery query generation.
+
+    Returns the full FalkorDB graph schema including:
+    - All node labels with their properties, types, and indexes
+    - All relationship types with descriptions and properties
+    - Common query templates ready to use
+
+    Use this BEFORE writing any Cypher queries to avoid wasting tokens
+    on schema discovery. The schema includes everything needed to write
+    accurate queries on the first attempt.
+
+    Returns:
+        Dict containing:
+        - node_labels: List of node types with properties
+        - relationship_types: List of edge types with metadata
+        - common_queries: Ready-to-use query templates
+    """
+    log.info("Tool: get_graph_schema called")
+    try:
+        schema = _deps.store.db.get_schema()
+        log.info(
+            f"Tool: get_graph_schema complete: "
+            f"{len(schema.get('node_labels', []))} nodes, "
+            f"{len(schema.get('relationship_types', []))} relationships"
+        )
+        return schema
+    except Exception as e:
+        log.error(f"Tool: get_graph_schema failed: {e}")
+        return {"error": str(e), "node_labels": [], "relationship_types": [], "common_queries": []}
+
+
+@mcp.tool()
+async def run_cypher_query(
+    query: str,
+    params: dict | None = None,
+    max_results: int = 100,
+) -> dict:
+    """Execute a validated Cypher query against the FalkorDB graph.
+
+    IMPORTANT: Use get_graph_schema first to understand available
+    node types, relationships, and properties before writing queries.
+
+    Security features (enforced automatically):
+    - Read-only by default: CREATE, MERGE, DELETE, SET, REMOVE blocked
+    - LIMIT injection: Queries without LIMIT get one added
+    - Result truncation: Output capped at max_results
+
+    Args:
+        query: Cypher query string (e.g., "MATCH (m:Memory) RETURN m.uuid, m.type LIMIT 10")
+        params: Optional query parameters for parameterized queries
+        max_results: Maximum rows to return (default: 100, max: 1000)
+
+    Returns:
+        Dict containing:
+        - results: List of result rows as dicts
+        - row_count: Number of rows returned
+        - truncated: True if results were limited
+        - execution_time_ms: Query execution time
+
+    Example queries (after checking schema):
+        - "MATCH (m:Memory)-[:RELATES_TO]->(e:Entity) WHERE e.name CONTAINS 'auth' RETURN m.uuid, m.content LIMIT 20"
+        - "MATCH path = (m:Memory)-[*1..2]-(other) WHERE m.uuid = $uuid RETURN path"
+        - "MATCH (e:Entity {type: 'file'}) RETURN e.name, e.version ORDER BY e.version DESC LIMIT 10"
+    """
+    log.info(f"Tool: run_cypher_query called (max_results={max_results})")
+    log.debug(f"Query: {query[:200]}...")
+
+    # Clamp max_results
+    max_results = min(max(1, max_results), 1000)
+
+    try:
+        result = _deps.store.db.execute_validated_cypher(
+            query=query,
+            params=params,
+            max_results=max_results,
+            allow_mutations=False,  # Always read-only via MCP
+        )
+        log.info(
+            f"Tool: run_cypher_query complete: "
+            f"{result['row_count']} rows in {result['execution_time_ms']}ms"
+        )
+        return result
+    except ValueError as e:
+        # Mutation blocked or validation error
+        log.warning(f"Tool: run_cypher_query validation failed: {e}")
+        return {"error": str(e), "results": [], "row_count": 0, "truncated": False}
+    except Exception as e:
+        log.error(f"Tool: run_cypher_query failed: {e}")
+        return {"error": str(e), "results": [], "row_count": 0, "truncated": False}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1134,7 +1578,7 @@ async def list_tracked_projects() -> dict:
 @mcp.resource("memory://recent")
 def list_recent_memories() -> str:
     """Browse 20 most recent memories."""
-    memories = store.list_recent(limit=20)
+    memories = _deps.store.list_recent(limit=20)
     return json.dumps(
         [
             {
@@ -1152,11 +1596,11 @@ def list_recent_memories() -> str:
 @mcp.resource("memory://{uuid}")
 def get_memory_resource(uuid: str) -> str:
     """Read a specific memory and its relationships."""
-    memory = store.get(uuid)
+    memory = _deps.store.get(uuid)
     if memory is None:
         return json.dumps({"error": "Memory not found"})
 
-    related = store.get_related(uuid, hops=1)
+    related = _deps.store.get_related(uuid, hops=1)
 
     return json.dumps(
         {
@@ -1170,14 +1614,14 @@ def get_memory_resource(uuid: str) -> str:
 @mcp.resource("traces://sessions")
 def list_trace_sessions() -> str:
     """Browse available Claude Code session traces."""
-    sessions = parser.list_sessions()[:50]
+    sessions = _deps.parser.list_sessions()[:50]
     return json.dumps(sessions, indent=2)
 
 
 @mcp.resource("graph://explore/{uuid}")
 def explore_graph(uuid: str) -> str:
     """2-hop graph exploration from a memory."""
-    connections = store.get_related(uuid, hops=2)
+    connections = _deps.store.get_related(uuid, hops=2)
     return json.dumps([_memory_to_dict(c) for c in connections], indent=2)
 
 
@@ -1197,7 +1641,7 @@ def list_file_entities() -> str:
     - modifies: Number of modify operations
     - sessions_count: Number of sessions this file appeared in
     """
-    files = store.db.get_entities_by_type("file", limit=100)
+    files = _deps.store.db.get_entities_by_type("file", limit=100)
     return json.dumps(files, indent=2)
 
 
@@ -1211,7 +1655,7 @@ def get_file_history(name: str) -> str:
     - sessions: List of sessions that touched this file
     - related_errors: Errors encountered while working with this file
     """
-    history = store.db.get_entity_history(name, "file", limit=50)
+    history = _deps.store.db.get_entity_history(name, "file", limit=50)
     return json.dumps(history, indent=2)
 
 
@@ -1224,7 +1668,7 @@ def list_tool_usage() -> str:
     - executions: Number of times executed
     - sessions_count: Number of sessions that used this tool
     """
-    tools = store.db.get_tool_usage(limit=100)
+    tools = _deps.store.db.get_tool_usage(limit=100)
     return json.dumps(tools, indent=2)
 
 
@@ -1238,7 +1682,7 @@ def get_tool_history(name: str) -> str:
     - sessions: Sessions that used this tool
     - related_errors: Errors triggered by this tool
     """
-    history = store.db.get_entity_history(name, "tool", limit=50)
+    history = _deps.store.db.get_entity_history(name, "tool", limit=50)
     return json.dumps(history, indent=2)
 
 
@@ -1251,7 +1695,7 @@ def list_error_patterns() -> str:
     - occurrences: Number of times this error was triggered
     - sessions_count: Number of sessions that encountered this error
     """
-    errors = store.db.get_error_patterns(limit=100)
+    errors = _deps.store.db.get_error_patterns(limit=100)
     return json.dumps(errors, indent=2)
 
 
@@ -1264,7 +1708,7 @@ def get_error_history(pattern: str) -> str:
     - memories: All memories where this error was triggered
     - sessions: Sessions that encountered this error
     """
-    history = store.db.get_entity_history(pattern, "error", limit=50)
+    history = _deps.store.db.get_entity_history(pattern, "error", limit=50)
     return json.dumps(history, indent=2)
 
 
@@ -1281,7 +1725,7 @@ def get_cross_session_insights() -> str:
     - sessions_count: Number of sessions this entity appeared in
     - session_ids: List of session IDs
     """
-    entities = store.db.get_cross_session_entities(min_sessions=2, limit=50)
+    entities = _deps.store.db.get_cross_session_entities(min_sessions=2, limit=50)
     return json.dumps(entities, indent=2)
 
 
@@ -1295,7 +1739,7 @@ def get_project_insights(project_id: str) -> str:
     - top_files: Most frequently touched files
     - errors: Errors encountered in this project
     """
-    insights = store.db.get_project_insights(project_id, limit=50)
+    insights = _deps.store.db.get_project_insights(project_id, limit=50)
     return json.dumps(insights, indent=2)
 
 
@@ -1305,7 +1749,7 @@ def list_projects() -> str:
 
     Returns projects sorted by session count.
     """
-    projects = store.db.get_projects(limit=50)
+    projects = _deps.store.db.get_projects(limit=50)
     return json.dumps(projects, indent=2)
 
 

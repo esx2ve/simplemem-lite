@@ -4,7 +4,7 @@ Provides embedding generation via LiteLLM with optional local fallback.
 """
 
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from simplemem_lite.config import Config
 from simplemem_lite.log_config import get_logger
@@ -19,6 +19,9 @@ _config: Config | None = None
 
 # Global model cache for local embeddings (avoids 2-3s reload per call)
 _local_model: "SentenceTransformer | None" = None  # type: ignore
+
+# Dynamic embedding cache (created with configurable size)
+_cached_embed_fn: Callable[[str, str, bool], tuple[float, ...]] | None = None
 
 
 def _get_local_model() -> "SentenceTransformer":
@@ -37,17 +40,24 @@ def _get_local_model() -> "SentenceTransformer":
     return _local_model
 
 
+def _create_cached_embed(cache_size: int) -> Callable[[str, str, bool], tuple[float, ...]]:
+    """Create a cached embedding function with configurable cache size."""
+
+    @lru_cache(maxsize=cache_size)
+    def cached_embed(text: str, model: str, use_local: bool) -> tuple[float, ...]:
+        """Cached embedding generation (returns tuple for hashability)."""
+        return tuple(_embed_impl(text, model, use_local))
+
+    return cached_embed
+
+
 def init_embeddings(config: Config) -> None:
     """Initialize embeddings module with configuration."""
-    global _config
+    global _config, _cached_embed_fn
     _config = config
-    log.debug(f"Embeddings initialized: model={config.embedding_model}, local={config.use_local_embeddings}")
-
-
-@lru_cache(maxsize=1000)
-def _cached_embed(text: str, model: str, use_local: bool) -> tuple[float, ...]:
-    """Cached embedding generation (returns tuple for hashability)."""
-    return tuple(_embed_impl(text, model, use_local))
+    # Create cache with configured size
+    _cached_embed_fn = _create_cached_embed(config.embedding_cache_size)
+    log.debug(f"Embeddings initialized: model={config.embedding_model}, local={config.use_local_embeddings}, cache_size={config.embedding_cache_size}")
 
 
 def _embed_impl(text: str, model: str, use_local: bool) -> list[float]:
@@ -88,8 +98,12 @@ def embed(text: str, config: Config | None = None) -> list[float]:
         cfg = Config()
 
     log.trace(f"Embedding text: {len(text)} chars, model={cfg.embedding_model}")
-    # Use cached version
-    result = _cached_embed(text, cfg.embedding_model, cfg.use_local_embeddings)
+    # Use cached version if initialized, otherwise generate directly
+    if _cached_embed_fn is not None:
+        result = _cached_embed_fn(text, cfg.embedding_model, cfg.use_local_embeddings)
+    else:
+        # Fallback for when init_embeddings hasn't been called
+        result = tuple(_embed_impl(text, cfg.embedding_model, cfg.use_local_embeddings))
     log.trace(f"Embedding complete: dim={len(result)}")
     return list(result)
 

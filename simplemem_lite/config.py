@@ -86,6 +86,9 @@ class Config:
     http_port: int = field(
         default_factory=lambda: int(_get_env("HTTP_PORT", "0"))  # 0 = ephemeral
     )
+    http_rate_limit: int = field(
+        default_factory=lambda: int(_get_env("HTTP_RATE_LIMIT", "100"))  # requests per minute
+    )
 
     # Code search settings
     code_index_enabled: bool = field(
@@ -99,6 +102,28 @@ class Config:
     )
     code_chunk_overlap: int = field(
         default_factory=lambda: int(_get_env("CODE_CHUNK_OVERLAP", "150"))
+    )
+
+    # Embedding cache size (number of embeddings to cache in memory)
+    embedding_cache_size: int = field(
+        default_factory=lambda: int(_get_env("EMBEDDING_CACHE_SIZE", "1000"))
+    )
+
+    # Database limits (extracted magic numbers for maintainability)
+    memory_content_max_size: int = field(
+        default_factory=lambda: int(_get_env("MEMORY_CONTENT_MAX_SIZE", "5000"))
+    )
+    summary_max_size: int = field(
+        default_factory=lambda: int(_get_env("SUMMARY_MAX_SIZE", "500"))
+    )
+    max_graph_hops: int = field(
+        default_factory=lambda: int(_get_env("MAX_GRAPH_HOPS", "3"))
+    )
+    graph_path_limit: int = field(
+        default_factory=lambda: int(_get_env("GRAPH_PATH_LIMIT", "100"))
+    )
+    cross_session_limit: int = field(
+        default_factory=lambda: int(_get_env("CROSS_SESSION_LIMIT", "50"))
     )
 
     @property

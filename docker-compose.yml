@@ -1,6 +1,6 @@
 services:
   falkordb:
-    image: falkordb/falkordb:latest
+    image: falkordb/falkordb:v4.16.0
     container_name: simplemem-falkordb
     ports:
       - "6379:6379"
