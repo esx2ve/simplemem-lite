@@ -23,6 +23,7 @@ from simplemem_lite.bootstrap import Bootstrap
 from simplemem_lite.code_index import CodeIndexer
 from simplemem_lite.config import Config
 from simplemem_lite.extractors import extract_with_actions
+from simplemem_lite.job_manager import JobManager, init_job_manager
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
 from simplemem_lite.projects import ProjectManager
@@ -58,6 +59,9 @@ log.debug("ProjectManager initialized")
 
 bootstrap = Bootstrap(config, project_manager, code_indexer, watcher_manager)
 log.debug("Bootstrap initialized")
+
+job_manager = init_job_manager(config.data_dir)
+log.debug("JobManager initialized")
 
 
 def _cleanup_watchers() -> None:
@@ -515,7 +519,7 @@ async def relate_memories(
 
 
 @mcp.tool()
-async def process_trace(session_id: str, ctx: Context) -> dict:
+async def process_trace(session_id: str, background: bool = True) -> dict:
     """Index a Claude Code session trace with hierarchical summaries.
 
     Creates a hierarchy of memories:
@@ -523,28 +527,48 @@ async def process_trace(session_id: str, ctx: Context) -> dict:
     - chunk_summary (5-15) - Summaries of activity chunks
 
     Uses cheap LLM (flash-lite) for summarization with progress updates.
+    Runs in background by default to avoid MCP timeout on large sessions.
 
     Args:
         session_id: Session UUID to index
-        ctx: MCP context for progress reporting
+        background: Run in background (default: True). Use job_status to check progress.
 
     Returns:
-        {session_summary_id, chunk_count, message_count} or error
+        If background=True: {job_id, status: "submitted"}
+        If background=False: {session_summary_id, chunk_count, message_count} or error
     """
-    log.info(f"Tool: process_trace called (session_id={session_id})")
+    log.info(f"Tool: process_trace called (session_id={session_id}, background={background})")
     log.debug(f"Using indexer with traces_dir={indexer.parser.traces_dir}")
     log.debug(f"traces_dir.exists()={indexer.parser.traces_dir.exists()}")
 
-    await ctx.report_progress(0, 100)
-    await ctx.info(f"Starting to process session {session_id[:8]}...")
+    if background:
+        # Submit to background job manager
+        async def _process_trace_job(sid: str) -> dict:
+            """Background job wrapper for process_trace."""
+            log.info(f"Background job: process_trace starting for session {sid}")
+            result = await indexer.index_session(sid, ctx=None)
+            if result is None:
+                log.error(f"Background job: process_trace failed - session not found: {sid}")
+                raise ValueError(f"Session {sid} not found")
+            log.info(f"Background job: process_trace complete: {len(result.chunk_summary_ids)} chunks")
+            return {
+                "session_summary_id": result.session_summary_id,
+                "chunk_count": len(result.chunk_summary_ids),
+                "message_count": len(result.message_ids),
+            }
 
-    result = await indexer.index_session(session_id, ctx)
+        job_id = await job_manager.submit("process_trace", _process_trace_job, session_id)
+        log.info(f"Tool: process_trace submitted as background job {job_id}")
+        return {"job_id": job_id, "status": "submitted", "message": f"Use job_status('{job_id}') to check progress"}
+
+    # Synchronous execution (may timeout for large sessions)
+    log.warning("Tool: process_trace running synchronously - may timeout for large sessions")
+    result = await indexer.index_session(session_id, ctx=None)
 
     if result is None:
         log.error(f"Tool: process_trace failed - session not found: {session_id}")
         return {"error": f"Session {session_id} not found"}
 
-    await ctx.report_progress(100, 100)
     log.info(f"Tool: process_trace complete: {len(result.chunk_summary_ids)} chunks")
     return {
         "session_summary_id": result.session_summary_id,
@@ -564,6 +588,71 @@ async def get_stats() -> dict:
     result = store.get_stats()
     log.info(f"Tool: get_stats complete: {result['total_memories']} memories")
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKGROUND JOB MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def job_status(job_id: str) -> dict:
+    """Get status of a background job.
+
+    Use this to check progress of long-running operations like process_trace
+    or index_directory that were submitted with background=True.
+
+    Args:
+        job_id: Job ID returned when submitting the background job
+
+    Returns:
+        {id, type, status, progress, message, result, error, timestamps}
+        status is one of: pending, running, completed, failed, cancelled
+    """
+    log.info(f"Tool: job_status called (job_id={job_id})")
+    result = job_manager.get_status(job_id)
+    if result is None:
+        log.warning(f"Tool: job_status - job not found: {job_id}")
+        return {"error": f"Job {job_id} not found"}
+    log.info(f"Tool: job_status complete: {job_id} status={result['status']} progress={result['progress']}%")
+    return result
+
+
+@mcp.tool()
+async def list_jobs(include_completed: bool = True, limit: int = 20) -> dict:
+    """List all background jobs.
+
+    Args:
+        include_completed: Include completed/failed/cancelled jobs (default: True)
+        limit: Maximum number of jobs to return (default: 20)
+
+    Returns:
+        {jobs: [{id, type, status, progress, message}]}
+    """
+    log.info(f"Tool: list_jobs called (include_completed={include_completed}, limit={limit})")
+    jobs = job_manager.list_jobs(include_completed=include_completed, limit=limit)
+    log.info(f"Tool: list_jobs complete: {len(jobs)} jobs returned")
+    return {"jobs": jobs}
+
+
+@mcp.tool()
+async def cancel_job(job_id: str) -> dict:
+    """Cancel a running background job.
+
+    Args:
+        job_id: Job ID to cancel
+
+    Returns:
+        {cancelled: bool, message: str}
+    """
+    log.info(f"Tool: cancel_job called (job_id={job_id})")
+    success = await job_manager.cancel(job_id)
+    if success:
+        log.info(f"Tool: cancel_job - successfully cancelled job {job_id}")
+        return {"cancelled": True, "message": f"Job {job_id} cancelled"}
+    else:
+        log.warning(f"Tool: cancel_job - failed to cancel job {job_id}")
+        return {"cancelled": False, "message": f"Job {job_id} not found or not running"}
 
 
 @mcp.tool()
@@ -724,21 +813,41 @@ async def index_directory(
     path: str,
     patterns: list[str] | None = None,
     clear_existing: bool = True,
+    background: bool = True,
 ) -> dict:
     """Index a directory for code search.
 
     Scans the directory for source files matching the patterns,
     splits them into semantic chunks, and adds to the search index.
+    Runs in background by default to avoid MCP timeout on large codebases.
 
     Args:
         path: Directory path to index
         patterns: Optional glob patterns (default: ['**/*.py', '**/*.ts', '**/*.js', '**/*.tsx', '**/*.jsx'])
         clear_existing: Whether to clear existing index for this directory (default: True)
+        background: Run in background (default: True). Use job_status to check progress.
 
     Returns:
-        Indexing statistics including files indexed and chunks created
+        If background=True: {job_id, status: "submitted"}
+        If background=False: Indexing statistics including files indexed and chunks created
     """
-    log.info(f"Tool: index_directory called (path={path})")
+    log.info(f"Tool: index_directory called (path={path}, background={background})")
+
+    if background:
+        # Submit to background job manager
+        async def _index_directory_job(p: str, pats: list[str] | None, clear: bool) -> dict:
+            """Background job wrapper for index_directory."""
+            log.info(f"Background job: index_directory starting for path {p}")
+            result = code_indexer.index_directory(p, pats, clear)
+            log.info(f"Background job: index_directory complete: {result.get('files_indexed', 0)} files")
+            return result
+
+        job_id = await job_manager.submit("index_directory", _index_directory_job, path, patterns, clear_existing)
+        log.info(f"Tool: index_directory submitted as background job {job_id}")
+        return {"job_id": job_id, "status": "submitted", "message": f"Use job_status('{job_id}') to check progress"}
+
+    # Synchronous execution
+    log.debug("Tool: index_directory running synchronously")
     result = code_indexer.index_directory(path, patterns, clear_existing)
     log.info(f"Tool: index_directory complete: {result.get('files_indexed', 0)} files, {result.get('chunks_created', 0)} chunks")
     return result
