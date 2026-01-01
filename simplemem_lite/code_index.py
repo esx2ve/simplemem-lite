@@ -129,6 +129,22 @@ class CodeIndexer:
         self._pathspec_cache: dict[str, pathspec.PathSpec] = {}
         log.info("CodeIndexer initialized")
 
+    def get_stats(self) -> dict[str, Any]:
+        """Get code index statistics for statusline.
+
+        Returns:
+            Dict with chunk_count and unique_files
+        """
+        try:
+            stats = self.db.get_code_stats()
+            return {
+                "chunk_count": stats.get("chunk_count", 0),
+                "unique_files": stats.get("unique_files", 0),
+            }
+        except Exception as e:
+            log.warning(f"Failed to get code stats: {e}")
+            return {"chunk_count": 0, "unique_files": 0}
+
     def _load_gitignore(self, root: Path) -> list[str]:
         """Load .gitignore patterns from project root and parent directories.
 
@@ -654,6 +670,7 @@ class CodeIndexer:
         formatted = []
         for r in results:
             formatted.append({
+                "uuid": r.get("uuid", ""),
                 "filepath": r.get("filepath", ""),
                 "content": r.get("content", ""),
                 "start_line": r.get("start_line", 0),
