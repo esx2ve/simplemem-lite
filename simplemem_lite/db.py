@@ -374,7 +374,7 @@ class DatabaseManager:
                 MATCH (m:Memory {uuid: $uuid})-[r:READS]->(e:Entity {name: $name, type: $type})
                 RETURN count(r) as cnt
                 """,
-                {"uuid": memory_uuid, "name": safe_name, "type": entity_type},
+                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type},
             )
             reads_exists = check_result.result_set and check_result.result_set[0][0] > 0
 
@@ -385,7 +385,7 @@ class DatabaseManager:
                     MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
                     CREATE (m)-[:READS {timestamp: $ts, implicit: true}]->(e)
                     """,
-                    {"uuid": memory_uuid, "name": safe_name, "type": entity_type, "ts": ts - 1},
+                    {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts - 1},
                 )
                 log.trace(f"Added implicit READS edge for MODIFIES: {entity_type}:{canonical_name}")
 
@@ -654,12 +654,15 @@ class DatabaseManager:
             List of matching memories with distance scores
         """
         log.trace(f"Searching vectors: limit={limit}, type_filter={type_filter}")
-        search = self.lance_table.search(query_vector).limit(limit)
 
-        if type_filter:
-            search = search.where(f"type = '{type_filter}'")
+        with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+            search = self.lance_table.search(query_vector).limit(limit)
 
-        results = search.to_list()
+            if type_filter:
+                search = search.where(f"type = '{type_filter}'")
+
+            results = search.to_list()
+
         log.debug(f"Vector search returned {len(results)} results")
         return results
 
@@ -684,7 +687,10 @@ class DatabaseManager:
             return 0
 
         log.info(f"Adding {len(chunks)} code chunks to index")
-        self.code_table.add(chunks)
+
+        with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+            self.code_table.add(chunks)
+
         log.debug(f"Code chunks added successfully")
         return len(chunks)
 
@@ -709,12 +715,15 @@ class DatabaseManager:
             return []
 
         log.trace(f"Searching code: limit={limit}, project_root={project_root}")
-        search = self.code_table.search(query_vector).limit(limit)
 
-        if project_root:
-            search = search.where(f"project_root = '{project_root}'")
+        with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+            search = self.code_table.search(query_vector).limit(limit)
 
-        results = search.to_list()
+            if project_root:
+                search = search.where(f"project_root = '{project_root}'")
+
+            results = search.to_list()
+
         log.debug(f"Code search returned {len(results)} results")
         return results
 
@@ -730,25 +739,26 @@ class DatabaseManager:
         if not self.config.code_index_enabled:
             return 0
 
-        if project_root:
-            log.info(f"Clearing code index for project: {project_root}")
-            # Count before delete
-            try:
-                count = len(self.code_table.search([0.0] * self.config.embedding_dim)
-                           .where(f"project_root = '{project_root}'")
-                           .limit(100000).to_list())
-            except Exception:
-                count = 0
-            self.code_table.delete(f"project_root = '{project_root}'")
-        else:
-            log.info("Clearing entire code index")
-            try:
-                count = self.code_table.count_rows()
-            except Exception:
-                count = 0
-            # Drop and recreate table
-            self.lance_db.drop_table(self.CODE_TABLE_NAME)
-            self._init_code_table()
+        with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+            if project_root:
+                log.info(f"Clearing code index for project: {project_root}")
+                # Count before delete
+                try:
+                    count = len(self.code_table.search([0.0] * self.config.embedding_dim)
+                               .where(f"project_root = '{project_root}'")
+                               .limit(100000).to_list())
+                except Exception:
+                    count = 0
+                self.code_table.delete(f"project_root = '{project_root}'")
+            else:
+                log.info("Clearing entire code index")
+                try:
+                    count = self.code_table.count_rows()
+                except Exception:
+                    count = 0
+                # Drop and recreate table
+                self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                self._init_code_table()
 
         log.info(f"Cleared {count} code chunks")
         return count

@@ -231,14 +231,14 @@ class SimplememDaemon:
 
     async def _handle_reason_memories(self, params: dict) -> dict:
         """Multi-hop reasoning over memory graph."""
-        log.debug(f"reason_memories: query='{params['query'][:50]}...'")
-        # Note: project_id filtering not yet supported by MemoryStore.reason()
-        # Param is accepted but not passed through until underlying support added
+        project_id = params.get("project_id")
+        log.debug(f"reason_memories: query='{params['query'][:50]}...', project={project_id}")
 
         results = self._memory_store.reason(
             query=params["query"],
             max_hops=params.get("max_hops", 2),
             min_score=params.get("min_score", 0.1),
+            project_id=project_id,
         )
 
         log.debug(f"reason_memories: found {len(results)} conclusions")
@@ -246,14 +246,14 @@ class SimplememDaemon:
 
     async def _handle_ask_memories(self, params: dict) -> dict:
         """LLM-synthesized answer from memories."""
-        log.debug(f"ask_memories: query='{params['query'][:50]}...'")
-        # Note: project_id filtering not yet supported by MemoryStore.ask_memories()
-        # Param is accepted but not passed through until underlying support added
+        project_id = params.get("project_id")
+        log.debug(f"ask_memories: query='{params['query'][:50]}...', project={project_id}")
 
         result = await self._memory_store.ask_memories(
             query=params["query"],
             max_memories=params.get("max_memories", 8),
             max_hops=params.get("max_hops", 2),
+            project_id=project_id,
         )
 
         log.info(f"ask_memories: confidence={result.get('confidence')}")

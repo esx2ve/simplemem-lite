@@ -607,6 +607,7 @@ class MemoryStore:
         max_hops: int = 2,
         min_score: float = 0.1,
         use_pagerank: bool = True,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Multi-hop reasoning over memory graph.
 
@@ -622,17 +623,28 @@ class MemoryStore:
             max_hops: Maximum path length for traversal
             min_score: Minimum score threshold for results
             use_pagerank: Whether to incorporate PageRank scores (default: True)
+            project_id: Optional filter by project (for cross-project isolation)
 
         Returns:
             List of conclusions with scores and proof chains
         """
-        log.info(f"Reasoning: query='{query[:50]}...', max_hops={max_hops}, pagerank={use_pagerank}")
+        log.info(f"Reasoning: query='{query[:50]}...', max_hops={max_hops}, pagerank={use_pagerank}, project={project_id}")
 
         # Step 1: Vector search for seed nodes
         log.trace("Step 1: Finding seed nodes via vector search")
         query_embedding = embed(query, self.config)
-        seeds = self.db.search_vectors(query_embedding, limit=seed_limit)
+        # Fetch more seeds when filtering by project to ensure adequate results
+        fetch_limit = seed_limit * 3 if project_id else seed_limit
+        seeds = self.db.search_vectors(query_embedding, limit=fetch_limit)
         log.debug(f"Found {len(seeds)} seed nodes")
+
+        # Optional: Filter by project_id (via graph lookup)
+        if project_id and seeds:
+            log.trace(f"Filtering seeds by project: {project_id}")
+            uuids = [s["uuid"] for s in seeds]
+            project_uuids = self.db.get_memories_in_project(project_id, uuids)
+            seeds = [s for s in seeds if s["uuid"] in project_uuids][:seed_limit]
+            log.debug(f"After project filter: {len(seeds)} seeds")
 
         if not seeds:
             return []
@@ -779,6 +791,7 @@ class MemoryStore:
         max_memories: int = 8,
         max_hops: int = 2,
         include_raw: bool = False,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """LLM-powered reasoning over graph-retrieved memories.
 
@@ -790,6 +803,7 @@ class MemoryStore:
             max_memories: Maximum memories to include in context (default: 8)
             max_hops: Maximum graph traversal depth (default: 2)
             include_raw: Include raw memory data in response (default: False)
+            project_id: Optional filter by project (for cross-project isolation)
 
         Returns:
             Dictionary with:
@@ -801,10 +815,10 @@ class MemoryStore:
         """
         from litellm import acompletion
 
-        log.info(f"ask_memories: query='{query[:50]}...', max_memories={max_memories}")
+        log.info(f"ask_memories: query='{query[:50]}...', max_memories={max_memories}, project={project_id}")
 
         # Step 1: Retrieve memories via graph reasoning
-        memories = self.reason(query, max_hops=max_hops, min_score=0.05)[:max_memories]
+        memories = self.reason(query, max_hops=max_hops, min_score=0.05, project_id=project_id)[:max_memories]
 
         if not memories:
             log.info("ask_memories: No relevant memories found")
