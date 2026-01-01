@@ -50,11 +50,12 @@ class Memory:
     Attributes:
         uuid: Unique identifier
         content: Text content
-        type: Memory type (fact, session_summary, chunk_summary, message)
+        type: Memory type (fact, session_summary, chunk_summary, message, todo)
         created_at: Unix timestamp
         score: Relevance score (higher = more relevant)
         session_id: Optional session identifier
         relations: Related memories
+        metadata: Additional metadata (project_id, todo fields, etc.)
     """
 
     uuid: str
@@ -64,6 +65,7 @@ class Memory:
     score: float = 0.0
     session_id: str | None = None
     relations: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class MemoryStore:
@@ -144,6 +146,7 @@ class MemoryStore:
                     content=item.content,
                     mem_type=mem_type,
                     session_id=session_id,
+                    metadata=item.metadata,
                 )
 
                 # Phase 3: Create relationships
@@ -208,6 +211,7 @@ class MemoryStore:
                 "session_id": session_id,
                 "created_at": created_at,
                 "relations": item.relations,
+                "metadata": item.metadata,
             })
             contents.append(item.content)
 
@@ -238,6 +242,7 @@ class MemoryStore:
                         content=data["content"],
                         mem_type=data["type"],
                         session_id=data["session_id"],
+                        metadata=data["metadata"],
                     )
 
                     uuids.append(data["uuid"])
@@ -548,6 +553,23 @@ class MemoryStore:
             "entities": db_stats.get("entities", 0),
         }
 
+    def _parse_metadata(self, metadata_str: str | None) -> dict[str, Any]:
+        """Parse JSON metadata string to dict.
+
+        Args:
+            metadata_str: JSON string or None
+
+        Returns:
+            Parsed metadata dict (empty dict if parsing fails)
+        """
+        if not metadata_str:
+            return {}
+        try:
+            import json
+            return json.loads(metadata_str)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
     def _format_vector_results(self, results: list[dict]) -> list[Memory]:
         """Format vector search results as Memory objects.
 
@@ -563,6 +585,7 @@ class MemoryStore:
                 session_id=r["session_id"] if r.get("session_id") else None,
                 created_at=0,  # Not stored in vector table
                 score=max(0, 1 - r.get("_distance", 0) / 2),  # Normalize cosine distance to 0-1
+                metadata=self._parse_metadata(r.get("metadata")),
             )
             for r in results
         ]
@@ -582,6 +605,7 @@ class MemoryStore:
                     session_id=data.get("session_id") if data.get("session_id") else None,
                     created_at=data.get("created_at", 0),
                     score=score,
+                    metadata=self._parse_metadata(data.get("metadata")),
                 )
             )
 

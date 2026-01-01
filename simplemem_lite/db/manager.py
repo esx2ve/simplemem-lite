@@ -179,6 +179,7 @@ class DatabaseManager:
                 pa.field("content", pa.string()),
                 pa.field("type", pa.string()),
                 pa.field("session_id", pa.string()),
+                pa.field("metadata", pa.string()),  # JSON-serialized metadata
             ])
 
             # Create empty table with schema
@@ -620,6 +621,7 @@ class DatabaseManager:
         content: str,
         mem_type: str,
         session_id: str | None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Add a memory vector to LanceDB.
 
@@ -629,7 +631,9 @@ class DatabaseManager:
             content: Memory content (for retrieval)
             mem_type: Memory type
             session_id: Optional session identifier
+            metadata: Additional metadata (stored as JSON)
         """
+        import json
         self.lance_table.add([
             {
                 "uuid": uuid,
@@ -637,6 +641,7 @@ class DatabaseManager:
                 "content": content,
                 "type": mem_type,
                 "session_id": session_id or "",
+                "metadata": json.dumps(metadata or {}),
             }
         ])
 
