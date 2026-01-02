@@ -17,9 +17,10 @@ WORKDIR /app
 RUN pip install uv
 
 # Copy dependency files first (better caching)
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml ./
+COPY uv.lock* ./
 
-# Install dependencies
+# Install dependencies (use uv if lock file exists, otherwise pip)
 RUN uv pip install --system -e ".[falkordb]"
 
 # Copy application code
