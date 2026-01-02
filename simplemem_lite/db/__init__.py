@@ -1,26 +1,46 @@
 """Database management for SimpleMem Lite.
 
-This package provides DatabaseManager which handles FalkorDB (graph) and LanceDB (vectors)
-with two-phase commit for consistency.
+This package provides DatabaseManager which handles graph database (FalkorDB/KuzuDB)
+and LanceDB (vectors) with two-phase commit for consistency.
+
+Graph Backend Selection:
+- FalkorDB: Preferred when Docker is available (full Cypher support, PageRank)
+- KuzuDB: Embedded fallback for HPC/serverless environments (no Docker required)
+- Auto-detection: Tries FalkorDB first, falls back to KuzuDB
+
+Environment Variables:
+- SIMPLEMEM_GRAPH_BACKEND: Force "falkordb" or "kuzu"
+- SIMPLEMEM_KUZU_PATH: Override KuzuDB database path
 
 Module Structure:
 - manager.py: DatabaseManager class with all database operations
-
-The package is organized to support future modular splitting:
-- Core: Connections, health checks, base operations (lines 1-230)
-- Memory: Node CRUD, relationships, entity linking (lines 234-795)
-- Code Search: Code indexing and semantic search (lines 800-1200)
-- Graph: Graph traversal and path operations (lines 1200-1400)
-- Analytics: PageRank, stats, insights (lines 1400+)
+- graph_protocol.py: Abstract protocol for graph backends
+- graph_factory.py: Backend selection and auto-detection
+- falkor_backend.py: FalkorDB implementation
+- kuzu_backend.py: KuzuDB implementation
 
 Example:
     from simplemem_lite.db import DatabaseManager
     from simplemem_lite.config import Config
 
     db = DatabaseManager(Config())
+    print(f"Using backend: {db.backend_name}")  # "falkordb" or "kuzu"
     db.add_memory_node(uuid="...", content="...", ...)
+
+Backend Info:
+    from simplemem_lite.db import get_backend_info
+    info = get_backend_info()
+    print(info)  # Shows which backends are available
 """
 
 from simplemem_lite.db.manager import DatabaseManager
+from simplemem_lite.db.graph_factory import create_graph_backend, get_backend_info
+from simplemem_lite.db.graph_protocol import GraphBackend, QueryResult
 
-__all__ = ["DatabaseManager"]
+__all__ = [
+    "DatabaseManager",
+    "GraphBackend",
+    "QueryResult",
+    "create_graph_backend",
+    "get_backend_info",
+]

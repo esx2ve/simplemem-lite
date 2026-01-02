@@ -10,11 +10,17 @@
 
 set -e
 
+# Debug logging
+LOG_FILE="${HOME}/.simplemem_lite/logs/stop-hook.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+echo "$(date '+%Y-%m-%d %H:%M:%S') Stop hook triggered" >> "$LOG_FILE"
+
 # Lock file location
 LOCK_FILE="${HOME}/.simplemem_lite/server.lock"
 
 # Read input from stdin
 INPUT=$(cat)
+echo "$(date '+%Y-%m-%d %H:%M:%S') Input: $INPUT" >> "$LOG_FILE"
 
 # Check if lock file exists
 if [[ ! -f "$LOCK_FILE" ]]; then

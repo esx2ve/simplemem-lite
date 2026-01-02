@@ -594,6 +594,8 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
             self._handle_session_start(body)
         elif self.path == "/hook/stop":
             self._handle_stop(body)
+        elif self.path == "/stats":
+            self._handle_stats()
         else:
             self._send_json_response(404, {"error": "Not found"})
 
@@ -679,6 +681,52 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
                 "session_id": session_id,
                 "error": str(e),
             })
+
+    def _handle_stats(self) -> None:
+        """Handle stats request for statusline.
+
+        Returns comprehensive stats for SimpleMem statusline display.
+        """
+        try:
+            # Memory stats
+            mem_stats = _deps.store.get_stats()
+
+            # Code index stats
+            code_stats = _deps.code_indexer.get_stats() if _deps.code_indexer else {}
+
+            # Watcher stats
+            watcher_status = _deps.watcher_manager.get_status() if _deps.watcher_manager else {}
+
+            # Job stats
+            job_stats = _deps.job_manager.get_active_stats() if _deps.job_manager else {}
+
+            # Todo count (query for pending todos)
+            todo_count = 0
+            try:
+                todos = _deps.store.db.graph.query(
+                    "MATCH (m:Memory {type: 'todo'}) "
+                    "WHERE m.content CONTAINS 'pending' "
+                    "RETURN count(m) AS count"
+                )
+                if todos.result_set:
+                    todo_count = todos.result_set[0][0]
+            except Exception:
+                pass
+
+            self._send_json_response(200, {
+                "memories": mem_stats.get("total_memories", 0),
+                "entities": mem_stats.get("entities", 0),
+                "relations": mem_stats.get("total_relations", 0),
+                "code_files": code_stats.get("unique_files", 0),
+                "code_chunks": code_stats.get("chunk_count", 0),
+                "watchers": watcher_status.get("watching", 0),
+                "jobs_running": job_stats.get("active", 0),
+                "job_current": job_stats.get("current"),
+                "todos_pending": todo_count,
+            })
+        except Exception as e:
+            log.error(f"Stats endpoint failed: {e}")
+            self._send_json_response(500, {"error": str(e)})
 
 
 class HookHTTPServer(HTTPServer):

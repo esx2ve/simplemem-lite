@@ -303,6 +303,24 @@ class JobManager:
             "completed_at": job.completed_at,
         }
 
+    def get_active_stats(self) -> dict:
+        """Get summary stats for active jobs (for statusline).
+
+        Returns:
+            Dict with active job count and current job info
+        """
+        active = [j for j in self._jobs.values() if j.status == JobStatus.RUNNING]
+        if active:
+            current = max(active, key=lambda j: j.started_at or "")
+            return {
+                "active": len(active),
+                "current": {
+                    "type": current.job_type,
+                    "progress": current.progress,
+                },
+            }
+        return {"active": 0, "current": None}
+
     def list_jobs(self, include_completed: bool = True, limit: int = 20) -> list[dict]:
         """List all jobs.
 

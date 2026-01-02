@@ -1,6 +1,12 @@
 """Database management for SimpleMem Lite.
 
-Handles FalkorDB (graph) and LanceDB (vectors) with two-phase commit.
+Handles graph database (FalkorDB or KuzuDB) and LanceDB (vectors) with two-phase commit.
+
+Graph Backend Selection:
+- FalkorDB: Preferred when Docker is available (full Cypher support, PageRank)
+- KuzuDB: Fallback for HPC/embedded environments (no Docker required)
+
+The backend is auto-detected at startup, or can be forced via SIMPLEMEM_GRAPH_BACKEND env var.
 """
 
 import threading
@@ -8,21 +14,27 @@ from typing import Any
 
 import lancedb
 import pyarrow as pa
-from falkordb import FalkorDB
 
 from simplemem_lite.config import Config
+from simplemem_lite.db.graph_factory import create_graph_backend, get_backend_info
+from simplemem_lite.db.graph_protocol import GraphBackend
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("db")
 
 
 class DatabaseManager:
-    """Manages FalkorDB and LanceDB connections with consistency guarantees.
+    """Manages graph database and LanceDB connections with consistency guarantees.
 
     Implements a simple two-phase commit pattern:
-    1. Write to graph (FalkorDB) first - source of truth
+    1. Write to graph (FalkorDB/KuzuDB) first - source of truth
     2. Write to vectors (LanceDB) second
     3. Rollback graph if vector write fails
+
+    Graph Backend Selection:
+    - Auto-detects FalkorDB if Docker is available
+    - Falls back to KuzuDB for HPC/embedded environments
+    - Can be forced via SIMPLEMEM_GRAPH_BACKEND environment variable
 
     CONCURRENCY WARNING:
     This class uses a threading.Lock for write operations which only protects
@@ -57,15 +69,24 @@ class DatabaseManager:
         self.config = config
         self._write_lock = threading.Lock()
 
-        # Initialize FalkorDB (requires running instance)
-        log.debug(f"Connecting to FalkorDB at {self.config.falkor_host}:{self.config.falkor_port}")
-        self.falkor_db = FalkorDB(
-            host=self.config.falkor_host,
-            port=self.config.falkor_port,
+        # Initialize graph backend with auto-detection
+        # Falls back from FalkorDB → KuzuDB if Docker not available
+        log.debug("Initializing graph backend with auto-detection")
+        self._graph_backend: GraphBackend = create_graph_backend(
+            backend="auto",
+            falkor_host=self.config.falkor_host,
+            falkor_port=self.config.falkor_port,
+            kuzu_path=self.config.data_dir / "kuzu",
         )
-        self.graph = self.falkor_db.select_graph(self.GRAPH_NAME)
-        self._init_graph_indexes()
-        log.info(f"FalkorDB connected: graph={self.GRAPH_NAME}")
+        log.info(f"Graph backend initialized: {self._graph_backend.backend_name}")
+
+        # For backward compatibility, expose graph attribute
+        # FalkorDBBackend has a .graph property that returns the underlying graph
+        if hasattr(self._graph_backend, "graph"):
+            self.graph = self._graph_backend.graph
+        else:
+            # KuzuDB uses the backend directly
+            self.graph = self._graph_backend
 
         # Initialize LanceDB (it creates its own directory)
         log.debug(f"Initializing LanceDB at {self.config.vectors_dir}")
@@ -74,8 +95,26 @@ class DatabaseManager:
         log.info(f"LanceDB initialized at {self.config.vectors_dir}")
 
         # Track connection health
-        self._falkor_healthy = True
+        self._graph_healthy = True
         self._last_health_check = 0
+
+    @property
+    def graph_backend(self) -> GraphBackend:
+        """Get the underlying graph backend.
+
+        Returns:
+            The GraphBackend instance (FalkorDB or KuzuDB)
+        """
+        return self._graph_backend
+
+    @property
+    def backend_name(self) -> str:
+        """Get the name of the active graph backend.
+
+        Returns:
+            "falkordb" or "kuzu"
+        """
+        return self._graph_backend.backend_name
 
     def health_check(self) -> dict[str, Any]:
         """Check health of database connections.
@@ -86,21 +125,19 @@ class DatabaseManager:
         import time
 
         result = {
-            "falkordb": {"healthy": False, "error": None},
+            "graph": {"healthy": False, "error": None, "backend": self.backend_name},
             "lancedb": {"healthy": False, "error": None},
             "timestamp": time.time(),
         }
 
-        # Check FalkorDB
+        # Check graph backend (FalkorDB or KuzuDB)
         try:
-            # Simple query to verify connection
-            self.graph.query("RETURN 1")
-            result["falkordb"]["healthy"] = True
-            self._falkor_healthy = True
+            result["graph"]["healthy"] = self._graph_backend.health_check()
+            self._graph_healthy = result["graph"]["healthy"]
         except Exception as e:
-            result["falkordb"]["error"] = str(e)
-            self._falkor_healthy = False
-            log.warning(f"FalkorDB health check failed: {e}")
+            result["graph"]["error"] = str(e)
+            self._graph_healthy = False
+            log.warning(f"Graph health check failed: {e}")
 
         # Check LanceDB
         try:
@@ -121,51 +158,34 @@ class DatabaseManager:
             True if all databases are healthy
         """
         health = self.health_check()
-        return health["falkordb"]["healthy"] and health["lancedb"]["healthy"]
+        return health["graph"]["healthy"] and health["lancedb"]["healthy"]
 
-    def reconnect_falkordb(self) -> bool:
-        """Attempt to reconnect to FalkorDB.
+    def reconnect_graph(self) -> bool:
+        """Attempt to reconnect to the graph backend.
 
         Returns:
             True if reconnection successful
         """
-        try:
-            log.info("Attempting to reconnect to FalkorDB...")
-            self.falkor_db = FalkorDB(
-                host=self.config.falkor_host,
-                port=self.config.falkor_port,
-            )
-            self.graph = self.falkor_db.select_graph(self.GRAPH_NAME)
-            # Verify connection
-            self.graph.query("RETURN 1")
-            self._falkor_healthy = True
-            log.info("FalkorDB reconnection successful")
-            return True
-        except Exception as e:
-            log.error(f"FalkorDB reconnection failed: {e}")
-            self._falkor_healthy = False
-            return False
+        # Only FalkorDB supports reconnection
+        if hasattr(self._graph_backend, "reconnect"):
+            try:
+                result = self._graph_backend.reconnect()
+                if result and hasattr(self._graph_backend, "graph"):
+                    self.graph = self._graph_backend.graph
+                self._graph_healthy = result
+                return result
+            except Exception as e:
+                log.error(f"Graph reconnection failed: {e}")
+                self._graph_healthy = False
+                return False
+        else:
+            log.warning("Current backend does not support reconnection")
+            return self._graph_backend.health_check()
 
-    def _init_graph_indexes(self) -> None:
-        """Create indexes for efficient lookups."""
-        log.trace("Creating FalkorDB indexes")
-        try:
-            # Create indexes for Memory nodes
-            self.graph.query("CREATE INDEX FOR (m:Memory) ON (m.uuid)")
-            self.graph.query("CREATE INDEX FOR (m:Memory) ON (m.type)")
-            self.graph.query("CREATE INDEX FOR (m:Memory) ON (m.session_id)")
-            # Create indexes for Entity nodes
-            self.graph.query("CREATE INDEX FOR (e:Entity) ON (e.name)")
-            self.graph.query("CREATE INDEX FOR (e:Entity) ON (e.type)")
-            # Create indexes for CodeChunk nodes (P1: entity linking)
-            self.graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.uuid)")
-            self.graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.filepath)")
-            # Create index for ProjectIndex nodes (P2: staleness detection)
-            self.graph.query("CREATE INDEX FOR (p:ProjectIndex) ON (p.project_root)")
-            log.debug("FalkorDB indexes created")
-        except Exception as e:
-            # Indexes may already exist
-            log.trace(f"Index creation (may already exist): {e}")
+    # Backward compatibility alias
+    def reconnect_falkordb(self) -> bool:
+        """Attempt to reconnect to graph backend (deprecated, use reconnect_graph)."""
+        return self.reconnect_graph()
 
     def _init_lance_table(self) -> None:
         """Initialize LanceDB table if not exists."""
