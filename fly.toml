@@ -1,5 +1,10 @@
-# Fly.io configuration for SimpleMem-Lite MCP Server
+# Fly.io configuration for SimpleMem-Lite Backend API
 # https://fly.io/docs/reference/configuration/
+#
+# Architecture:
+#   MCP (local, always) → Backend API (this, cloud)
+#   - Local MCP connects via SIMPLEMEM_BACKEND_URL
+#   - Set SIMPLEMEM_AUTO_START=false when using cloud backend
 
 app = "simplemem-lite"
 primary_region = "sjc"
@@ -8,14 +13,17 @@ primary_region = "sjc"
   dockerfile = "Dockerfile"
 
 [env]
+  # Data persistence
   SIMPLEMEM_DATA_DIR = "/data"
-  SIMPLEMEM_TRANSPORT = "sse"
-  PORT = "8000"
+  # Backend API port
+  PORT = "8420"
   # Graph backend: kuzu (embedded, no Docker needed)
   SIMPLEMEM_GRAPH_BACKEND = "kuzu"
+  # Cloud deployment requires auth
+  SIMPLEMEM_REQUIRE_AUTH = "true"
 
 [http_service]
-  internal_port = 8000
+  internal_port = 8420
   force_https = true
   auto_stop_machines = "suspend"
   auto_start_machines = true
@@ -38,10 +46,11 @@ primary_region = "sjc"
   cpu_kind = "shared"
   cpus = 1
 
-# Health checks - TCP check since SSE doesn't have a simple /health endpoint
+# Health checks using /health endpoint
 [checks]
   [checks.alive]
-    port = 8000
-    type = "tcp"
+    port = 8420
+    type = "http"
+    path = "/health"
     interval = "30s"
     timeout = "5s"

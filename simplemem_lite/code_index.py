@@ -320,6 +320,124 @@ class CodeIndexer:
             "errors": errors if errors else None,
         }
 
+    def index_files_content(
+        self,
+        project_root: str,
+        files: list[dict[str, Any]],
+        clear_existing: bool = True,
+    ) -> dict[str, Any]:
+        """Index code from file contents (for remote backend).
+
+        Unlike index_directory which reads from disk, this accepts
+        pre-read file content from the MCP thin layer.
+
+        Args:
+            project_root: Project root path (for identification)
+            files: List of dicts with {path, content} keys
+            clear_existing: Whether to clear existing index for this root
+
+        Returns:
+            Dict with indexing stats
+        """
+        log.info(f"Indexing {len(files)} files from content for {project_root}")
+
+        if clear_existing:
+            cleared = self.db.clear_code_index(project_root)
+            log.info(f"Cleared {cleared} existing chunks")
+
+        if not files:
+            return {"files_indexed": 0, "chunks_created": 0, "project_root": project_root}
+
+        total_chunks = 0
+        files_indexed = 0
+        errors = []
+
+        for file_info in files:
+            filepath = file_info.get("path", "")
+            content = file_info.get("content", "")
+
+            if not filepath or not content:
+                continue
+
+            try:
+                chunks = self._index_content(
+                    content=content,
+                    filepath=filepath,
+                    project_root=project_root,
+                )
+                total_chunks += chunks
+                files_indexed += 1
+            except Exception as e:
+                log.error(f"Failed to index {filepath}: {e}")
+                errors.append({"file": filepath, "error": str(e)})
+
+        log.info(f"Content indexing complete: {files_indexed} files, {total_chunks} chunks")
+
+        return {
+            "files_indexed": files_indexed,
+            "chunks_created": total_chunks,
+            "project_root": project_root,
+            "errors": errors if errors else None,
+        }
+
+    def _index_content(
+        self,
+        content: str,
+        filepath: str,
+        project_root: str,
+    ) -> int:
+        """Index content of a single file.
+
+        Args:
+            content: File content as string
+            filepath: Relative path within project
+            project_root: Project root path
+
+        Returns:
+            Number of chunks created
+        """
+        # Skip empty content
+        if not content.strip():
+            return 0
+
+        # Split into chunks
+        chunks = self._split_code(content, filepath)
+        if not chunks:
+            return 0
+
+        # Generate embeddings for all chunks
+        texts = [c["content"] for c in chunks]
+        embeddings = embed_batch(texts, self.config)
+
+        # Prepare records for database
+        records = []
+        for chunk, embedding in zip(chunks, embeddings):
+            records.append({
+                "uuid": str(uuid_lib.uuid4()),
+                "vector": embedding,
+                "content": chunk["content"],
+                "filepath": filepath,
+                "project_root": project_root,
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+            })
+
+        # Add to vector database
+        self.db.add_code_chunks(records)
+
+        # Link chunks to entities in graph
+        for record in records:
+            self._link_chunk_entities(
+                chunk_uuid=record["uuid"],
+                filepath=record["filepath"],
+                project_root=record["project_root"],
+                start_line=record["start_line"],
+                end_line=record["end_line"],
+                chunk_content=record["content"],
+            )
+
+        return len(records)
+
     def _index_file(self, file_path: Path, project_root: Path) -> int:
         """Index a single file.
 

@@ -3,6 +3,7 @@
 Parses JSONL session traces and creates hierarchical memory indexes.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -471,7 +472,6 @@ class HierarchicalIndexer:
 
             # 2. Summarize all chunks in parallel using asyncio.gather
             log.info(f"Summarizing {len(chunks)} chunks in parallel")
-            import asyncio
 
             # Process chunks in parallel batches to avoid overwhelming the API
             batch_size = 5
@@ -1124,3 +1124,332 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
             # Fallback: basic summary
             log.warning(f"Session summarization failed: {e}")
             return f"Session with {len(messages)} messages across {len(chunk_summaries)} activities."
+
+    def _parse_trace_content(
+        self,
+        trace_content: str | dict | list,
+        session_id: str,
+    ) -> list[TraceMessage]:
+        """Parse trace content directly (for cloud/remote backend).
+
+        Args:
+            trace_content: Trace data as JSONL string, dict, or list of entries
+            session_id: Session identifier
+
+        Returns:
+            List of parsed TraceMessage objects
+        """
+        messages = []
+
+        # Handle different input formats
+        if isinstance(trace_content, str):
+            # JSONL string - parse line by line
+            for line in trace_content.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    msg = self._entry_to_message(entry, session_id)
+                    if msg:
+                        messages.append(msg)
+                except json.JSONDecodeError:
+                    continue
+
+        elif isinstance(trace_content, list):
+            # List of entries (already parsed)
+            for entry in trace_content:
+                if isinstance(entry, dict):
+                    msg = self._entry_to_message(entry, session_id)
+                    if msg:
+                        messages.append(msg)
+
+        elif isinstance(trace_content, dict):
+            # Single entry or wrapped content
+            if "messages" in trace_content:
+                # Wrapped format: {"messages": [...]}
+                for entry in trace_content["messages"]:
+                    msg = self._entry_to_message(entry, session_id)
+                    if msg:
+                        messages.append(msg)
+            else:
+                # Single entry
+                msg = self._entry_to_message(trace_content, session_id)
+                if msg:
+                    messages.append(msg)
+
+        return messages
+
+    def _entry_to_message(self, entry: dict, session_id: str) -> TraceMessage | None:
+        """Convert a raw entry dict to TraceMessage.
+
+        Args:
+            entry: Raw JSONL entry
+            session_id: Session identifier
+
+        Returns:
+            TraceMessage if valid, None otherwise
+        """
+        msg_type = entry.get("type")
+        if msg_type not in ("user", "assistant", "tool_use", "tool_result"):
+            return None
+
+        content = self.parser._extract_content(entry)
+        if not content or len(content.strip()) < 10:
+            return None
+
+        return TraceMessage(
+            uuid=entry.get("uuid", ""),
+            session_id=entry.get("sessionId", session_id),
+            type=msg_type,
+            content=content,
+            timestamp=entry.get("timestamp", ""),
+            parent_uuid=entry.get("parentUuid"),
+        )
+
+    async def index_session_content(
+        self,
+        session_id: str,
+        trace_content: str | dict | list,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> SessionIndex | None:
+        """Index a trace from content directly (for cloud/remote backend).
+
+        Unlike index_session which reads from disk, this accepts pre-read
+        trace content from the MCP thin layer.
+
+        Args:
+            session_id: Session UUID to index
+            trace_content: Trace data (JSONL string, dict, or list)
+            progress_callback: Optional callback(progress: int, message: str)
+
+        Returns:
+            SessionIndex with created memory IDs, or None if no messages
+        """
+        log.info(f"Indexing session content: {session_id}")
+
+        def report(progress: int, msg: str = ""):
+            if progress_callback:
+                progress_callback(progress, msg)
+
+        # UPSERT: Clean up any existing index for this session
+        cleanup_result = self.store.db.delete_session_memories(session_id)
+        if cleanup_result["memories_deleted"] > 0:
+            log.info(f"UPSERT: Deleted {cleanup_result['memories_deleted']} existing memories")
+
+        report(5, "Parsing trace content...")
+
+        # Parse content directly (no disk read)
+        messages = self._parse_trace_content(trace_content, session_id)
+        if not messages:
+            log.warning(f"No messages found in trace content for session {session_id}")
+            return None
+
+        log.info(f"Parsed {len(messages)} messages from trace content")
+
+        # 0. Extract goal from first user message
+        goal_id = None
+        first_user_msg = next((m for m in messages if m.type == "user"), None)
+        if first_user_msg:
+            report(7, "Extracting session goal...")
+            goal_text = await extract_goal(first_user_msg.content, self.config)
+            if goal_text:
+                import uuid
+                goal_id = str(uuid.uuid4())
+                try:
+                    self.store.db.add_goal_node(
+                        goal_id=goal_id,
+                        intent=goal_text,
+                        session_id=session_id,
+                        status="active",
+                    )
+                    log.info(f"Created Goal node: {goal_text[:50]}...")
+                except Exception as e:
+                    log.warning(f"Failed to create Goal node: {e}")
+                    goal_id = None
+
+        # 1. Chunk messages by tool sequences
+        chunks = self._chunk_by_tool_sequences(messages)
+        report(10, f"Created {len(chunks)} chunks, starting summarization...")
+
+        # Track which chunk each message belongs to
+        msg_to_chunk_idx: dict[str, int] = {}
+        for chunk_idx, chunk in enumerate(chunks):
+            for msg in chunk:
+                msg_to_chunk_idx[msg.uuid] = chunk_idx
+
+        # 2. Summarize all chunks in parallel
+        log.info(f"Summarizing {len(chunks)} chunks in parallel")
+
+        batch_size = 5
+        chunk_summaries = []
+        for batch_start in range(0, len(chunks), batch_size):
+            batch_end = min(batch_start + batch_size, len(chunks))
+            batch = chunks[batch_start:batch_end]
+
+            progress = 10 + int((batch_start / len(chunks)) * 60)
+            report(progress, f"Summarizing chunks {batch_start+1}-{batch_end}/{len(chunks)}...")
+
+            batch_summaries = await asyncio.gather(
+                *[self._summarize_chunk(chunk) for chunk in batch]
+            )
+            chunk_summaries.extend(batch_summaries)
+
+        report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
+
+        # 3. Batch store all chunk summaries
+        chunk_items = [
+            MemoryItem(
+                content=summary,
+                metadata={
+                    "type": "chunk_summary",
+                    "session_id": session_id,
+                    "source": "claude_trace",
+                    "message_count": len(chunk),
+                },
+            )
+            for chunk, summary in zip(chunks, chunk_summaries)
+        ]
+
+        report(75, f"Batch embedding {len(chunk_items)} chunks...")
+        chunk_ids = self.store.store_batch(chunk_items)
+        log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
+
+        # 3b. Create chunk→chunk follows relationships
+        for i in range(1, len(chunk_ids)):
+            try:
+                self.store.relate(chunk_ids[i], chunk_ids[i - 1], "follows")
+            except Exception as e:
+                log.warning(f"Failed to create chunk follows relation: {e}")
+
+        # 4. Store interesting individual messages
+        report(80, "Identifying interesting messages...")
+        interesting_msgs = [m for m in messages if self._is_interesting(m)][:50]
+        log.info(f"Found {len(interesting_msgs)} interesting messages")
+
+        msg_by_uuid: dict[str, TraceMessage] = {m.uuid: m for m in messages}
+        message_ids = []
+        extractions_list: list[EnhancedExtraction] = []
+
+        if interesting_msgs:
+            # Build extraction contents with context merge
+            extraction_contents = []
+            for msg in interesting_msgs:
+                content = msg.content
+                if msg.type == "tool_result" and msg.parent_uuid:
+                    parent = msg_by_uuid.get(msg.parent_uuid)
+                    if parent and parent.type == "tool_use":
+                        content = f"Tool call: {parent.content}\n\nResult:\n{msg.content}"
+                extraction_contents.append(content)
+
+            report(82, f"Extracting entities from {len(interesting_msgs)} messages...")
+            extractions_list = await extract_with_actions_batch(
+                extraction_contents, self.config
+            )
+
+            msg_items = []
+            for msg, extraction in zip(interesting_msgs, extractions_list):
+                content = msg.content[:1800]
+                entity_parts = []
+                files = [e.name for e in extraction.entities if e.type == "file"]
+                tools = [e.name for e in extraction.entities if e.type == "tool"]
+                errors = [e.name for e in extraction.entities if e.type == "error"]
+
+                if files:
+                    entity_parts.append(f"Files: {', '.join(files[:5])}")
+                if errors:
+                    entity_parts.append(f"Errors: {', '.join(errors[:2])}")
+                if tools:
+                    entity_parts.append(f"Tools: {', '.join(tools[:5])}")
+
+                if entity_parts:
+                    content += f"\n\n[Context: {' | '.join(entity_parts)}]"
+
+                msg_items.append(MemoryItem(
+                    content=content,
+                    metadata={
+                        "type": "message",
+                        "session_id": session_id,
+                        "source": "claude_trace",
+                        "msg_type": msg.type,
+                        **extraction.to_metadata(),
+                    },
+                ))
+
+            report(85, f"Storing {len(msg_items)} messages...")
+            message_ids = self.store.store_batch(msg_items)
+            log.info(f"Stored {len(message_ids)} interesting messages")
+
+            # 4b. Create verb-specific edges
+            for msg_id, extraction in zip(message_ids, extractions_list):
+                for entity in extraction.entities[:15]:
+                    try:
+                        self.store.db.add_verb_edge(
+                            memory_uuid=msg_id,
+                            entity_name=entity.name,
+                            entity_type=entity.type,
+                            action=entity.action,
+                        )
+                    except Exception as e:
+                        log.warning(f"Failed to create verb edge: {e}")
+
+            # 4c. Create message relationships
+            for i, (msg, msg_id) in enumerate(zip(interesting_msgs, message_ids)):
+                chunk_idx = msg_to_chunk_idx.get(msg.uuid)
+                if chunk_idx is not None and chunk_idx < len(chunk_ids):
+                    try:
+                        self.store.relate(msg_id, chunk_ids[chunk_idx], "child_of")
+                    except Exception as e:
+                        log.warning(f"Failed to create message→chunk relation: {e}")
+
+                if i > 0:
+                    try:
+                        self.store.relate(msg_id, message_ids[i - 1], "follows")
+                    except Exception as e:
+                        log.warning(f"Failed to create message follows relation: {e}")
+
+        # 5. Generate session summary
+        report(90, "Generating session summary...")
+        session_summary = await self._summarize_session(messages, chunk_summaries)
+
+        report(95, "Storing session summary...")
+        session_summary_id = self.store.store(
+            MemoryItem(
+                content=session_summary,
+                metadata={
+                    "type": "session_summary",
+                    "session_id": session_id,
+                    "source": "claude_trace",
+                    "goal_id": goal_id,
+                },
+                relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
+            )
+        )
+
+        # 5b. Create chunk→session child_of relationships
+        for cid in chunk_ids:
+            try:
+                self.store.relate(cid, session_summary_id, "child_of")
+            except Exception as e:
+                log.warning(f"Failed to create chunk→session child_of relation: {e}")
+
+        # 5c. Link session to goal
+        if goal_id:
+            try:
+                self.store.db.link_session_to_goal(session_summary_id, goal_id)
+                for msg_id in message_ids[:10]:
+                    try:
+                        self.store.db.link_memory_to_goal(msg_id, goal_id)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"Failed to link session to goal: {e}")
+
+        report(100, "Complete!")
+        return SessionIndex(
+            session_id=session_id,
+            session_summary_id=session_summary_id,
+            chunk_summary_ids=chunk_ids,
+            message_ids=message_ids,
+            goal_id=goal_id,
+        )

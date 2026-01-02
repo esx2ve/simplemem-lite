@@ -40,13 +40,13 @@ def _get_local_model() -> "SentenceTransformer":
     return _local_model
 
 
-def _create_cached_embed(cache_size: int) -> Callable[[str, str, bool], tuple[float, ...]]:
+def _create_cached_embed(cache_size: int) -> Callable[[str, str, bool, int | None], tuple[float, ...]]:
     """Create a cached embedding function with configurable cache size."""
 
     @lru_cache(maxsize=cache_size)
-    def cached_embed(text: str, model: str, use_local: bool) -> tuple[float, ...]:
+    def cached_embed(text: str, model: str, use_local: bool, dimensions: int | None = None) -> tuple[float, ...]:
         """Cached embedding generation (returns tuple for hashability)."""
-        return tuple(_embed_impl(text, model, use_local))
+        return tuple(_embed_impl(text, model, use_local, dimensions))
 
     return cached_embed
 
@@ -60,19 +60,23 @@ def init_embeddings(config: Config) -> None:
     log.debug(f"Embeddings initialized: model={config.embedding_model}, local={config.use_local_embeddings}, cache_size={config.embedding_cache_size}")
 
 
-def _embed_impl(text: str, model: str, use_local: bool) -> list[float]:
+def _embed_impl(text: str, model: str, use_local: bool, dimensions: int | None = None) -> list[float]:
     """Actual embedding generation implementation."""
     if use_local:
         return _embed_local(text)
     else:
-        return _embed_litellm(text, model)
+        return _embed_litellm(text, model, dimensions=dimensions)
 
 
-def _embed_litellm(text: str, model: str) -> list[float]:
+def _embed_litellm(text: str, model: str, dimensions: int | None = None) -> list[float]:
     """Generate embedding via LiteLLM."""
     from litellm import embedding
 
-    response = embedding(model=model, input=[text])
+    kwargs = {"model": model, "input": [text]}
+    # Pass dimensions for models that support it (e.g., Gemini, OpenAI text-embedding-3-*)
+    if dimensions:
+        kwargs["dimensions"] = dimensions
+    response = embedding(**kwargs)
     return response.data[0]["embedding"]
 
 
@@ -97,13 +101,16 @@ def embed(text: str, config: Config | None = None) -> list[float]:
     if cfg is None:
         cfg = Config()
 
-    log.trace(f"Embedding text: {len(text)} chars, model={cfg.embedding_model}")
+    # Get dimensions for models that support it
+    dimensions = cfg.embedding_dim if not cfg.use_local_embeddings else None
+
+    log.trace(f"Embedding text: {len(text)} chars, model={cfg.embedding_model}, dim={dimensions}")
     # Use cached version if initialized, otherwise generate directly
     if _cached_embed_fn is not None:
-        result = _cached_embed_fn(text, cfg.embedding_model, cfg.use_local_embeddings)
+        result = _cached_embed_fn(text, cfg.embedding_model, cfg.use_local_embeddings, dimensions)
     else:
         # Fallback for when init_embeddings hasn't been called
-        result = tuple(_embed_impl(text, cfg.embedding_model, cfg.use_local_embeddings))
+        result = tuple(_embed_impl(text, cfg.embedding_model, cfg.use_local_embeddings, dimensions))
     log.trace(f"Embedding complete: dim={len(result)}")
     return list(result)
 
@@ -131,5 +138,9 @@ def embed_batch(texts: list[str], config: Config | None = None) -> list[list[flo
         # LiteLLM: batch via API
         from litellm import embedding
 
-        response = embedding(model=cfg.embedding_model, input=texts)
+        kwargs = {"model": cfg.embedding_model, "input": texts}
+        # Pass dimensions for models that support it
+        if cfg.embedding_dim:
+            kwargs["dimensions"] = cfg.embedding_dim
+        response = embedding(**kwargs)
         return [d["embedding"] for d in response.data]

@@ -152,6 +152,9 @@ class Config:
         if self.use_local_embeddings:
             # all-MiniLM-L6-v2 produces 384-dim vectors
             return 384
+        # Gemini models produce 768-dim vectors (LiteLLM dimensions param not supported)
+        if "gemini" in self.embedding_model.lower():
+            return 768
         # OpenAI text-embedding-3-small produces 1536-dim vectors
         return 1536
 
