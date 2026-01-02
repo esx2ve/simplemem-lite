@@ -1,0 +1,47 @@
+# Fly.io configuration for SimpleMem-Lite MCP Server
+# https://fly.io/docs/reference/configuration/
+
+app = "simplemem-lite"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  SIMPLEMEM_DATA_DIR = "/data"
+  SIMPLEMEM_TRANSPORT = "sse"
+  PORT = "8000"
+  # Graph backend: kuzu (embedded, no Docker needed)
+  SIMPLEMEM_GRAPH_BACKEND = "kuzu"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+# Persistent volume for LanceDB + KuzuDB data
+[mounts]
+  source = "simplemem_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# Health checks - TCP check since SSE doesn't have a simple /health endpoint
+[checks]
+  [checks.alive]
+    port = 8000
+    type = "tcp"
+    interval = "30s"
+    timeout = "5s"

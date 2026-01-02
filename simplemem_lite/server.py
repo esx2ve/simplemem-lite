@@ -2605,26 +2605,44 @@ def _memory_to_dict(memory: Memory) -> dict:
 
 
 def main():
-    """Run the MCP server with HTTP hook support."""
+    """Run the MCP server with HTTP hook support.
+
+    Supports two transport modes:
+    - stdio (default): For local MCP clients (Claude Desktop, Claude Code)
+    - sse: For remote MCP clients over HTTP (Fly.io deployment)
+
+    Set SIMPLEMEM_TRANSPORT=sse for remote hosting.
+    """
     global _http_server, _http_thread
 
-    log.info("Starting SimpleMem Lite server...")
+    transport = os.environ.get("SIMPLEMEM_TRANSPORT", "stdio").lower()
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
 
-    # Start HTTP server for hook communication
-    result = _start_http_server()
-    if result:
-        _http_server, _http_thread = result
-        log.info("HTTP hook server ready")
-    else:
-        log.warning("HTTP hook server not started (hooks will not work)")
+    log.info(f"Starting SimpleMem Lite server (transport={transport})...")
+
+    # Start HTTP server for hook communication (only for stdio mode)
+    # In SSE mode, hooks would need a different mechanism
+    if transport == "stdio":
+        result = _start_http_server()
+        if result:
+            _http_server, _http_thread = result
+            log.info("HTTP hook server ready")
+        else:
+            log.warning("HTTP hook server not started (hooks will not work)")
 
     # Run MCP server (blocks until shutdown)
-    log.info("Starting MCP server run loop")
+    log.info(f"Starting MCP server run loop (transport={transport})")
     try:
-        mcp.run()
+        if transport == "sse":
+            log.info(f"SSE endpoint: http://{host}:{port}/sse")
+            mcp.run(transport="sse", host=host, port=port)
+        else:
+            mcp.run()
     finally:
         log.info("MCP server stopped")
-        _stop_http_server()
+        if transport == "stdio":
+            _stop_http_server()
 
 
 if __name__ == "__main__":
