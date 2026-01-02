@@ -7,12 +7,34 @@ and sends the content here for indexing.
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.services import get_code_indexer, get_memory_store
 from simplemem_lite.compression import decompress_payload
 from simplemem_lite.log_config import get_logger
 
 router = APIRouter()
 log = get_logger("backend.api.code")
+
+
+def require_project_id(project_root: str | None, endpoint: str) -> None:
+    """Validate that project_root/project_id is provided when required.
+
+    For code endpoints, project_root serves as project_id.
+
+    Args:
+        project_root: The project_root from the request
+        endpoint: Name of the endpoint for error message
+
+    Raises:
+        HTTPException: 400 if project_id is required but not provided
+    """
+    config = get_config()
+    if config.require_project_id and not project_root:
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_root is required for {endpoint}. "
+            "Cloud API requires project isolation for all operations.",
+        )
 
 
 class FileInput(BaseModel):
@@ -33,6 +55,22 @@ class IndexDirectoryRequest(BaseModel):
     files: list[FileInput] = Field(..., description="List of files to index")
     clear_existing: bool = Field(default=True, description="Clear existing index")
     background: bool = Field(default=True, description="Run in background")
+
+
+class FileUpdateInput(BaseModel):
+    """Input model for a file update operation."""
+
+    path: str = Field(..., description="File path relative to project root")
+    action: str = Field(..., description="Action: 'add', 'modify', or 'delete'")
+    content: str | None = Field(default=None, description="File content (required for add/modify)")
+    compressed: bool = Field(default=False, description="Whether content is gzip+base64")
+
+
+class UpdateCodeRequest(BaseModel):
+    """Request model for incremental code index updates."""
+
+    project_root: str = Field(..., description="Project root path")
+    updates: list[FileUpdateInput] = Field(..., description="List of file updates")
 
 
 class SearchCodeRequest(BaseModel):
@@ -63,6 +101,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
 
     The MCP layer reads files locally and sends content here.
     """
+    require_project_id(request.project_root, "index_code")
     try:
         # Decompress files if needed
         processed_files = []
@@ -98,9 +137,56 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/update")
+async def update_code(request: UpdateCodeRequest) -> dict:
+    """Incrementally update code index with file changes.
+
+    Used by the file watcher for real-time updates.
+    Supports add, modify, and delete operations.
+    """
+    require_project_id(request.project_root, "update_code")
+    try:
+        # Process updates, decompressing content if needed
+        processed_updates = []
+        for update in request.updates:
+            content = update.content
+            if update.compressed and content:
+                try:
+                    content = decompress_payload(content)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to decompress {update.path}: {e}"
+                    )
+            processed_updates.append({
+                "path": update.path,
+                "action": update.action,
+                "content": content,
+            })
+
+        indexer = get_code_indexer()
+        result = indexer.update_files_content(
+            project_root=request.project_root,
+            updates=processed_updates,
+        )
+
+        log.info(
+            f"Updated {result['files_updated']} files: "
+            f"+{result['chunks_created']}/-{result['chunks_deleted']} chunks"
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Code update failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/search")
 async def search_code(request: SearchCodeRequest) -> dict:
     """Semantic search over indexed code."""
+    require_project_id(request.project_root, "search_code")
     try:
         indexer = get_code_indexer()
         results = indexer.search(
@@ -121,6 +207,7 @@ async def search_code(request: SearchCodeRequest) -> dict:
 @router.get("/stats")
 async def code_stats(project_root: str | None = None) -> dict:
     """Get code index statistics."""
+    require_project_id(project_root, "code_stats")
     try:
         indexer = get_code_indexer()
         stats = indexer.get_stats()

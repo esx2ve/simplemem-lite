@@ -20,11 +20,12 @@ from simplemem_lite.log_config import get_logger
 from simplemem_lite.mcp.client import BackendClient, BackendError
 from simplemem_lite.mcp.launcher import ensure_backend_running, stop_backend
 from simplemem_lite.mcp.local_reader import LocalReader
+from simplemem_lite.mcp.watcher_cloud import CloudWatcherManager
 
 log = get_logger("mcp.server")
 
 # Initialize FastMCP server
-mcp = FastMCP("SimpleMem-Lite", version="0.1.0")
+mcp = FastMCP("SimpleMem-Lite")
 
 # Auto-start configuration (disabled when connecting to cloud backend)
 AUTO_START_BACKEND = os.environ.get("SIMPLEMEM_AUTO_START", "true").lower() == "true"
@@ -32,8 +33,10 @@ AUTO_START_BACKEND = os.environ.get("SIMPLEMEM_AUTO_START", "true").lower() == "
 # Lazy-initialized dependencies with thread-safe locks
 _client: BackendClient | None = None
 _reader: LocalReader | None = None
+_watcher_manager: CloudWatcherManager | None = None
 _client_lock = asyncio.Lock()
 _reader_lock = asyncio.Lock()
+_watcher_lock = asyncio.Lock()
 _backend_started = False
 
 
@@ -74,6 +77,19 @@ async def _get_reader() -> LocalReader:
             if _reader is None:
                 _reader = LocalReader()
     return _reader
+
+
+async def _get_watcher_manager() -> CloudWatcherManager:
+    """Get or create the cloud watcher manager (thread-safe)."""
+    global _watcher_manager
+    if _watcher_manager is None:
+        async with _watcher_lock:
+            # Double-check after acquiring lock
+            if _watcher_manager is None:
+                client = await _get_client()
+                reader = await _get_reader()
+                _watcher_manager = CloudWatcherManager(client=client, reader=reader)
+    return _watcher_manager
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -217,12 +233,13 @@ async def ask_memories(
         {answer, memories_used, cross_session_insights, confidence, sources}
     """
     try:
-        log.info(f"ask_memories called (query='{query[:50]}...')")
+        log.info(f"ask_memories called (query='{query[:50]}...', project={project_id})")
         client = await _get_client()
         return await client.ask_memories(
             query=query,
             max_memories=max_memories,
             max_hops=max_hops,
+            project_id=project_id,
         )
     except BackendError as e:
         log.error(f"ask_memories failed: {e}")
@@ -256,12 +273,13 @@ async def reason_memories(
         {conclusions: [{uuid, content, type, score, proof_chain, hops}]}
     """
     try:
-        log.info(f"reason_memories called (query='{query[:50]}...')")
+        log.info(f"reason_memories called (query='{query[:50]}...', project={project_id})")
         client = await _get_client()
         return await client.reason_memories(
             query=query,
             max_hops=max_hops,
             min_score=min_score,
+            project_id=project_id,
         )
     except BackendError as e:
         log.error(f"reason_memories failed: {e}")
@@ -705,6 +723,76 @@ async def run_cypher_query(
 
 
 @mcp.tool()
+async def start_code_watching(
+    project_root: str,
+    patterns: list[str] | None = None,
+) -> dict:
+    """Start watching a project directory for file changes.
+
+    When files matching the patterns are created, modified, or deleted,
+    the code index will be automatically updated.
+
+    Args:
+        project_root: Absolute path to the project root directory
+        patterns: Glob patterns for files to watch (default: *.py, *.ts, *.js, *.tsx, *.jsx)
+
+    Returns:
+        Status dict with:
+        - status: "started", "already_watching", or error
+        - project_root: The watched directory
+        - patterns: The file patterns being watched
+    """
+    try:
+        log.info(f"start_code_watching called (project_root={project_root})")
+        manager = await _get_watcher_manager()
+        return manager.start_watching(project_root, patterns)
+    except Exception as e:
+        log.error(f"start_code_watching failed: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def stop_code_watching(project_root: str) -> dict:
+    """Stop watching a project directory for file changes.
+
+    Args:
+        project_root: Absolute path to the project root directory
+
+    Returns:
+        Status dict with:
+        - status: "stopped" or "not_watching"
+        - project_root: The directory
+    """
+    try:
+        log.info(f"stop_code_watching called (project_root={project_root})")
+        manager = await _get_watcher_manager()
+        return manager.stop_watching(project_root)
+    except Exception as e:
+        log.error(f"stop_code_watching failed: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_watcher_status(project_root: str | None = None) -> dict:
+    """Get status of file watchers.
+
+    Args:
+        project_root: Optional - specific project to check status for.
+                     If not provided, returns status of all watchers.
+
+    Returns:
+        Status dict with watching state and details
+    """
+    try:
+        log.info(f"get_watcher_status called (project_root={project_root})")
+        manager = await _get_watcher_manager()
+        return manager.get_status(project_root)
+    except Exception as e:
+        log.error(f"get_watcher_status failed: {e}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def get_project_status(project_root: str) -> dict:
     """Get bootstrap and watcher status for a project.
 
@@ -729,13 +817,18 @@ async def get_project_status(project_root: str) -> dict:
         if info is None:
             return {"error": "Could not read directory info"}
 
+        # Get actual watcher status
+        manager = await _get_watcher_manager()
+        watcher_status = manager.get_status(project_root)
+        is_watching = watcher_status.get("is_watching", False)
+
         return {
             "exists": info.get("exists", False),
             "is_git": info.get("is_git", False),
             "file_count": info.get("file_count", 0),
             "is_known": False,  # Would need backend state
             "is_bootstrapped": False,  # Would need backend state
-            "is_watching": False,  # Would need backend state
+            "is_watching": is_watching,
             "project_name": Path(project_root).name,
             "should_ask": True,
         }
@@ -751,7 +844,16 @@ async def get_project_status(project_root: str) -> dict:
 
 async def cleanup():
     """Cleanup resources on shutdown."""
-    global _client, _backend_started
+    global _client, _backend_started, _watcher_manager
+
+    # Stop all file watchers
+    if _watcher_manager is not None:
+        try:
+            _watcher_manager.stop_all()
+            log.info("Stopped all file watchers")
+        except Exception as e:
+            log.warning(f"Error stopping watchers: {e}")
+        _watcher_manager = None
 
     # Close HTTP client
     if _client is not None:

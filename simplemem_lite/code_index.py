@@ -380,6 +380,92 @@ class CodeIndexer:
             "errors": errors if errors else None,
         }
 
+    def update_files_content(
+        self,
+        project_root: str,
+        updates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Incrementally update code index with file changes.
+
+        Handles add, modify, and delete operations for individual files.
+        Used by the file watcher for real-time cloud-based updates.
+
+        Args:
+            project_root: Project root path (for identification)
+            updates: List of dicts with {path, content, action} where
+                     action is "add", "modify", or "delete"
+
+        Returns:
+            Dict with update statistics
+        """
+        log.info(f"Incremental update: {len(updates)} files for {project_root}")
+
+        if not updates:
+            return {
+                "files_updated": 0,
+                "chunks_created": 0,
+                "chunks_deleted": 0,
+                "project_root": project_root,
+            }
+
+        total_created = 0
+        total_deleted = 0
+        files_updated = 0
+        errors = []
+
+        for update in updates:
+            filepath = update.get("path", "")
+            action = update.get("action", "modify")
+            content = update.get("content", "")
+
+            if not filepath:
+                continue
+
+            try:
+                if action == "delete":
+                    # Delete chunks for this file
+                    deleted = self.db.delete_chunks_by_filepath(project_root, filepath)
+                    total_deleted += deleted
+                    files_updated += 1
+                    log.debug(f"Deleted {deleted} chunks for {filepath}")
+
+                elif action in ("add", "modify"):
+                    # For modify: delete existing chunks first
+                    if action == "modify":
+                        deleted = self.db.delete_chunks_by_filepath(project_root, filepath)
+                        total_deleted += deleted
+                        log.debug(f"Deleted {deleted} existing chunks for {filepath}")
+
+                    # Index new content
+                    if content:
+                        chunks = self._index_content(
+                            content=content,
+                            filepath=filepath,
+                            project_root=project_root,
+                        )
+                        total_created += chunks
+                        files_updated += 1
+                        log.debug(f"Created {chunks} chunks for {filepath}")
+                    elif action == "add":
+                        errors.append({"file": filepath, "error": "No content for add"})
+
+            except Exception as e:
+                log.error(f"Failed to update {filepath}: {e}")
+                errors.append({"file": filepath, "error": str(e)})
+
+        log.info(
+            f"Incremental update complete: {files_updated} files, "
+            f"+{total_created}/-{total_deleted} chunks"
+        )
+
+        return {
+            "files_updated": files_updated,
+            "chunks_created": total_created,
+            "chunks_deleted": total_deleted,
+            "project_root": project_root,
+            "errors": errors if errors else None,
+        }
+
     def _index_content(
         self,
         content: str,
@@ -425,16 +511,20 @@ class CodeIndexer:
         # Add to vector database
         self.db.add_code_chunks(records)
 
-        # Link chunks to entities in graph
+        # Link chunks to entities in graph (non-fatal - vector search works without graph)
         for record in records:
-            self._link_chunk_entities(
-                chunk_uuid=record["uuid"],
-                filepath=record["filepath"],
-                project_root=record["project_root"],
-                start_line=record["start_line"],
-                end_line=record["end_line"],
-                chunk_content=record["content"],
-            )
+            try:
+                self._link_chunk_entities(
+                    chunk_uuid=record["uuid"],
+                    filepath=record["filepath"],
+                    project_root=record["project_root"],
+                    start_line=record["start_line"],
+                    end_line=record["end_line"],
+                    chunk_content=record["content"],
+                )
+            except Exception as e:
+                # Graph linking is optional - vector search still works
+                log.debug(f"Graph linking failed for {record['filepath']}: {e}")
 
         return len(records)
 
@@ -486,18 +576,22 @@ class CodeIndexer:
         # Add to vector database
         self.db.add_code_chunks(records)
 
-        # P1: Link chunks to entities in graph (for cross-referencing with memories)
+        # P1: Link chunks to entities in graph (non-fatal - vector search works without graph)
         total_entities = 0
         for record in records:
-            entities_linked = self._link_chunk_entities(
-                chunk_uuid=record["uuid"],
-                filepath=record["filepath"],
-                project_root=record["project_root"],
-                start_line=record["start_line"],
-                end_line=record["end_line"],
-                chunk_content=record["content"],
-            )
-            total_entities += entities_linked
+            try:
+                entities_linked = self._link_chunk_entities(
+                    chunk_uuid=record["uuid"],
+                    filepath=record["filepath"],
+                    project_root=record["project_root"],
+                    start_line=record["start_line"],
+                    end_line=record["end_line"],
+                    chunk_content=record["content"],
+                )
+                total_entities += entities_linked
+            except Exception as e:
+                # Graph linking is optional - vector search still works
+                log.debug(f"Graph linking failed for {record['filepath']}: {e}")
 
         log.debug(f"Linked {total_entities} entities for {len(records)} chunks in {relative_path}")
         return len(records)

@@ -190,12 +190,14 @@ class BackendClient:
         query: str,
         max_memories: int = 8,
         max_hops: int = 2,
+        project_id: str | None = None,
     ) -> dict:
         """Ask a question with LLM-synthesized answer from memory graph."""
         data = {
             "query": query,
             "max_memories": max_memories,
             "max_hops": max_hops,
+            "project_id": project_id,
         }
         return await self._request("POST", "/api/v1/memories/ask", json_data=data)
 
@@ -204,12 +206,14 @@ class BackendClient:
         query: str,
         max_hops: int = 2,
         min_score: float = 0.1,
+        project_id: str | None = None,
     ) -> dict:
         """Multi-hop reasoning over memory graph."""
         data = {
             "query": query,
             "max_hops": max_hops,
             "min_score": min_score,
+            "project_id": project_id,
         }
         return await self._request("POST", "/api/v1/memories/reason", json_data=data)
 
@@ -347,6 +351,55 @@ class BackendClient:
             "clear_existing": clear_existing,
         }
         return await self._request("POST", "/api/v1/code/index", json_data=data)
+
+    async def update_code(
+        self,
+        project_root: str,
+        updates: list[dict],
+    ) -> dict:
+        """Incrementally update code index via backend API.
+
+        Used by file watcher for real-time updates.
+
+        Args:
+            project_root: Absolute path to project root
+            updates: List of {"path": str, "action": str, "content": str|None}
+                     where action is "add", "modify", or "delete"
+
+        Returns:
+            Update result with files_updated, chunks_created, chunks_deleted
+        """
+        # Compress large file contents for add/modify actions
+        compressed_updates = []
+        for update in updates:
+            action = update.get("action", "modify")
+            content = update.get("content")
+
+            if content and action in ("add", "modify"):
+                content, was_compressed = compress_if_large(
+                    content,
+                    threshold_bytes=COMPRESSION_THRESHOLD,
+                )
+                compressed_updates.append({
+                    "path": update["path"],
+                    "action": action,
+                    "content": content,
+                    "compressed": was_compressed,
+                })
+            else:
+                # Delete actions have no content
+                compressed_updates.append({
+                    "path": update["path"],
+                    "action": action,
+                    "content": None,
+                    "compressed": False,
+                })
+
+        data = {
+            "project_root": project_root,
+            "updates": compressed_updates,
+        }
+        return await self._request("POST", "/api/v1/code/update", json_data=data)
 
     async def search_code(
         self,
