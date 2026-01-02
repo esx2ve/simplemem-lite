@@ -3,7 +3,7 @@
 Provides:
 - Session locks for race condition prevention
 - Content hash tracking for change detection
-- Byte offset tracking for incremental indexing
+- Line index tracking for incremental indexing
 - WAL mode for concurrent access safety
 """
 
@@ -13,8 +13,6 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("session_state")
@@ -29,7 +27,7 @@ class SessionState:
 
     session_id: str
     file_path: str
-    indexed_byte_offset: int
+    indexed_line_index: int  # Line index (not byte offset) for incremental reads
     content_hash: str
     status: str  # 'pending', 'processing', 'indexed', 'failed'
     indexed_at: float
@@ -42,7 +40,7 @@ class SessionStateDB:
     Provides:
     - Per-session distributed locks
     - Content hash tracking for skip detection
-    - Byte offset tracking for incremental reads
+    - Line index tracking for incremental reads
     - Concurrent access safety via WAL mode
     """
 
@@ -88,7 +86,7 @@ class SessionStateDB:
             CREATE TABLE IF NOT EXISTS indexed_sessions (
                 session_id TEXT PRIMARY KEY,
                 file_path TEXT NOT NULL,
-                indexed_byte_offset INTEGER DEFAULT 0,
+                indexed_line_index INTEGER DEFAULT 0,
                 content_hash TEXT,
                 inode INTEGER,
                 status TEXT CHECK(status IN ('pending', 'processing', 'indexed', 'failed')) DEFAULT 'pending',
@@ -110,7 +108,29 @@ class SessionStateDB:
             CREATE INDEX IF NOT EXISTS idx_locks_expires ON session_locks(expires_at);
         """)
         self.conn.commit()
+
+        # Migrate old column name if it exists (SQLite 3.25+)
+        self._migrate_column_names()
+
         log.debug("Database schema created/verified")
+
+    def _migrate_column_names(self) -> None:
+        """Migrate old column names to new names for consistency."""
+        try:
+            # Check if old column exists
+            cursor = self.conn.execute("PRAGMA table_info(indexed_sessions)")
+            columns = {row[1] for row in cursor.fetchall()}
+
+            if "indexed_byte_offset" in columns and "indexed_line_index" not in columns:
+                log.info("Migrating indexed_byte_offset -> indexed_line_index")
+                self.conn.execute(
+                    "ALTER TABLE indexed_sessions RENAME COLUMN indexed_byte_offset TO indexed_line_index"
+                )
+                self.conn.commit()
+                log.info("Column migration complete")
+        except sqlite3.OperationalError as e:
+            # SQLite < 3.25 doesn't support RENAME COLUMN - data is still usable
+            log.warning(f"Column migration skipped (SQLite version): {e}")
 
     def _cleanup_stale_locks(self) -> None:
         """Remove expired locks on startup.
@@ -239,7 +259,7 @@ class SessionStateDB:
         """
         row = self.conn.execute(
             """
-            SELECT session_id, file_path, indexed_byte_offset, content_hash,
+            SELECT session_id, file_path, indexed_line_index, content_hash,
                    inode, status, indexed_at
             FROM indexed_sessions
             WHERE session_id = ?
@@ -253,7 +273,7 @@ class SessionStateDB:
         return SessionState(
             session_id=row["session_id"],
             file_path=row["file_path"],
-            indexed_byte_offset=row["indexed_byte_offset"] or 0,
+            indexed_line_index=row["indexed_line_index"] or 0,
             content_hash=row["content_hash"] or "",
             status=row["status"],
             indexed_at=row["indexed_at"] or 0,
@@ -264,7 +284,7 @@ class SessionStateDB:
         self,
         session_id: str,
         file_path: str,
-        byte_offset: int,
+        line_index: int,
         content_hash: str,
         status: str = "indexed",
         inode: int | None = None,
@@ -274,7 +294,7 @@ class SessionStateDB:
         Args:
             session_id: Session identifier
             file_path: Path to trace file
-            byte_offset: Bytes processed so far
+            line_index: Lines processed so far (for incremental indexing)
             content_hash: SHA256 hash of content
             status: Processing status
             inode: File inode for rotation detection
@@ -283,21 +303,21 @@ class SessionStateDB:
         self.conn.execute(
             """
             INSERT INTO indexed_sessions
-                (session_id, file_path, indexed_byte_offset, content_hash, inode, status, indexed_at, updated_at)
+                (session_id, file_path, indexed_line_index, content_hash, inode, status, indexed_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 file_path = excluded.file_path,
-                indexed_byte_offset = excluded.indexed_byte_offset,
+                indexed_line_index = excluded.indexed_line_index,
                 content_hash = excluded.content_hash,
                 inode = excluded.inode,
                 status = excluded.status,
                 indexed_at = excluded.indexed_at,
                 updated_at = excluded.updated_at
             """,
-            (session_id, file_path, byte_offset, content_hash, inode, status, now, now)
+            (session_id, file_path, line_index, content_hash, inode, status, now, now)
         )
         self.conn.commit()
-        log.debug(f"Session state updated: {session_id[:8]}... offset={byte_offset} status={status}")
+        log.debug(f"Session state updated: {session_id[:8]}... line_index={line_index} status={status}")
 
     def set_status(self, session_id: str, status: str) -> None:
         """Update only the status of a session.
@@ -329,7 +349,7 @@ class SessionStateDB:
         if status:
             rows = self.conn.execute(
                 """
-                SELECT session_id, file_path, indexed_byte_offset, content_hash,
+                SELECT session_id, file_path, indexed_line_index, content_hash,
                        inode, status, indexed_at
                 FROM indexed_sessions
                 WHERE status = ?
@@ -341,7 +361,7 @@ class SessionStateDB:
         else:
             rows = self.conn.execute(
                 """
-                SELECT session_id, file_path, indexed_byte_offset, content_hash,
+                SELECT session_id, file_path, indexed_line_index, content_hash,
                        inode, status, indexed_at
                 FROM indexed_sessions
                 ORDER BY indexed_at DESC
@@ -354,7 +374,7 @@ class SessionStateDB:
             SessionState(
                 session_id=row["session_id"],
                 file_path=row["file_path"],
-                indexed_byte_offset=row["indexed_byte_offset"] or 0,
+                indexed_line_index=row["indexed_line_index"] or 0,
                 content_hash=row["content_hash"] or "",
                 status=row["status"],
                 indexed_at=row["indexed_at"] or 0,
@@ -403,24 +423,3 @@ def compute_content_hash(file_path: Path, max_bytes: int = 1024 * 1024) -> str:
     except (OSError, FileNotFoundError) as e:
         log.warning(f"Failed to compute hash for {file_path}: {e}")
         return ""
-
-
-def read_from_offset(file_path: Path, offset: int) -> tuple[str, int]:
-    """Read file content starting from byte offset.
-
-    Args:
-        file_path: Path to file
-        offset: Byte offset to start reading from
-
-    Returns:
-        Tuple of (content_string, new_offset)
-    """
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            f.seek(offset)
-            content = f.read()
-            new_offset = f.tell()
-        return content, new_offset
-    except (OSError, FileNotFoundError) as e:
-        log.warning(f"Failed to read from offset {offset} in {file_path}: {e}")
-        return "", offset

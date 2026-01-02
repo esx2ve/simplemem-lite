@@ -5,6 +5,19 @@ description = "Minimal hybrid memory MCP server with Claude Code trace processin
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
+authors = [
+    {name = "Shimon Vainer"}
+]
+keywords = ["mcp", "memory", "claude", "ai", "vector-database", "graph-database"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 dependencies = [
     "mcp>=1.0.0",
@@ -14,20 +27,31 @@ dependencies = [
     "pyarrow>=18.0.0",
     "python-dotenv>=1.0.0",
     "loguru>=0.7.0",
-    "json_repair>=0.30.0", # Robust JSON parsing for LLM outputs
-    "watchdog>=4.0.0", # File system watcher for P3 auto-capture
+    "json_repair>=0.30.0",
+    "watchdog>=4.0.0",
     "pathspec>=0.12.1",
-    "typer>=0.12.0",  # CLI framework
-    "rich>=13.0.0",   # Beautiful terminal output
+    "typer>=0.12.0",
+    "rich>=13.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shimonvainer/simplemem"
+Repository = "https://github.com/shimonvainer/simplemem"
 
 [project.optional-dependencies]
 local = [
     "sentence-transformers>=2.2.0",
 ]
+falkordb = [
+    "falkordb>=1.0.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+all = [
+    "simplemem-lite[local,falkordb,dev]",
 ]
 
 [project.scripts]

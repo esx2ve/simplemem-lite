@@ -417,9 +417,13 @@ class SessionAutoIndexer:
             )
 
             # Submit job to JobManager
-            job_id = await self._job_manager.submit_job(
-                job_type="auto_index_session",
-                coro=self._index_session(session_id, project_root, session["path"]),
+            # Note: submit() takes a factory function + args, not an instantiated coroutine
+            job_id = await self._job_manager.submit(
+                "auto_index_session",
+                self._index_session,
+                session_id,
+                project_root,
+                session["path"],
             )
 
             log.info(f"Session {session_id[:8]}... queued as job {job_id[:8]}...")

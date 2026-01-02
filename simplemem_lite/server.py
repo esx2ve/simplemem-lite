@@ -18,7 +18,7 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -1014,10 +1014,14 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
 
     if background:
         # Submit to background job manager
-        async def _process_trace_job(sid: str) -> dict:
+        async def _process_trace_job(
+            sid: str, progress_callback: Callable[[int, str], None] | None = None
+        ) -> dict:
             """Background job wrapper for process_trace."""
             log.info(f"Background job: process_trace starting for session {sid}")
-            result = await _deps.indexer.index_session(sid, ctx=None)
+            result = await _deps.indexer.index_session(
+                sid, ctx=None, progress_callback=progress_callback
+            )
             if result is None:
                 log.error(f"Background job: process_trace failed - session not found: {sid}")
                 raise ValueError(f"Session {sid} not found")
@@ -1045,6 +1049,82 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
         "session_summary_id": result.session_summary_id,
         "chunk_count": len(result.chunk_summary_ids),
         "message_count": len(result.message_ids),
+    }
+
+
+@mcp.tool()
+async def process_trace_batch(
+    sessions: list[dict],
+    max_concurrent: int = 3,
+) -> dict:
+    """Process multiple session traces with full hierarchical indexing.
+
+    Unlike index_sessions_batch (which uses delta indexing), this tool runs
+    full process_trace with LLM summarization for each session.
+
+    Each session dict should have 'session_id' and 'path' keys (as returned
+    by discover_sessions).
+
+    Args:
+        sessions: List of session dicts with session_id and path keys
+        max_concurrent: Maximum concurrent jobs (default: 3)
+
+    Returns:
+        {queued: [...], errors: [...], job_ids: {...}}
+    """
+    log.info(f"Tool: process_trace_batch called with {len(sessions)} sessions")
+
+    queued = []
+    errors = []
+    job_ids = {}
+
+    for session in sessions[:max_concurrent * 10]:  # Limit total to prevent overload
+        session_id = session.get("session_id")
+        session_path = session.get("path")
+
+        if not session_id or not session_path:
+            errors.append({"session_id": session_id, "error": "Missing session_id or path"})
+            continue
+
+        try:
+            # Submit job with the full path to bypass find_session lookup
+            async def _process_with_path(
+                sid: str, path: str, progress_callback: Callable[[int, str], None] | None = None
+            ) -> dict:
+                """Background job wrapper that uses provided path."""
+                log.info(f"Background job: process_trace_batch starting for {sid}")
+                result = await _deps.indexer.index_session(
+                    sid, ctx=None, session_path=path, progress_callback=progress_callback
+                )
+                if result is None:
+                    raise ValueError(f"Session {sid} indexing failed")
+                log.info(f"Background job: process_trace_batch complete: {len(result.chunk_summary_ids)} chunks")
+                return {
+                    "session_summary_id": result.session_summary_id,
+                    "chunk_count": len(result.chunk_summary_ids),
+                    "message_count": len(result.message_ids),
+                }
+
+            job_id = await _deps.job_manager.submit(
+                "process_trace_batch",
+                _process_with_path,
+                session_id,
+                session_path,
+            )
+            queued.append(session_id)
+            job_ids[session_id] = job_id
+            log.info(f"Tool: process_trace_batch queued {session_id} as job {job_id}")
+
+        except Exception as e:
+            log.error(f"Tool: process_trace_batch failed for {session_id}: {e}")
+            errors.append({"session_id": session_id, "error": str(e)})
+
+    log.info(f"Tool: process_trace_batch complete: {len(queued)} queued, {len(errors)} errors")
+    return {
+        "queued": queued,
+        "errors": errors,
+        "job_ids": job_ids,
+        "total_requested": len(sessions),
     }
 
 
@@ -2157,14 +2237,14 @@ async def index_sessions_batch(
 
             try:
                 # Queue for indexing via JobManager
-                job_id = await _deps.job_manager.submit_job(
-                    job_type="batch_index_session",
-                    coro=_deps.indexer.index_session_delta(
-                        session_id=session_id,
-                        project_root=project_root,
-                        project_manager=_deps.project_manager,
-                        transcript_path=session["path"],
-                    ),
+                # Note: submit() takes a factory function + args, not an instantiated coroutine
+                job_id = await _deps.job_manager.submit(
+                    "batch_index_session",
+                    _deps.indexer.index_session_delta,
+                    session_id=session_id,
+                    project_root=project_root,
+                    project_manager=_deps.project_manager,
+                    transcript_path=session["path"],
                 )
                 queued.append(session_id)
                 job_ids[session_id] = job_id

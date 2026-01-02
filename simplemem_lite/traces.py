@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 from simplemem_lite.config import Config
 
@@ -237,10 +237,6 @@ class TraceParser:
                 except json.JSONDecodeError:
                     continue
 
-                # Skip sidechains (parallel agent runs)
-                if entry.get("isSidechain", False):
-                    continue
-
                 msg_type = entry.get("type")
                 if msg_type not in ("user", "assistant", "tool_use", "tool_result"):
                     continue
@@ -366,15 +362,26 @@ class HierarchicalIndexer:
         self.session_state_db = session_state_db
         log.info(f"HierarchicalIndexer initialized with traces_dir={self.config.claude_traces_dir}")
 
-    async def index_session(self, session_id: str, ctx=None) -> SessionIndex | None:
+    async def index_session(
+        self,
+        session_id: str,
+        ctx=None,
+        session_path: Path | str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> SessionIndex | None:
         """Index a Claude Code session with hierarchical summaries.
 
         Uses UPSERT semantics: if session was previously indexed, all existing
         memories for that session are deleted first to prevent duplicates.
 
+        Uses SessionStateDB locking (if available) to prevent race conditions
+        during the destructive UPSERT operation.
+
         Args:
             session_id: Session UUID to index
             ctx: Optional MCP Context for progress reporting
+            session_path: Optional path to session file (bypasses find_session lookup)
+            progress_callback: Optional callback(progress: int, message: str) for job progress
 
         Returns:
             SessionIndex with created memory IDs, or None if session not found
@@ -382,293 +389,334 @@ class HierarchicalIndexer:
         log.info(f"Indexing session: {session_id}")
         log.debug(f"Using parser with traces_dir={self.parser.traces_dir}")
 
-        # UPSERT: Clean up any existing index for this session
-        cleanup_result = self.store.db.delete_session_memories(session_id)
-        if cleanup_result["memories_deleted"] > 0:
-            log.info(f"UPSERT: Deleted {cleanup_result['memories_deleted']} existing memories for session {session_id}")
-
         async def report(progress: int, msg: str = ""):
-            """Helper to report progress if ctx available."""
+            """Helper to report progress via ctx or callback."""
             if ctx:
                 await ctx.report_progress(progress, 100)
                 if msg:
                     await ctx.info(msg)
+            elif progress_callback:
+                progress_callback(progress, msg)
 
-        session_path = self.parser.find_session(session_id)
-        if not session_path:
-            log.error(f"Session {session_id} not found by parser")
-            return None
+        # Use provided path or look it up (before acquiring lock)
+        if session_path:
+            session_path = Path(session_path) if isinstance(session_path, str) else session_path
+            if not session_path.exists():
+                log.error(f"Provided session path does not exist: {session_path}")
+                return None
+            log.debug(f"Using provided session path: {session_path}")
+        else:
+            session_path = self.parser.find_session(session_id)
+            if not session_path:
+                log.error(f"Session {session_id} not found by parser")
+                return None
 
-        await report(5, "Found session, parsing messages...")
-        log.debug(f"Found session at {session_path}")
-        # Parse all messages (ignore line indices for full indexing)
-        messages = [msg for _, msg in self.parser.parse_session(session_path)]
-        if not messages:
-            log.warning(f"No messages found in session {session_id}")
-            return None
+        # Acquire lock if SessionStateDB available (prevents race condition during UPSERT)
+        lock_acquired = False
+        if self.session_state_db is not None:
+            lock_acquired = self.session_state_db.acquire_lock(session_id, timeout_seconds=60.0)
+            if not lock_acquired:
+                log.warning(f"Could not acquire lock for session {session_id}, another process is indexing")
+                return None
 
-        log.info(f"Parsed {len(messages)} messages from session {session_id}")
+        try:
+            # UPSERT: Clean up any existing index for this session (now protected by lock)
+            cleanup_result = self.store.db.delete_session_memories(session_id)
+            if cleanup_result["memories_deleted"] > 0:
+                log.info(f"UPSERT: Deleted {cleanup_result['memories_deleted']} existing memories for session {session_id}")
 
-        # 0. Extract goal from first user message
-        goal_id = None
-        first_user_msg = next((m for m in messages if m.type == "user"), None)
-        if first_user_msg:
-            await report(7, "Extracting session goal...")
-            goal_text = await extract_goal(first_user_msg.content, self.config)
-            if goal_text:
-                import uuid
-                goal_id = str(uuid.uuid4())
-                try:
-                    self.store.db.add_goal_node(
-                        goal_id=goal_id,
-                        intent=goal_text,
-                        session_id=session_id,
-                        status="active",
-                    )
-                    log.info(f"Created Goal node: {goal_text[:50]}...")
-                except Exception as e:
-                    log.warning(f"Failed to create Goal node: {e}")
-                    goal_id = None
+            await report(5, "Found session, parsing messages...")
+            log.debug(f"Found session at {session_path}")
+            # Parse all messages, keeping track of line indices for state tracking
+            parsed_results = list(self.parser.parse_session(session_path))
+            messages = [msg for _, msg in parsed_results]
+            # Calculate next line index for incremental reads (actual line position, not message count)
+            next_line_index = (parsed_results[-1][0] + 1) if parsed_results else 0
+            if not messages:
+                log.warning(f"No messages found in session {session_id}")
+                return None
 
-        # 1. Chunk messages by tool sequences
-        chunks = self._chunk_by_tool_sequences(messages)
-        await report(10, f"Created {len(chunks)} chunks, starting summarization...")
+            log.info(f"Parsed {len(messages)} messages from session {session_id}")
 
-        # Track which chunk each message belongs to (for message→chunk relationships)
-        msg_to_chunk_idx: dict[str, int] = {}
-        for chunk_idx, chunk in enumerate(chunks):
-            for msg in chunk:
-                msg_to_chunk_idx[msg.uuid] = chunk_idx
+            # 0. Extract goal from first user message
+            goal_id = None
+            first_user_msg = next((m for m in messages if m.type == "user"), None)
+            if first_user_msg:
+                await report(7, "Extracting session goal...")
+                goal_text = await extract_goal(first_user_msg.content, self.config)
+                if goal_text:
+                    import uuid
+                    goal_id = str(uuid.uuid4())
+                    try:
+                        self.store.db.add_goal_node(
+                            goal_id=goal_id,
+                            intent=goal_text,
+                            session_id=session_id,
+                            status="active",
+                        )
+                        log.info(f"Created Goal node: {goal_text[:50]}...")
+                    except Exception as e:
+                        log.warning(f"Failed to create Goal node: {e}")
+                        goal_id = None
 
-        # 2. Summarize all chunks in parallel using asyncio.gather
-        log.info(f"Summarizing {len(chunks)} chunks in parallel")
-        import asyncio
+            # 1. Chunk messages by tool sequences
+            chunks = self._chunk_by_tool_sequences(messages)
+            await report(10, f"Created {len(chunks)} chunks, starting summarization...")
 
-        # Process chunks in parallel batches to avoid overwhelming the API
-        batch_size = 5
-        chunk_summaries = []
-        for batch_start in range(0, len(chunks), batch_size):
-            batch_end = min(batch_start + batch_size, len(chunks))
-            batch = chunks[batch_start:batch_end]
+            # Track which chunk each message belongs to (for message→chunk relationships)
+            msg_to_chunk_idx: dict[str, int] = {}
+            for chunk_idx, chunk in enumerate(chunks):
+                for msg in chunk:
+                    msg_to_chunk_idx[msg.uuid] = chunk_idx
 
-            progress = 10 + int((batch_start / len(chunks)) * 60)
-            await report(progress, f"Summarizing chunks {batch_start+1}-{batch_end}/{len(chunks)}...")
+            # 2. Summarize all chunks in parallel using asyncio.gather
+            log.info(f"Summarizing {len(chunks)} chunks in parallel")
+            import asyncio
 
-            # Summarize batch in parallel
-            batch_summaries = await asyncio.gather(
-                *[self._summarize_chunk(chunk) for chunk in batch]
-            )
-            chunk_summaries.extend(batch_summaries)
+            # Process chunks in parallel batches to avoid overwhelming the API
+            batch_size = 5
+            chunk_summaries = []
+            for batch_start in range(0, len(chunks), batch_size):
+                batch_end = min(batch_start + batch_size, len(chunks))
+                batch = chunks[batch_start:batch_end]
 
-        await report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
+                progress = 10 + int((batch_start / len(chunks)) * 60)
+                await report(progress, f"Summarizing chunks {batch_start+1}-{batch_end}/{len(chunks)}...")
 
-        # 3. Batch store all chunk summaries (single embedding call!)
-        chunk_items = [
-            MemoryItem(
-                content=summary,
-                metadata={
-                    "type": "chunk_summary",
-                    "session_id": session_id,
-                    "source": "claude_trace",
-                    "message_count": len(chunk),
-                },
-            )
-            for chunk, summary in zip(chunks, chunk_summaries)
-        ]
+                # Summarize batch in parallel
+                batch_summaries = await asyncio.gather(
+                    *[self._summarize_chunk(chunk) for chunk in batch]
+                )
+                chunk_summaries.extend(batch_summaries)
 
-        await report(75, f"Batch embedding {len(chunk_items)} chunks...")
-        chunk_ids = self.store.store_batch(chunk_items)
-        log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
+            await report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
 
-        # 3b. Create chunk→chunk (follows) relationships for temporal sequence
-        follows_created = 0
-        for i in range(1, len(chunk_ids)):
-            try:
-                self.store.relate(chunk_ids[i], chunk_ids[i - 1], "follows")
-                follows_created += 1
-            except Exception as e:
-                log.warning(f"Failed to create chunk follows relation: {e}")
-        log.info(f"Created {follows_created} chunk→chunk follows relationships")
-
-        # 4. Store interesting individual messages
-        await report(80, "Identifying interesting messages...")
-        interesting_msgs = [m for m in messages if self._is_interesting(m)]
-        log.info(f"Found {len(interesting_msgs)} interesting messages")
-
-        # Build uuid→message lookup for context merging
-        msg_by_uuid: dict[str, TraceMessage] = {m.uuid: m for m in messages}
-
-        message_ids = []
-        extractions_list: list[EnhancedExtraction] = []
-        if interesting_msgs:
-            # Cap at 50 to control costs
-            interesting_msgs = interesting_msgs[:50]
-
-            # Build extraction contents with context merge (tool_use + tool_result)
-            # This solves the "0 READS" issue by giving the LLM both filename AND content
-            extraction_contents = []
-            for msg in interesting_msgs:
-                content = msg.content
-                # If this is a tool_result, prepend the tool_use context
-                if msg.type == "tool_result" and msg.parent_uuid:
-                    parent = msg_by_uuid.get(msg.parent_uuid)
-                    if parent and parent.type == "tool_use":
-                        # Merge: LLM sees tool name + args + result together
-                        content = f"Tool call: {parent.content}\n\nResult:\n{msg.content}"
-                extraction_contents.append(content)
-
-            # Extract entities WITH actions using enhanced LLM extraction
-            await report(82, f"Extracting entities with actions from {len(interesting_msgs)} messages...")
-            extractions_list = await extract_with_actions_batch(
-                extraction_contents, self.config
-            )
-
-            msg_items = []
-            for msg, extraction in zip(interesting_msgs, extractions_list):
-                # Build searchable content with entity context appended
-                content = msg.content[:1800]  # Leave room for entity footer
-
-                # Append entity context for better semantic search
-                entity_parts = []
-                files = [e.name for e in extraction.entities if e.type == "file"]
-                tools = [e.name for e in extraction.entities if e.type == "tool"]
-                commands = [e.name for e in extraction.entities if e.type == "command"]
-                errors = [e.name for e in extraction.entities if e.type == "error"]
-
-                if files:
-                    entity_parts.append(f"Files: {', '.join(files[:5])}")
-                if commands:
-                    entity_parts.append(f"Commands: {', '.join(commands[:3])}")
-                if errors:
-                    entity_parts.append(f"Errors: {', '.join(errors[:2])}")
-                if tools:
-                    entity_parts.append(f"Tools: {', '.join(tools[:5])}")
-
-                if entity_parts:
-                    content += f"\n\n[Context: {' | '.join(entity_parts)}]"
-
-                msg_items.append(MemoryItem(
-                    content=content,
+            # 3. Batch store all chunk summaries (single embedding call!)
+            chunk_items = [
+                MemoryItem(
+                    content=summary,
                     metadata={
-                        "type": "message",
+                        "type": "chunk_summary",
                         "session_id": session_id,
                         "source": "claude_trace",
-                        "msg_type": msg.type,
-                        **extraction.to_metadata(),
+                        "message_count": len(chunk),
                     },
-                ))
-
-            await report(85, f"Storing {len(msg_items)} messages...")
-            message_ids = self.store.store_batch(msg_items)
-            log.info(f"Stored {len(message_ids)} interesting messages")
-
-            # 4b. Create verb-specific edges for cross-session linking
-            verb_edges_created = 0
-            for msg_id, extraction in zip(message_ids, extractions_list):
-                for entity in extraction.entities[:15]:  # Cap at 15 per message
-                    try:
-                        self.store.db.add_verb_edge(
-                            memory_uuid=msg_id,
-                            entity_name=entity.name,
-                            entity_type=entity.type,
-                            action=entity.action,
-                        )
-                        verb_edges_created += 1
-                    except Exception as e:
-                        log.warning(f"Failed to create verb edge: {e}")
-            log.info(f"Created {verb_edges_created} verb-specific edges (READS/MODIFIES/EXECUTES/TRIGGERED)")
-
-            # 4c. Create message relationships
-            msg_relations_created = 0
-            for i, (msg, msg_id) in enumerate(zip(interesting_msgs, message_ids)):
-                # message→chunk (child_of) - link message to its parent chunk
-                chunk_idx = msg_to_chunk_idx.get(msg.uuid)
-                if chunk_idx is not None and chunk_idx < len(chunk_ids):
-                    try:
-                        self.store.relate(msg_id, chunk_ids[chunk_idx], "child_of")
-                        msg_relations_created += 1
-                    except Exception as e:
-                        log.warning(f"Failed to create message→chunk relation: {e}")
-
-                # message→message (follows) - temporal sequence
-                if i > 0:
-                    try:
-                        self.store.relate(msg_id, message_ids[i - 1], "follows")
-                        msg_relations_created += 1
-                    except Exception as e:
-                        log.warning(f"Failed to create message follows relation: {e}")
-            log.info(f"Created {msg_relations_created} message relationships")
-
-        # 5. Generate session summary using chunk summaries (Map-Reduce)
-        await report(90, "Generating session summary...")
-        session_summary = await self._summarize_session(messages, chunk_summaries)
-
-        await report(95, "Storing session summary...")
-        session_summary_id = self.store.store(
-            MemoryItem(
-                content=session_summary,
-                metadata={
-                    "type": "session_summary",
-                    "session_id": session_id,
-                    "source": "claude_trace",
-                    "goal_id": goal_id,
-                },
-                relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
-            )
-        )
-
-        # 5b. Create chunk→session (child_of) relationships for bi-directional traversal
-        child_of_created = 0
-        for cid in chunk_ids:
-            try:
-                self.store.relate(cid, session_summary_id, "child_of")
-                child_of_created += 1
-            except Exception as e:
-                log.warning(f"Failed to create chunk→session child_of relation: {e}")
-        log.info(f"Created {child_of_created} chunk→session child_of relationships")
-
-        # 5c. Link session to goal if extracted
-        if goal_id:
-            try:
-                self.store.db.link_session_to_goal(session_summary_id, goal_id)
-                log.info(f"Linked session to Goal: {goal_id[:8]}...")
-
-                # Also link interesting messages to goal (ACHIEVES)
-                for msg_id in message_ids[:10]:  # Cap to prevent too many edges
-                    try:
-                        self.store.db.link_memory_to_goal(msg_id, goal_id)
-                    except Exception as e:
-                        log.trace(f"Failed to link message to goal: {e}")
-            except Exception as e:
-                log.warning(f"Failed to link session to goal: {e}")
-
-        # 5d. Create Project node and link session (BELONGS_TO)
-        # Extract project ID from session path: ~/.claude/projects/{project_dir}/{session}.jsonl
-        project_dir = None
-        try:
-            project_dir = session_path.parent.name  # e.g., "-Users-shimon-repo-simplemem"
-            if project_dir and project_dir != "projects":
-                # Decode path for human-readable display (preserves hyphens in project names)
-                project_path_display = _decode_project_path(project_dir)
-                self.store.db.add_project_node(
-                    project_id=project_dir,  # Use raw dir name as unique ID
-                    project_path=project_path_display,  # Human-readable path
                 )
-                self.store.db.link_session_to_project(session_summary_id, project_dir)
-                log.info(f"Linked session to Project: {project_path_display}")
-        except Exception as e:
-            log.warning(f"Failed to create/link project: {e}")
-            project_dir = None
+                for chunk, summary in zip(chunks, chunk_summaries)
+            ]
 
-        await report(100, "Complete!")
-        return SessionIndex(
-            session_id=session_id,
-            session_summary_id=session_summary_id,
-            chunk_summary_ids=chunk_ids,
-            message_ids=message_ids,
-            goal_id=goal_id,
-            project_id=project_dir,
-        )
+            await report(75, f"Batch embedding {len(chunk_items)} chunks...")
+            chunk_ids = self.store.store_batch(chunk_items)
+            log.info(f"Batch stored {len(chunk_ids)} chunk summaries")
+
+            # 3b. Create chunk→chunk (follows) relationships for temporal sequence
+            follows_created = 0
+            for i in range(1, len(chunk_ids)):
+                try:
+                    self.store.relate(chunk_ids[i], chunk_ids[i - 1], "follows")
+                    follows_created += 1
+                except Exception as e:
+                    log.warning(f"Failed to create chunk follows relation: {e}")
+            log.info(f"Created {follows_created} chunk→chunk follows relationships")
+
+            # 4. Store interesting individual messages
+            await report(80, "Identifying interesting messages...")
+            interesting_msgs = [m for m in messages if self._is_interesting(m)]
+            log.info(f"Found {len(interesting_msgs)} interesting messages")
+
+            # Build uuid→message lookup for context merging
+            msg_by_uuid: dict[str, TraceMessage] = {m.uuid: m for m in messages}
+
+            message_ids = []
+            extractions_list: list[EnhancedExtraction] = []
+            if interesting_msgs:
+                # Cap at 50 to control costs
+                interesting_msgs = interesting_msgs[:50]
+
+                # Build extraction contents with context merge (tool_use + tool_result)
+                # This solves the "0 READS" issue by giving the LLM both filename AND content
+                extraction_contents = []
+                for msg in interesting_msgs:
+                    content = msg.content
+                    # If this is a tool_result, prepend the tool_use context
+                    if msg.type == "tool_result" and msg.parent_uuid:
+                        parent = msg_by_uuid.get(msg.parent_uuid)
+                        if parent and parent.type == "tool_use":
+                            # Merge: LLM sees tool name + args + result together
+                            content = f"Tool call: {parent.content}\n\nResult:\n{msg.content}"
+                    extraction_contents.append(content)
+
+                # Extract entities WITH actions using enhanced LLM extraction
+                await report(82, f"Extracting entities with actions from {len(interesting_msgs)} messages...")
+                extractions_list = await extract_with_actions_batch(
+                    extraction_contents, self.config
+                )
+
+                msg_items = []
+                for msg, extraction in zip(interesting_msgs, extractions_list):
+                    # Build searchable content with entity context appended
+                    content = msg.content[:1800]  # Leave room for entity footer
+
+                    # Append entity context for better semantic search
+                    entity_parts = []
+                    files = [e.name for e in extraction.entities if e.type == "file"]
+                    tools = [e.name for e in extraction.entities if e.type == "tool"]
+                    commands = [e.name for e in extraction.entities if e.type == "command"]
+                    errors = [e.name for e in extraction.entities if e.type == "error"]
+
+                    if files:
+                        entity_parts.append(f"Files: {', '.join(files[:5])}")
+                    if commands:
+                        entity_parts.append(f"Commands: {', '.join(commands[:3])}")
+                    if errors:
+                        entity_parts.append(f"Errors: {', '.join(errors[:2])}")
+                    if tools:
+                        entity_parts.append(f"Tools: {', '.join(tools[:5])}")
+
+                    if entity_parts:
+                        content += f"\n\n[Context: {' | '.join(entity_parts)}]"
+
+                    msg_items.append(MemoryItem(
+                        content=content,
+                        metadata={
+                            "type": "message",
+                            "session_id": session_id,
+                            "source": "claude_trace",
+                            "msg_type": msg.type,
+                            **extraction.to_metadata(),
+                        },
+                    ))
+
+                await report(85, f"Storing {len(msg_items)} messages...")
+                message_ids = self.store.store_batch(msg_items)
+                log.info(f"Stored {len(message_ids)} interesting messages")
+
+                # 4b. Create verb-specific edges for cross-session linking
+                verb_edges_created = 0
+                for msg_id, extraction in zip(message_ids, extractions_list):
+                    for entity in extraction.entities[:15]:  # Cap at 15 per message
+                        try:
+                            self.store.db.add_verb_edge(
+                                memory_uuid=msg_id,
+                                entity_name=entity.name,
+                                entity_type=entity.type,
+                                action=entity.action,
+                            )
+                            verb_edges_created += 1
+                        except Exception as e:
+                            log.warning(f"Failed to create verb edge: {e}")
+                log.info(f"Created {verb_edges_created} verb-specific edges (READS/MODIFIES/EXECUTES/TRIGGERED)")
+
+                # 4c. Create message relationships
+                msg_relations_created = 0
+                for i, (msg, msg_id) in enumerate(zip(interesting_msgs, message_ids)):
+                    # message→chunk (child_of) - link message to its parent chunk
+                    chunk_idx = msg_to_chunk_idx.get(msg.uuid)
+                    if chunk_idx is not None and chunk_idx < len(chunk_ids):
+                        try:
+                            self.store.relate(msg_id, chunk_ids[chunk_idx], "child_of")
+                            msg_relations_created += 1
+                        except Exception as e:
+                            log.warning(f"Failed to create message→chunk relation: {e}")
+
+                    # message→message (follows) - temporal sequence
+                    if i > 0:
+                        try:
+                            self.store.relate(msg_id, message_ids[i - 1], "follows")
+                            msg_relations_created += 1
+                        except Exception as e:
+                            log.warning(f"Failed to create message follows relation: {e}")
+                log.info(f"Created {msg_relations_created} message relationships")
+
+            # 5. Generate session summary using chunk summaries (Map-Reduce)
+            await report(90, "Generating session summary...")
+            session_summary = await self._summarize_session(messages, chunk_summaries)
+
+            await report(95, "Storing session summary...")
+            session_summary_id = self.store.store(
+                MemoryItem(
+                    content=session_summary,
+                    metadata={
+                        "type": "session_summary",
+                        "session_id": session_id,
+                        "source": "claude_trace",
+                        "goal_id": goal_id,
+                    },
+                    relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
+                )
+            )
+
+            # 5b. Create chunk→session (child_of) relationships for bi-directional traversal
+            child_of_created = 0
+            for cid in chunk_ids:
+                try:
+                    self.store.relate(cid, session_summary_id, "child_of")
+                    child_of_created += 1
+                except Exception as e:
+                    log.warning(f"Failed to create chunk→session child_of relation: {e}")
+            log.info(f"Created {child_of_created} chunk→session child_of relationships")
+
+            # 5c. Link session to goal if extracted
+            if goal_id:
+                try:
+                    self.store.db.link_session_to_goal(session_summary_id, goal_id)
+                    log.info(f"Linked session to Goal: {goal_id[:8]}...")
+
+                    # Also link interesting messages to goal (ACHIEVES)
+                    for msg_id in message_ids[:10]:  # Cap to prevent too many edges
+                        try:
+                            self.store.db.link_memory_to_goal(msg_id, goal_id)
+                        except Exception as e:
+                            log.trace(f"Failed to link message to goal: {e}")
+                except Exception as e:
+                    log.warning(f"Failed to link session to goal: {e}")
+
+            # 5d. Create Project node and link session (BELONGS_TO)
+            # Extract project ID from session path: ~/.claude/projects/{project_dir}/{session}.jsonl
+            project_dir = None
+            try:
+                project_dir = session_path.parent.name  # e.g., "-Users-shimon-repo-simplemem"
+                if project_dir and project_dir != "projects":
+                    # Decode path for human-readable display (preserves hyphens in project names)
+                    project_path_display = _decode_project_path(project_dir)
+                    self.store.db.add_project_node(
+                        project_id=project_dir,  # Use raw dir name as unique ID
+                        project_path=project_path_display,  # Human-readable path
+                    )
+                    self.store.db.link_session_to_project(session_summary_id, project_dir)
+                    log.info(f"Linked session to Project: {project_path_display}")
+            except Exception as e:
+                log.warning(f"Failed to create/link project: {e}")
+                project_dir = None
+
+            # Update SessionStateDB to mark session as indexed (Fix 3)
+            if self.session_state_db is not None:
+                from simplemem_lite.session_state import compute_content_hash
+                content_hash = compute_content_hash(session_path)
+                self.session_state_db.update_session_state(
+                    session_id=session_id,
+                    file_path=str(session_path),
+                    line_index=next_line_index,  # Track actual line position for incremental reads
+                    content_hash=content_hash,
+                    status="indexed",
+                )
+                log.info(f"Updated SessionStateDB for session {session_id[:8]}...")
+
+            await report(100, "Complete!")
+            return SessionIndex(
+                session_id=session_id,
+                session_summary_id=session_summary_id,
+                chunk_summary_ids=chunk_ids,
+                message_ids=message_ids,
+                goal_id=goal_id,
+                project_id=project_dir,
+            )
+
+        finally:
+            # Always release lock if we acquired it
+            if lock_acquired and self.session_state_db is not None:
+                self.session_state_db.release_lock(session_id)
+                log.debug(f"Released lock for session {session_id[:8]}...")
 
     async def index_session_delta(
         self,
@@ -682,7 +730,7 @@ class HierarchicalIndexer:
         Uses SessionStateDB (if available) for robust state tracking with:
         - Per-session locking to prevent race conditions
         - Content hash checking to skip unchanged files
-        - Byte offset tracking for efficient incremental reads
+        - Line index tracking for efficient incremental reads
 
         Falls back to ProjectManager-based tracking if SessionStateDB not available.
 
@@ -690,7 +738,8 @@ class HierarchicalIndexer:
             session_id: Session UUID to index
             project_root: Project root path
             project_manager: ProjectManager for cursor tracking (legacy)
-            transcript_path: Optional explicit path to transcript
+            transcript_path: Optional explicit path to session file (same as session_path
+                in index_session, kept as transcript_path for Claude Code hooks compatibility)
 
         Returns:
             Dict with processing results
@@ -735,7 +784,7 @@ class HierarchicalIndexer:
 
                 state = self.session_state_db.get_session_state(session_id)
                 if state:
-                    last_index = state.indexed_byte_offset  # Note: now byte offset, not line index
+                    last_index = state.indexed_line_index
                     last_inode = state.inode
                     last_hash = state.content_hash
 
@@ -809,7 +858,7 @@ class HierarchicalIndexer:
                 self.session_state_db.update_session_state(
                     session_id=session_id,
                     file_path=str(session_path),
-                    byte_offset=max_index,  # Still using line index for now (parse_session uses lines)
+                    line_index=max_index,
                     content_hash=current_hash or "",
                     status="indexed",
                     inode=current_inode,
