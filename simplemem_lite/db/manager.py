@@ -933,22 +933,29 @@ class DatabaseManager:
             Number of orphaned entities deleted
         """
         # Find and delete entities with no incoming edges
-        # This query finds Entity nodes where no other node points to them
-        result = self.graph.query(
-            """
-            MATCH (e:Entity)
-            WHERE NOT exists((e)<-[]-())
-            WITH e, e.name AS name, e.type AS type
-            DETACH DELETE e
-            RETURN count(*) AS deleted_count
-            """
-        )
+        # Use OPTIONAL MATCH + WHERE null pattern for FalkorDB compatibility
+        try:
+            result = self.graph.query(
+                """
+                MATCH (e:Entity)
+                OPTIONAL MATCH (other)-[r]->(e)
+                WITH e, other
+                WHERE other IS NULL
+                DETACH DELETE e
+                RETURN count(*) AS deleted_count
+                """
+            )
 
-        if result.result_set and result.result_set[0][0]:
-            deleted = result.result_set[0][0]
-            log.debug(f"Deleted {deleted} orphaned Entity nodes")
-            return deleted
-        return 0
+            # Handle None/empty results safely
+            if result.result_set and len(result.result_set) > 0:
+                deleted = result.result_set[0][0]
+                if deleted is not None and deleted > 0:
+                    log.debug(f"Deleted {deleted} orphaned Entity nodes")
+                    return int(deleted)
+            return 0
+        except Exception as e:
+            log.warning(f"Orphan entity cleanup failed: {e}")
+            return 0
 
     def add_goal_node(
         self,
