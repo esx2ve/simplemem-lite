@@ -116,6 +116,7 @@ class MemoryStore:
         mem_type = item.metadata.get("type", "fact")
         source = item.metadata.get("source", "user")
         session_id = item.metadata.get("session_id")
+        project_id = item.metadata.get("project_id")
         created_at = int(time.time())
 
         log.debug(f"Storing memory: uuid={memory_uuid[:8]}..., type={mem_type}, source={source}")
@@ -136,6 +137,7 @@ class MemoryStore:
                     source=source,
                     session_id=session_id,
                     created_at=created_at,
+                    project_id=project_id,
                 )
 
                 # Phase 2: Write to vectors

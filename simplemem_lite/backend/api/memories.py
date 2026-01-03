@@ -3,12 +3,32 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.services import get_memory_store
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem
 
 router = APIRouter()
 log = get_logger("backend.api.memories")
+
+
+def require_project_id(project_id: str | None, endpoint: str) -> None:
+    """Validate that project_id is provided when required by config.
+
+    Args:
+        project_id: The project_id from the request
+        endpoint: Name of the endpoint for error message
+
+    Raises:
+        HTTPException: 400 if project_id is required but not provided
+    """
+    config = get_config()
+    if config.require_project_id and not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_id is required for {endpoint}. "
+            "Cloud API requires project isolation for all operations.",
+        )
 
 
 class RelationInput(BaseModel):
@@ -51,6 +71,7 @@ class AskMemoriesRequest(BaseModel):
     query: str = Field(..., description="Question to answer")
     max_memories: int = Field(default=8, ge=1, le=20)
     max_hops: int = Field(default=2, ge=1, le=3)
+    project_id: str | None = Field(default=None, description="Project identifier")
 
 
 class ReasonMemoriesRequest(BaseModel):
@@ -59,11 +80,13 @@ class ReasonMemoriesRequest(BaseModel):
     query: str = Field(..., description="Query for reasoning")
     max_hops: int = Field(default=2, ge=1, le=3)
     min_score: float = Field(default=0.1, ge=0.0, le=1.0)
+    project_id: str | None = Field(default=None, description="Project identifier")
 
 
 @router.post("/store", response_model=StoreMemoryResponse)
 async def store_memory(request: StoreMemoryRequest) -> StoreMemoryResponse:
     """Store a new memory with optional relations."""
+    require_project_id(request.project_id, "store_memory")
     try:
         store = get_memory_store()
 
@@ -98,6 +121,7 @@ async def store_memory(request: StoreMemoryRequest) -> StoreMemoryResponse:
 @router.post("/search")
 async def search_memories(request: SearchMemoriesRequest) -> dict:
     """Search memories with hybrid vector + graph search."""
+    require_project_id(request.project_id, "search_memories")
     try:
         store = get_memory_store()
         results = store.search(
@@ -131,12 +155,14 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
 @router.post("/ask")
 async def ask_memories(request: AskMemoriesRequest) -> dict:
     """Ask a question and get LLM-synthesized answer from memories."""
+    require_project_id(request.project_id, "ask_memories")
     try:
         store = get_memory_store()
         result = await store.ask_memories(
             query=request.query,
             max_memories=request.max_memories,
             max_hops=request.max_hops,
+            project_id=request.project_id,
         )
         return result
 
@@ -148,12 +174,14 @@ async def ask_memories(request: AskMemoriesRequest) -> dict:
 @router.post("/reason")
 async def reason_memories(request: ReasonMemoriesRequest) -> dict:
     """Multi-hop reasoning over memory graph."""
+    require_project_id(request.project_id, "reason_memories")
     try:
         store = get_memory_store()
         results = store.reason(
             query=request.query,
             max_hops=request.max_hops,
             min_score=request.min_score,
+            project_id=request.project_id,
         )
         return {
             "conclusions": results,

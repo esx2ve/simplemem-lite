@@ -54,3 +54,4 @@ primary_region = "sjc"
     path = "/health"
     interval = "30s"
     timeout = "5s"
+    grace_period = "15s"  # Allow time for FalkorDB/LanceDB initialization

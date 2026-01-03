@@ -86,9 +86,13 @@ async def _get_watcher_manager() -> CloudWatcherManager:
         async with _watcher_lock:
             # Double-check after acquiring lock
             if _watcher_manager is None:
-                client = await _get_client()
+                # IMPORTANT: Create a NEW BackendClient for the watcher, not shared!
+                # The watcher runs in its own thread with its own event loop,
+                # and httpx.AsyncClient cannot be shared across event loops.
+                from simplemem_lite.mcp.client import BackendClient
+                watcher_client = BackendClient()
                 reader = await _get_reader()
-                _watcher_manager = CloudWatcherManager(client=client, reader=reader)
+                _watcher_manager = CloudWatcherManager(client=watcher_client, reader=reader)
     return _watcher_manager
 
 

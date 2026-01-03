@@ -76,6 +76,7 @@ class DatabaseManager:
             backend="auto",
             falkor_host=self.config.falkor_host,
             falkor_port=self.config.falkor_port,
+            falkor_password=self.config.falkor_password,
             kuzu_path=self.config.data_dir / "kuzu",
         )
         log.info(f"Graph backend initialized: {self._graph_backend.backend_name}")
@@ -570,6 +571,7 @@ class DatabaseManager:
         source: str,
         session_id: str | None,
         created_at: int,
+        project_id: str | None = None,
     ) -> None:
         """Add a memory node to the graph.
 
@@ -580,8 +582,9 @@ class DatabaseManager:
             source: Source of memory (claude_trace, user, extracted)
             session_id: Optional session identifier
             created_at: Unix timestamp
+            project_id: Optional project identifier for isolation
         """
-        log.trace(f"Adding memory node: uuid={uuid[:8]}..., type={mem_type}")
+        log.trace(f"Adding memory node: uuid={uuid[:8]}..., type={mem_type}, project={project_id}")
         # Parameterized queries handle escaping automatically
         self.graph.query(
             """
@@ -591,7 +594,8 @@ class DatabaseManager:
                 type: $type,
                 source: $source,
                 session_id: $session_id,
-                created_at: $created_at
+                created_at: $created_at,
+                project_id: $project_id
             })
             """,
             {
@@ -601,6 +605,7 @@ class DatabaseManager:
                 "source": source,
                 "session_id": session_id or "",
                 "created_at": created_at,
+                "project_id": project_id or "",
             },
         )
 
@@ -2401,11 +2406,18 @@ class DatabaseManager:
 
         result = self.graph.query(
             """
+            // First, find memories with direct project_id property match
+            UNWIND $uuids AS uuid
+            MATCH (m:Memory {uuid: uuid})
+            WHERE m.project_id = $project_id
+            RETURN DISTINCT m.uuid
+
+            UNION
+
+            // Also find memories via session-based relationships
             MATCH (p:Project {id: $project_id})
             OPTIONAL MATCH (session:Memory)-[:BELONGS_TO]->(p)
             WITH collect(session.uuid) AS session_uuids
-
-            // Get all memories that are session summaries or children of session summaries
             UNWIND $uuids AS uuid
             MATCH (m:Memory {uuid: uuid})
             OPTIONAL MATCH (parent:Memory)-[:CONTAINS*1..3]->(m)

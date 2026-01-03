@@ -29,6 +29,12 @@ class BackendConfig:
         == "true"
     )
 
+    # Project isolation (required in cloud mode)
+    require_project_id: bool = field(
+        default_factory=lambda: os.environ.get("SIMPLEMEM_REQUIRE_PROJECT_ID", "").lower()
+        == "true"
+    )
+
     # Graph backend
     graph_backend: str = field(
         default_factory=lambda: os.environ.get("SIMPLEMEM_GRAPH_BACKEND", "kuzu")

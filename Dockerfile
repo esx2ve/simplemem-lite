@@ -25,8 +25,8 @@ RUN pip install uv==0.5.14
 COPY pyproject.toml ./
 COPY uv.lock* ./
 
-# Install dependencies (no editable install, no cache for smaller image)
-RUN uv pip install --system --no-cache "."
+# Install dependencies with FalkorDB support (no editable install, no cache for smaller image)
+RUN uv pip install --system --no-cache ".[falkordb]"
 
 # Copy application code
 COPY simplemem_lite/ ./simplemem_lite/

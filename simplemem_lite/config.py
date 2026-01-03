@@ -68,12 +68,15 @@ class Config:
         default_factory=lambda: _get_env("LOCAL_MODEL", "all-MiniLM-L6-v2")
     )
 
-    # FalkorDB connection settings
+    # FalkorDB connection settings (use os.getenv directly to support both prefixed and unprefixed)
     falkor_host: str = field(
-        default_factory=lambda: _get_env("FALKOR_HOST", "localhost")
+        default_factory=lambda: os.getenv("SIMPLEMEM_FALKOR_HOST", os.getenv("SIMPLEMEM_LITE_FALKOR_HOST", "localhost"))
     )
     falkor_port: int = field(
-        default_factory=lambda: int(_get_env("FALKOR_PORT", "6379"))
+        default_factory=lambda: int(os.getenv("SIMPLEMEM_FALKOR_PORT", os.getenv("SIMPLEMEM_LITE_FALKOR_PORT", "6379")))
+    )
+    falkor_password: str | None = field(
+        default_factory=lambda: os.getenv("SIMPLEMEM_FALKOR_PASSWORD", os.getenv("SIMPLEMEM_LITE_FALKOR_PASSWORD"))
     )
 
     # HTTP server settings (for hook communication)
@@ -179,7 +182,7 @@ class Config:
         log.debug(f"summary_model={self.summary_model}")
         log.debug(f"use_local_embeddings={self.use_local_embeddings}")
         log.debug(f"embedding_dim={self.embedding_dim}")
-        log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}")
+        log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}, falkor_password={'***' if self.falkor_password else 'None'}")
         log.debug(f"code_index_enabled={self.code_index_enabled}")
         log.debug(f"code_index_patterns={self.code_index_patterns}")
         log.info(f"Config initialized: data_dir={self.data_dir}, traces={self.claude_traces_dir}")

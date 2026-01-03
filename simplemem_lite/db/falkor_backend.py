@@ -22,20 +22,22 @@ class FalkorDBBackend(BaseGraphBackend):
     Provides full Cypher support including shortestPath() and PageRank.
     """
 
-    def __init__(self, host: str = "localhost", port: int = 6379):
+    def __init__(self, host: str = "localhost", port: int = 6379, password: str | None = None):
         """Initialize FalkorDB connection.
 
         Args:
             host: FalkorDB host address
             port: FalkorDB port (default: 6379)
+            password: Optional Redis password for authentication
         """
         from falkordb import FalkorDB
 
         self.host = host
         self.port = port
+        self.password = password
 
-        log.info(f"Connecting to FalkorDB at {host}:{port}")
-        self._db = FalkorDB(host=host, port=port)
+        log.info(f"Connecting to FalkorDB at {host}:{port} (auth={'yes' if password else 'no'})")
+        self._db = FalkorDB(host=host, port=port, password=password)
         self._graph = self._db.select_graph(self.GRAPH_NAME)
 
         log.info(f"FalkorDB connected: graph={self.GRAPH_NAME}")
@@ -159,7 +161,7 @@ class FalkorDBBackend(BaseGraphBackend):
 
         try:
             log.info("Attempting to reconnect to FalkorDB...")
-            self._db = FalkorDB(host=self.host, port=self.port)
+            self._db = FalkorDB(host=self.host, port=self.port, password=self.password)
             self._graph = self._db.select_graph(self.GRAPH_NAME)
 
             # Verify connection
@@ -234,12 +236,14 @@ class FalkorDBBackend(BaseGraphBackend):
 def create_falkor_backend(
     host: str = "localhost",
     port: int = 6379,
+    password: str | None = None,
 ) -> FalkorDBBackend:
     """Factory function to create and initialize a FalkorDB backend.
 
     Args:
         host: FalkorDB host address
         port: FalkorDB port
+        password: Optional Redis password for authentication
 
     Returns:
         Initialized FalkorDBBackend instance
@@ -247,17 +251,22 @@ def create_falkor_backend(
     Raises:
         ConnectionError: If FalkorDB is not reachable
     """
-    backend = FalkorDBBackend(host, port)
+    backend = FalkorDBBackend(host, port, password)
     backend.init_schema()
     return backend
 
 
-def is_falkordb_available(host: str = "localhost", port: int = 6379) -> bool:
+def is_falkordb_available(
+    host: str = "localhost",
+    port: int = 6379,
+    password: str | None = None,
+) -> bool:
     """Check if FalkorDB is available at the given address.
 
     Args:
         host: FalkorDB host address
         port: FalkorDB port
+        password: Optional Redis password for authentication
 
     Returns:
         True if FalkorDB is reachable and healthy
@@ -265,7 +274,7 @@ def is_falkordb_available(host: str = "localhost", port: int = 6379) -> bool:
     try:
         from falkordb import FalkorDB
 
-        db = FalkorDB(host=host, port=port)
+        db = FalkorDB(host=host, port=port, password=password)
         graph = db.select_graph("simplemem_test")
         graph.query("RETURN 1")
         return True

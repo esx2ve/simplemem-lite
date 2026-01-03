@@ -1,0 +1,27 @@
+app = "simplemem-falkor"
+primary_region = "sjc"
+
+[build]
+  image = "falkordb/falkordb:latest"
+
+[env]
+  # FalkorDB uses Redis protocol on port 6379
+
+[mounts]
+  source = "falkordb_data"
+  destination = "/data"
+
+[[services]]
+  internal_port = 6379
+  protocol = "tcp"
+
+  # Only expose internally within the Fly.io private network
+  # No public HTTP service needed
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

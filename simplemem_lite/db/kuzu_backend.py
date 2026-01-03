@@ -61,6 +61,59 @@ class KuzuDBBackend(BaseGraphBackend):
         Returns:
             QueryResult with result_set, header, and stats
         """
+        # Handle Entity MERGE/MATCH patterns - KuzuDB needs composite id
+        # Convert patterns like (e:Entity {name: $name, type: $type}) to (e:Entity {id: $entity_id})
+        import re
+        if params:
+            params = dict(params)  # Copy to avoid mutating original
+
+            # Handle $name/$type params (most common pattern)
+            if "name" in params and "type" in params and "Entity {name:" in cypher:
+                entity_id = f"{params['type']}:{params['name']}"
+                params["entity_id"] = entity_id
+                cypher = re.sub(
+                    r"\(\s*(\w+)\s*:\s*Entity\s*\{\s*name\s*:\s*\$name\s*,\s*type\s*:\s*\$type\s*\}\s*\)",
+                    r"(\1:Entity {id: $entity_id})",
+                    cypher, flags=re.IGNORECASE
+                )
+                log.debug(f"Transformed Entity pattern (name/type), entity_id={entity_id}")
+
+            # Handle $entity_name/$entity_type params (code linking)
+            if "entity_name" in params and "entity_type" in params and "Entity {name:" in cypher:
+                entity_id = f"{params['entity_type']}:{params['entity_name']}"
+                params["entity_id"] = entity_id
+                cypher = re.sub(
+                    r"\(\s*(\w+)\s*:\s*Entity\s*\{\s*name\s*:\s*\$entity_name\s*,\s*type\s*:\s*\$entity_type\s*\}\s*\)",
+                    r"(\1:Entity {id: $entity_id})",
+                    cypher, flags=re.IGNORECASE
+                )
+                log.debug(f"Transformed Entity pattern (entity_name/type), entity_id={entity_id}")
+
+            # Handle $filename with hardcoded type: 'file'
+            if "filename" in params and "type: 'file'" in cypher:
+                entity_id = f"file:{params['filename']}"
+                params["entity_id_file"] = entity_id
+                cypher = re.sub(
+                    r"\(\s*(\w+)\s*:\s*Entity\s*\{\s*name\s*:\s*\$filename\s*,\s*type\s*:\s*'file'\s*\}\s*\)",
+                    r"(\1:Entity {id: $entity_id_file})",
+                    cypher, flags=re.IGNORECASE
+                )
+                log.debug(f"Transformed Entity pattern (filename/'file'), entity_id={entity_id}")
+
+            # Handle single-property Entity matches with $from_entity/$to_entity
+            # Note: These need type info; assume 'file' type for graph traversal queries
+            for param_name in ("from_entity", "to_entity"):
+                if param_name in params and f"${param_name}" in cypher:
+                    entity_id_key = f"entity_id_{param_name}"
+                    # Default to file type for entity traversal queries
+                    params[entity_id_key] = f"file:{params[param_name]}"
+                    cypher = re.sub(
+                        rf"\(\s*(\w+)\s*:\s*Entity\s*\{{\s*name\s*:\s*\${param_name}\s*\}}\s*\)",
+                        rf"(\1:Entity {{id: ${entity_id_key}}})",
+                        cypher, flags=re.IGNORECASE
+                    )
+                    log.debug(f"Transformed Entity pattern ({param_name}), entity_id={params[entity_id_key]}")
+
         # Translate Cypher dialect differences
         translated = self._translate_cypher(cypher)
 
@@ -364,11 +417,12 @@ class KuzuDBBackend(BaseGraphBackend):
                 flags=re.IGNORECASE,
             )
 
-        # Replace timestamp() with a placeholder (caller should provide as param)
-        # KuzuDB doesn't have a built-in timestamp() function
+        # Replace timestamp() with current Unix timestamp
+        # KuzuDB doesn't have a built-in timestamp() function like Neo4j/FalkorDB
         if "timestamp()" in result.lower():
-            log.debug("timestamp() function not supported - should use parameter")
-            # The caller should provide timestamp as a parameter instead
+            import time
+            current_ts = int(time.time())
+            result = re.sub(r"timestamp\(\)", str(current_ts), result, flags=re.IGNORECASE)
 
         # Handle Entity matching by name,type -> use composite id
         # MATCH (e:Entity {name: $name, type: $type}) -> MATCH (e:Entity {id: $entity_id})

@@ -1,5 +1,6 @@
 """FastAPI application factory for SimpleMem-Lite backend."""
 
+import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -33,8 +34,8 @@ async def verify_api_key(api_key: str | None = Security(api_key_header)) -> str 
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # Verify the key
-    if api_key != config.api_key:
+    # Verify the key using constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(api_key, config.api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",

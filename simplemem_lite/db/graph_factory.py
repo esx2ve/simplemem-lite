@@ -7,6 +7,9 @@ Provides intelligent backend selection:
 Environment variables for override:
 - SIMPLEMEM_GRAPH_BACKEND: Force specific backend ('falkordb', 'kuzu')
 - SIMPLEMEM_KUZU_PATH: Override KuzuDB database path
+- SIMPLEMEM_FALKOR_HOST: FalkorDB host (default: localhost)
+- SIMPLEMEM_FALKOR_PORT: FalkorDB port (default: 6379)
+- SIMPLEMEM_FALKOR_PASSWORD: FalkorDB/Redis password for authentication
 """
 
 import os
@@ -24,8 +27,9 @@ BackendType = Literal["falkordb", "kuzu", "auto"]
 
 def create_graph_backend(
     backend: BackendType = "auto",
-    falkor_host: str = "localhost",
-    falkor_port: int = 6379,
+    falkor_host: str | None = None,
+    falkor_port: int | None = None,
+    falkor_password: str | None = None,
     kuzu_path: str | Path | None = None,
 ) -> GraphBackend:
     """Create a graph backend with auto-detection and fallback.
@@ -37,8 +41,9 @@ def create_graph_backend(
 
     Args:
         backend: Backend type - "falkordb", "kuzu", or "auto"
-        falkor_host: FalkorDB host address
-        falkor_port: FalkorDB port
+        falkor_host: FalkorDB host address (default: localhost, or SIMPLEMEM_FALKOR_HOST)
+        falkor_port: FalkorDB port (default: 6379, or SIMPLEMEM_FALKOR_PORT)
+        falkor_password: FalkorDB password (or SIMPLEMEM_FALKOR_PASSWORD)
         kuzu_path: Path for KuzuDB database (default: ~/.simplemem/kuzu)
 
     Returns:
@@ -52,6 +57,14 @@ def create_graph_backend(
     if env_backend in ("falkordb", "kuzu"):
         backend = env_backend
         log.info(f"Using backend from environment: {backend}")
+
+    # Override FalkorDB settings from environment
+    if falkor_host is None:
+        falkor_host = os.environ.get("SIMPLEMEM_FALKOR_HOST", "localhost")
+    if falkor_port is None:
+        falkor_port = int(os.environ.get("SIMPLEMEM_FALKOR_PORT", "6379"))
+    if falkor_password is None:
+        falkor_password = os.environ.get("SIMPLEMEM_FALKOR_PASSWORD")
 
     # Override KuzuDB path from environment
     kuzu_path_override = os.environ.get("SIMPLEMEM_KUZU_PATH")
@@ -67,7 +80,7 @@ def create_graph_backend(
     # ══════════════════════════════════════════════════════════════════════════════
 
     if backend == "falkordb":
-        return _create_falkordb(falkor_host, falkor_port)
+        return _create_falkordb(falkor_host, falkor_port, falkor_password)
 
     if backend == "kuzu":
         return _create_kuzu(kuzu_path)
@@ -76,21 +89,22 @@ def create_graph_backend(
     log.info("Auto-detecting graph backend...")
 
     # Try FalkorDB first
-    if _is_falkordb_available(falkor_host, falkor_port):
+    if _is_falkordb_available(falkor_host, falkor_port, falkor_password):
         log.info("FalkorDB detected and healthy, using FalkorDB backend")
-        return _create_falkordb(falkor_host, falkor_port)
+        return _create_falkordb(falkor_host, falkor_port, falkor_password)
 
     # Fall back to KuzuDB
     log.info("FalkorDB not available, falling back to KuzuDB")
     return _create_kuzu(kuzu_path)
 
 
-def _is_falkordb_available(host: str, port: int) -> bool:
+def _is_falkordb_available(host: str, port: int, password: str | None = None) -> bool:
     """Check if FalkorDB is available.
 
     Args:
         host: FalkorDB host
         port: FalkorDB port
+        password: Optional Redis password
 
     Returns:
         True if FalkorDB is reachable
@@ -98,7 +112,7 @@ def _is_falkordb_available(host: str, port: int) -> bool:
     try:
         from falkordb import FalkorDB
 
-        db = FalkorDB(host=host, port=port)
+        db = FalkorDB(host=host, port=port, password=password)
         graph = db.select_graph("simplemem_health_check")
         graph.query("RETURN 1")
         log.debug(f"FalkorDB available at {host}:{port}")
@@ -113,12 +127,13 @@ def _is_falkordb_available(host: str, port: int) -> bool:
         return False
 
 
-def _create_falkordb(host: str, port: int) -> GraphBackend:
+def _create_falkordb(host: str, port: int, password: str | None = None) -> GraphBackend:
     """Create FalkorDB backend.
 
     Args:
         host: FalkorDB host
         port: FalkorDB port
+        password: Optional Redis password
 
     Returns:
         FalkorDBBackend instance
@@ -129,7 +144,7 @@ def _create_falkordb(host: str, port: int) -> GraphBackend:
     try:
         from simplemem_lite.db.falkor_backend import create_falkor_backend
 
-        backend = create_falkor_backend(host, port)
+        backend = create_falkor_backend(host, port, password)
         log.info(f"FalkorDB backend initialized at {host}:{port}")
         return backend
 
