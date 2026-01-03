@@ -104,12 +104,14 @@ class BackendClient:
         client = await self._get_client()
 
         try:
+            log.debug(f"HTTP {method} {self.base_url}{path}")
             response = await client.request(
                 method=method,
                 url=path,
                 json=json_data,
                 params=params,
             )
+            log.debug(f"Response: {response.status_code} from {response.url}")
 
             if response.status_code >= 400:
                 try:

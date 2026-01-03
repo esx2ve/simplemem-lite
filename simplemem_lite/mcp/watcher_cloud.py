@@ -62,6 +62,13 @@ class CloudWatcherWorker(threading.Thread):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        # Create a FRESH BackendClient for this worker's event loop.
+        # httpx.AsyncClient cannot be shared across event loops, so each
+        # worker thread must create its own client instance.
+        from simplemem_lite.mcp.client import BackendClient
+        self._worker_client = BackendClient()
+        log.info(f"Worker BackendClient created with base_url={self._worker_client.base_url}")
+
         try:
             while not self._stop_event.is_set():
                 # Check for ready events (debounce period elapsed)
@@ -73,6 +80,12 @@ class CloudWatcherWorker(threading.Thread):
                 # Sleep before next check
                 time.sleep(self.poll_interval)
         finally:
+            # Clean up the worker's BackendClient before closing the loop
+            if hasattr(self, '_worker_client') and self._worker_client:
+                try:
+                    self._loop.run_until_complete(self._worker_client.close())
+                except Exception:
+                    pass  # Best effort cleanup
             self._loop.close()
             log.info(f"CloudWatcherWorker stopped for {self.project_root}")
 
@@ -100,7 +113,7 @@ class CloudWatcherWorker(threading.Thread):
             elif event.event_type in ("created", "modified"):
                 # Read file content
                 try:
-                    content = self.reader.read_file(event.path)
+                    content = self.reader.read_single_file(event.path)
                     if content:
                         action = "add" if event.event_type == "created" else "modify"
                         updates.append({
@@ -121,15 +134,17 @@ class CloudWatcherWorker(threading.Thread):
             return
 
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                self.client.update_code(
+            # Use run_until_complete since we're in the worker thread and can block.
+            # This actually executes the coroutine (unlike run_coroutine_threadsafe
+            # which requires the loop to be running separately).
+            # Use the worker's own BackendClient to avoid cross-loop issues.
+            log.debug(f"Sending {len(updates)} updates to {self._worker_client.base_url}/api/v1/code/update")
+            result = self._loop.run_until_complete(
+                self._worker_client.update_code(
                     project_root=str(self.project_root),
                     updates=updates,
-                ),
-                self._loop,
+                )
             )
-            # Wait for result with timeout
-            result = future.result(timeout=30)
             log.info(
                 f"Cloud update: {result.get('files_updated', 0)} files, "
                 f"+{result.get('chunks_created', 0)}/-{result.get('chunks_deleted', 0)} chunks"
