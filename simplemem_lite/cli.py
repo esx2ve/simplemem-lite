@@ -1,18 +1,16 @@
-"""SimpleMem Lite CLI with beautiful Rich output.
+"""SimpleMem Lite Backend CLI.
 
-Provides commands for:
-- Backend status and info
-- FalkorDB management via Apptainer/Docker
-- Memory search and storage
-- Project management
-- User-space installation
+This is the BACKEND service CLI. For the user-facing MCP client, use simplemem-mcp:
+    uvx simplemem-mcp serve
 
-Usage:
+Backend commands:
     simplemem status           # Show backend status
     simplemem start            # Start FalkorDB (Apptainer or Docker)
     simplemem stop             # Stop FalkorDB
-    simplemem search "query"   # Search memories
-    simplemem install          # Install to ~/.claude
+    simplemem serve            # Run backend API server
+
+For local development:
+    simplemem install          # Install local backend as MCP server
 """
 
 import os
@@ -32,7 +30,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 # Initialize Typer app and Rich console
 app = typer.Typer(
     name="simplemem",
-    help="SimpleMem Lite - Long-term memory for Claude Code",
+    help="SimpleMem Lite Backend - Cloud API for memory storage. Users: install simplemem-mcp instead.",
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
@@ -551,22 +549,21 @@ def install(
     data_dir: Optional[str] = typer.Option(None, "--data-dir", help="SimpleMem data directory"),
     use_local_embeddings: bool = typer.Option(True, "--local-embeddings/--no-local-embeddings", help="Use local sentence-transformers"),
 ):
-    """Install SimpleMem to Claude Code (user scope).
+    """Install SimpleMem LOCAL backend to Claude Code (for development).
 
-    This command installs:
-    - MCP server config to ~/.claude.json (user-scope, works across all projects)
+    NOTE: For production use, install the cloud-connected MCP client instead:
+        uvx simplemem-mcp serve
+
+    This command installs the LOCAL backend as an MCP server (for development):
+    - MCP server config to ~/.claude.json
     - Skills to ~/.claude/skills/
     - Agents to ~/.claude/agents/
     - Auto-allow permissions for simplemem tools
-
-    For HPC clusters, specify --venv to point to your installation:
-        simplemem install --venv /path/to/simplemem/.venv
 
     Examples:
         simplemem install                    # Full installation
         simplemem install --dry-run          # Preview changes
         simplemem install --force            # Overwrite existing
-        simplemem install --venv ~/.venvs/simplemem  # Custom venv
     """
     import shutil
     import json
