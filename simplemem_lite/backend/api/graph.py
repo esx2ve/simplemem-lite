@@ -24,6 +24,22 @@ ALLOWED_QUERY_TEMPLATES = {
     "count_memories": "MATCH (m:Memory) RETURN count(m) as count",
     "count_by_type": "MATCH (m:Memory {type: $type}) RETURN count(m) as count",
     "recent_memories": "MATCH (m:Memory) RETURN m ORDER BY m.created_at DESC LIMIT $limit",
+    # Goal query templates
+    "session_goals": """
+        MATCH (s:Memory {type: 'session_summary'})-[:HAS_GOAL]->(g:Goal)
+        WHERE ($session_id IS NULL OR s.session_id = $session_id)
+          AND ($goal_id IS NULL OR g.id = $goal_id)
+        RETURN g.id as goal_id, g.intent, g.status, s.session_id, s.uuid as session_uuid
+        ORDER BY s.created_at DESC
+        LIMIT $limit
+    """,
+    "all_goals": """
+        MATCH (g:Goal)
+        OPTIONAL MATCH (s:Memory)-[:HAS_GOAL]->(g)
+        RETURN g.id as goal_id, g.intent, g.status, g.created_at, s.session_id
+        ORDER BY g.created_at DESC
+        LIMIT $limit
+    """,
 }
 
 

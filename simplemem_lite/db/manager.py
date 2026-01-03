@@ -99,6 +99,47 @@ class DatabaseManager:
         self._graph_healthy = True
         self._last_health_check = 0
 
+    def close(self) -> None:
+        """Close database connections gracefully.
+
+        Ensures all pending LanceDB writes are flushed to disk.
+        Critical for preventing corruption on Fly.io auto-suspend.
+        """
+        log.info("Closing database connections...")
+
+        # Close LanceDB - this flushes pending writes
+        if hasattr(self, 'lance_db') and self.lance_db is not None:
+            try:
+                # LanceDB connections don't have explicit close(),
+                # but we can optimize tables to ensure writes are flushed
+                if hasattr(self, 'lance_table') and self.lance_table is not None:
+                    try:
+                        self.lance_table.optimize()
+                        log.debug("Optimized memories LanceDB table")
+                    except Exception as e:
+                        log.warning(f"Failed to optimize memories table: {e}")
+
+                if hasattr(self, 'code_table') and self.code_table is not None:
+                    try:
+                        self.code_table.optimize()
+                        log.debug("Optimized code_chunks LanceDB table")
+                    except Exception as e:
+                        log.warning(f"Failed to optimize code_chunks table: {e}")
+
+                log.info("LanceDB tables optimized and flushed")
+            except Exception as e:
+                log.error(f"Error closing LanceDB: {e}")
+
+        # Close graph backend if it has a close method
+        if hasattr(self, '_graph_backend') and hasattr(self._graph_backend, 'close'):
+            try:
+                self._graph_backend.close()
+                log.info("Graph backend closed")
+            except Exception as e:
+                log.warning(f"Error closing graph backend: {e}")
+
+        log.info("Database connections closed")
+
     @property
     def graph_backend(self) -> GraphBackend:
         """Get the underlying graph backend.
@@ -256,6 +297,52 @@ class DatabaseManager:
             return self.graph.query(query, params)
         return self.graph.query(query)
 
+    def _serialize_graph_value(self, value: Any) -> Any:
+        """Serialize FalkorDB graph objects to JSON-safe Python types.
+
+        Handles Node, Edge, Path objects from FalkorDB query results.
+
+        Args:
+            value: Any value from a query result
+
+        Returns:
+            JSON-serializable Python value
+        """
+        # Check for FalkorDB Node
+        if hasattr(value, 'properties') and hasattr(value, 'labels'):
+            return {
+                "_type": "node",
+                "labels": list(value.labels) if value.labels else [],
+                "properties": dict(value.properties) if value.properties else {},
+            }
+
+        # Check for FalkorDB Edge
+        if hasattr(value, 'properties') and hasattr(value, 'relation'):
+            return {
+                "_type": "edge",
+                "relation": value.relation,
+                "properties": dict(value.properties) if value.properties else {},
+            }
+
+        # Check for FalkorDB Path
+        if hasattr(value, 'nodes') and hasattr(value, 'edges'):
+            return {
+                "_type": "path",
+                "nodes": [self._serialize_graph_value(n) for n in value.nodes()],
+                "edges": [self._serialize_graph_value(e) for e in value.edges()],
+            }
+
+        # Handle lists recursively
+        if isinstance(value, list):
+            return [self._serialize_graph_value(v) for v in value]
+
+        # Handle dicts recursively
+        if isinstance(value, dict):
+            return {k: self._serialize_graph_value(v) for k, v in value.items()}
+
+        # Primitive types pass through
+        return value
+
     def execute_validated_cypher(
         self,
         query: str,
@@ -304,9 +391,9 @@ class DatabaseManager:
                         "(store_memory, relate_memories) for data modifications."
                     )
 
-        # Inject LIMIT if not present
+        # Inject LIMIT if not present (match LIMIT <number> or LIMIT $param)
         query_stripped = query.strip().rstrip(';')
-        if not re.search(r'\bLIMIT\s+\d+', query_upper):
+        if not re.search(r'\bLIMIT\s+(\d+|\$\w+)', query_upper):
             query_stripped = f"{query_stripped} LIMIT {max_results}"
             log.debug(f"Injected LIMIT {max_results}")
 
@@ -331,11 +418,14 @@ class DatabaseManager:
             column_names = [col[1] if isinstance(col, tuple) else str(col) for col in header] if header else None
 
             for row in result.result_set:
-                if column_names and len(column_names) == len(row):
-                    rows.append(dict(zip(column_names, row)))
+                # Serialize FalkorDB objects (Node, Edge, Path) to JSON-safe dicts
+                serialized_row = [self._serialize_graph_value(val) for val in row]
+
+                if column_names and len(column_names) == len(serialized_row):
+                    rows.append(dict(zip(column_names, serialized_row)))
                 else:
                     # Fallback to positional indexing
-                    rows.append({f"col_{i}": val for i, val in enumerate(row)})
+                    rows.append({f"col_{i}": val for i, val in enumerate(serialized_row)})
 
         truncated = len(rows) >= max_results
         log.info(f"Cypher executed: {len(rows)} rows in {execution_time_ms:.1f}ms, truncated={truncated}")
@@ -556,6 +646,31 @@ class DatabaseManager:
                     "description": "Get graph statistics",
                     "cypher": "MATCH (n) RETURN labels(n)[0] as label, count(n) as count ORDER BY count DESC",
                     "params": {},
+                },
+                {
+                    "name": "session_goals",
+                    "description": "Get goals linked to sessions, optionally filtered by session_id or goal_id",
+                    "cypher": """
+                        MATCH (s:Memory {type: 'session_summary'})-[:HAS_GOAL]->(g:Goal)
+                        WHERE ($session_id IS NULL OR s.session_id = $session_id)
+                          AND ($goal_id IS NULL OR g.id = $goal_id)
+                        RETURN g.id as goal_id, g.intent, g.status, s.session_id, s.uuid as session_uuid
+                        ORDER BY s.created_at DESC
+                        LIMIT $limit
+                    """,
+                    "params": {"session_id": None, "goal_id": None, "limit": 10},
+                },
+                {
+                    "name": "all_goals",
+                    "description": "Get all goals across all sessions",
+                    "cypher": """
+                        MATCH (g:Goal)
+                        OPTIONAL MATCH (s:Memory)-[:HAS_GOAL]->(g)
+                        RETURN g.id as goal_id, g.intent, g.status, g.created_at, s.session_id
+                        ORDER BY g.created_at DESC
+                        LIMIT $limit
+                    """,
+                    "params": {"limit": 20},
                 },
             ],
         }

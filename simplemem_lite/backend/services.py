@@ -111,3 +111,27 @@ def clear_service_caches() -> None:
     get_hierarchical_indexer.cache_clear()
     get_job_manager.cache_clear()
     log.info("Service caches cleared")
+
+
+def shutdown_services() -> None:
+    """Gracefully shutdown all services.
+
+    Closes database connections and flushes pending writes.
+    Critical for preventing LanceDB corruption on Fly.io auto-suspend.
+    """
+    log.info("Shutting down services...")
+
+    # Close database manager if initialized
+    # Check cache to see if it was ever created
+    cache_info = get_database_manager.cache_info()
+    if cache_info.hits > 0 or cache_info.currsize > 0:
+        try:
+            db_manager = get_database_manager()
+            db_manager.close()
+            log.info("Database manager closed")
+        except Exception as e:
+            log.error(f"Error closing database manager: {e}")
+
+    # Clear caches after shutdown
+    clear_service_caches()
+    log.info("Services shutdown complete")

@@ -80,6 +80,8 @@ def _log_security_mode() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup/shutdown."""
+    from simplemem_lite.backend.services import shutdown_services
+
     config = get_config()
 
     # Log security mode at startup
@@ -91,8 +93,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    # Shutdown: Cleanup resources
-    # Services handle their own cleanup
+    # Shutdown: Gracefully close all services
+    # Critical for preventing LanceDB corruption on Fly.io auto-suspend
+    log.info("Received shutdown signal, closing services...")
+    shutdown_services()
+    log.info("Graceful shutdown complete")
 
 
 def create_app() -> FastAPI:
