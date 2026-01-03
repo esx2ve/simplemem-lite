@@ -923,6 +923,33 @@ class DatabaseManager:
 
         return name
 
+    def _cleanup_orphan_entities(self) -> int:
+        """Delete Entity nodes that have no incoming edges.
+
+        Called after code chunk deletion to clean up entities that are no longer
+        referenced by any CodeChunk or Memory node.
+
+        Returns:
+            Number of orphaned entities deleted
+        """
+        # Find and delete entities with no incoming edges
+        # This query finds Entity nodes where no other node points to them
+        result = self.graph.query(
+            """
+            MATCH (e:Entity)
+            WHERE NOT exists((e)<-[]-())
+            WITH e, e.name AS name, e.type AS type
+            DETACH DELETE e
+            RETURN count(*) AS deleted_count
+            """
+        )
+
+        if result.result_set and result.result_set[0][0]:
+            deleted = result.result_set[0][0]
+            log.debug(f"Deleted {deleted} orphaned Entity nodes")
+            return deleted
+        return 0
+
     def add_goal_node(
         self,
         goal_id: str,
@@ -1197,6 +1224,9 @@ class DatabaseManager:
     def clear_code_index(self, project_root: str | None = None) -> int:
         """Clear code index for a project or all projects.
 
+        Clears both LanceDB vectors and graph CodeChunk nodes, then
+        cleans up any orphaned Entity nodes.
+
         Args:
             project_root: If provided, only clear chunks from this project
 
@@ -1217,6 +1247,12 @@ class DatabaseManager:
                 except Exception:
                     count = 0
                 self.code_table.delete(f"project_root = '{project_root}'")
+
+                # Also clear CodeChunk nodes from graph for this project
+                self.graph.query(
+                    "MATCH (c:CodeChunk {project_root: $project_root}) DETACH DELETE c",
+                    {"project_root": project_root},
+                )
             else:
                 log.info("Clearing entire code index")
                 try:
@@ -1226,6 +1262,14 @@ class DatabaseManager:
                 # Drop and recreate table
                 self.lance_db.drop_table(self.CODE_TABLE_NAME)
                 self._init_code_table()
+
+                # Also clear ALL CodeChunk nodes from graph
+                self.graph.query("MATCH (c:CodeChunk) DETACH DELETE c")
+
+            # Clean up orphaned Entity nodes
+            orphans_deleted = self._cleanup_orphan_entities()
+            if orphans_deleted > 0:
+                log.info(f"Cleaned up {orphans_deleted} orphaned entity nodes")
 
         log.info(f"Cleared {count} code chunks")
         return count
@@ -1287,6 +1331,12 @@ class DatabaseManager:
                     "MATCH (c:CodeChunk {uuid: $uuid}) DETACH DELETE c",
                     {"uuid": uuid},
                 )
+
+            # Clean up orphaned Entity nodes that have no remaining references
+            # (neither from CodeChunks nor from Memories)
+            orphans_deleted = self._cleanup_orphan_entities()
+            if orphans_deleted > 0:
+                log.info(f"Cleaned up {orphans_deleted} orphaned entity nodes")
 
             log.info(f"Deleted {count} chunks for {filepath}")
             return count
@@ -2466,3 +2516,28 @@ class DatabaseManager:
 
         log.debug(f"Retrieved {len(projects)} projects")
         return projects
+
+    def cleanup_orphan_entities(self) -> dict[str, Any]:
+        """Manually run orphan entity cleanup.
+
+        Finds and deletes Entity nodes with no incoming edges
+        (not referenced by any Memory or CodeChunk).
+
+        Returns:
+            Dict with orphans_deleted count and any errors
+        """
+        log.info("Running manual orphan entity cleanup")
+        try:
+            with self._write_lock:
+                deleted = self._cleanup_orphan_entities()
+            return {
+                "orphans_deleted": deleted,
+                "status": "success",
+            }
+        except Exception as e:
+            log.error(f"Orphan cleanup failed: {e}")
+            return {
+                "orphans_deleted": 0,
+                "status": "error",
+                "error": str(e),
+            }
