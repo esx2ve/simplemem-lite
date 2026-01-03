@@ -115,12 +115,13 @@ def embed(text: str, config: Config | None = None) -> list[float]:
     return list(result)
 
 
-def embed_batch(texts: list[str], config: Config | None = None) -> list[list[float]]:
+def embed_batch(texts: list[str], config: Config | None = None, batch_size: int = 100) -> list[list[float]]:
     """Generate embeddings for multiple texts.
 
     Args:
         texts: List of texts to embed
         config: Optional config override
+        batch_size: Max texts per API call (default 100, Gemini's limit)
 
     Returns:
         List of embedding vectors
@@ -135,12 +136,17 @@ def embed_batch(texts: list[str], config: Config | None = None) -> list[list[flo
         embeddings = model.encode(texts, convert_to_numpy=True)
         return [e.tolist() for e in embeddings]
     else:
-        # LiteLLM: batch via API
+        # LiteLLM: batch via API with chunking to respect API limits
         from litellm import embedding
 
-        kwargs = {"model": cfg.embedding_model, "input": texts}
-        # Pass dimensions for models that support it
-        if cfg.embedding_dim:
-            kwargs["dimensions"] = cfg.embedding_dim
-        response = embedding(**kwargs)
-        return [d["embedding"] for d in response.data]
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            log.debug(f"Embedding batch {i // batch_size + 1}: {len(batch)} texts")
+            kwargs = {"model": cfg.embedding_model, "input": batch}
+            # Pass dimensions for models that support it
+            if cfg.embedding_dim:
+                kwargs["dimensions"] = cfg.embedding_dim
+            response = embedding(**kwargs)
+            all_embeddings.extend([d["embedding"] for d in response.data])
+        return all_embeddings
