@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
-from simplemem_lite.backend.services import get_memory_store
+from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem
 
@@ -225,10 +225,34 @@ async def relate_memories(request: RelateMemoriesRequest) -> dict:
 
 @router.get("/stats")
 async def get_stats() -> dict:
-    """Get memory store statistics."""
+    """Get comprehensive statistics for statusline display.
+
+    Returns memory stats, code index stats, and code_index status
+    for Claude Code statusline integration.
+    """
     try:
         store = get_memory_store()
-        return store.get_stats()
+        mem_stats = store.get_stats()
+
+        # Add code index stats for statusline
+        try:
+            code_indexer = get_code_indexer()
+            code_stats = code_indexer.get_stats()
+            mem_stats["code_files"] = code_stats.get("unique_files", 0)
+            mem_stats["code_chunks"] = code_stats.get("chunk_count", 0)
+        except Exception:
+            pass
+
+        # Add code_index status for statusline
+        try:
+            job_manager = get_job_manager()
+            code_index_status = job_manager.get_code_index_status()
+            mem_stats["watchers"] = code_index_status.get("watchers", 0)
+            mem_stats["code_index"] = code_index_status
+        except Exception:
+            pass
+
+        return mem_stats
 
     except Exception as e:
         log.error(f"Failed to get stats: {e}")
