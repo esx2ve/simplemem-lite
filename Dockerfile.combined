@@ -22,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy FalkorDB module from official image
-COPY --from=falkordb /FalkorDB /FalkorDB
+# Copy FalkorDB module from official image (path changed in v4.14+)
+COPY --from=falkordb /var/lib/falkordb /var/lib/falkordb
 
 # Set working directory
 WORKDIR /app
