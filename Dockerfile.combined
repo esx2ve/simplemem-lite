@@ -1,0 +1,67 @@
+# SimpleMem-Lite Combined Deployment
+# Co-locates FalkorDB + Backend API on the same machine
+# Eliminates LanceDB corruption from Fly.io auto-suspend
+#
+# Architecture:
+#   MCP (local, always) → Backend API + FalkorDB (this, cloud)
+#   MCP handles: stdio protocol, local file access, compression
+#   Backend handles: LanceDB vectors, FalkorDB graph, LLM calls
+
+# Stage 1: Get FalkorDB module from official image
+FROM falkordb/falkordb:latest AS falkordb
+
+# Stage 2: Build combined image
+FROM python:3.12-slim
+
+# Install system dependencies including Redis
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    curl \
+    redis-server \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy FalkorDB module from official image
+COPY --from=falkordb /FalkorDB /FalkorDB
+
+# Set working directory
+WORKDIR /app
+
+# Install uv for fast package management (pinned for reproducibility)
+RUN pip install uv==0.5.14
+
+# Copy dependency files first (better caching)
+COPY pyproject.toml ./
+COPY uv.lock* ./
+
+# Install dependencies with FalkorDB support
+RUN uv pip install --system --no-cache ".[falkordb]"
+
+# Copy application code
+COPY simplemem_lite/ ./simplemem_lite/
+
+# Copy supervisord configuration
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Create data directory for persistence (LanceDB + FalkorDB)
+RUN mkdir -p /data /var/log
+
+# Environment variables
+ENV SIMPLEMEM_DATA_DIR=/data
+ENV HOST=0.0.0.0
+ENV PORT=8420
+# Use FalkorDB graph backend (co-located)
+ENV SIMPLEMEM_GRAPH_BACKEND=falkordb
+ENV SIMPLEMEM_FALKOR_HOST=localhost
+ENV SIMPLEMEM_FALKOR_PORT=6379
+
+# Expose backend API port
+EXPOSE 8420
+
+# Health check - verify both API and FalkorDB are responsive
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf http://localhost:8420/health --max-time 5 && redis-cli -p 6379 ping | grep -q PONG || exit 1
+
+# Run supervisord to manage both processes
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
