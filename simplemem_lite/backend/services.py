@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from simplemem_lite.code_index import CodeIndexer
     from simplemem_lite.config import Config
     from simplemem_lite.db import DatabaseManager
+    from simplemem_lite.job_manager import JobManager
     from simplemem_lite.memory import MemoryStore
     from simplemem_lite.traces import HierarchicalIndexer
 
@@ -88,6 +89,19 @@ def get_hierarchical_indexer() -> "HierarchicalIndexer":
     return HierarchicalIndexer(memory_store, config)
 
 
+@lru_cache(maxsize=1)
+def get_job_manager() -> "JobManager":
+    """Get the JobManager instance (cached).
+
+    Provides background job management and status tracking.
+    """
+    from simplemem_lite.job_manager import JobManager
+
+    config = get_simplemem_config()
+    log.info("Initializing JobManager")
+    return JobManager(data_dir=config.data_dir)
+
+
 def clear_service_caches() -> None:
     """Clear all service caches (for testing)."""
     get_simplemem_config.cache_clear()
@@ -95,4 +109,5 @@ def clear_service_caches() -> None:
     get_memory_store.cache_clear()
     get_code_indexer.cache_clear()
     get_hierarchical_indexer.cache_clear()
+    get_job_manager.cache_clear()
     log.info("Service caches cleared")

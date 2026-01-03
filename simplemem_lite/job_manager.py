@@ -84,6 +84,23 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
+        # Code index status tracking for statusline
+        self._code_index_status: dict[str, Any] = {
+            "status": "idle",  # idle, indexing, watching
+            "watchers": 0,
+            "projects_watching": [],
+            "indexing": {
+                "in_progress": False,
+                "files_done": 0,
+                "files_total": 0,
+                "current_file": None,
+            },
+            "stats": {
+                "total_files": 0,
+                "total_chunks": 0,
+            },
+        }
+
         # Load persisted jobs on startup
         self._load_jobs()
 
@@ -162,12 +179,14 @@ class JobManager:
                     "progress": current.progress,
                     "message": current.progress_message or f"{current.job_type}...",
                 },
+                "code_index": self._code_index_status,
                 "updated_at": datetime.now().isoformat(),
             }
         else:
             status = {
                 "active_jobs": 0,
                 "current": None,
+                "code_index": self._code_index_status,
                 "updated_at": datetime.now().isoformat(),
             }
 
@@ -176,6 +195,74 @@ class JobManager:
             log.debug(f"Updated status file: {status.get('active_jobs', 0)} active jobs")
         except Exception as e:
             log.error(f"Failed to update status file: {e}")
+
+    def update_code_index_status(
+        self,
+        status: str | None = None,
+        watchers: int | None = None,
+        projects_watching: list[str] | None = None,
+        indexing_in_progress: bool | None = None,
+        files_done: int | None = None,
+        files_total: int | None = None,
+        current_file: str | None = None,
+        total_files: int | None = None,
+        total_chunks: int | None = None,
+    ) -> None:
+        """Update code index status for statusline display.
+
+        Args:
+            status: Overall status (idle, indexing, watching)
+            watchers: Number of active file watchers
+            projects_watching: List of project roots being watched
+            indexing_in_progress: Whether indexing is currently running
+            files_done: Files indexed so far
+            files_total: Total files to index
+            current_file: Currently indexing file path
+            total_files: Total indexed files (stats)
+            total_chunks: Total code chunks (stats)
+        """
+        if status is not None:
+            self._code_index_status["status"] = status
+        if watchers is not None:
+            self._code_index_status["watchers"] = watchers
+        if projects_watching is not None:
+            self._code_index_status["projects_watching"] = projects_watching
+
+        # Update indexing sub-dict
+        if indexing_in_progress is not None:
+            self._code_index_status["indexing"]["in_progress"] = indexing_in_progress
+        if files_done is not None:
+            self._code_index_status["indexing"]["files_done"] = files_done
+        if files_total is not None:
+            self._code_index_status["indexing"]["files_total"] = files_total
+        if current_file is not None:
+            self._code_index_status["indexing"]["current_file"] = current_file
+
+        # Update stats sub-dict
+        if total_files is not None:
+            self._code_index_status["stats"]["total_files"] = total_files
+        if total_chunks is not None:
+            self._code_index_status["stats"]["total_chunks"] = total_chunks
+
+        # Infer status if not explicitly set
+        if status is None:
+            if self._code_index_status["indexing"]["in_progress"]:
+                self._code_index_status["status"] = "indexing"
+            elif self._code_index_status["watchers"] > 0:
+                self._code_index_status["status"] = "watching"
+            else:
+                self._code_index_status["status"] = "idle"
+
+        self._update_status_file()
+        log.debug(f"Code index status updated: {self._code_index_status['status']}")
+
+    def get_code_index_status(self) -> dict[str, Any]:
+        """Get current code index status.
+
+        Returns:
+            Code index status dict
+        """
+        return self._code_index_status.copy()
 
     async def submit(
         self,

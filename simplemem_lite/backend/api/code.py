@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
-from simplemem_lite.backend.services import get_code_indexer, get_memory_store
+from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.compression import decompress_payload
 from simplemem_lite.log_config import get_logger
 
@@ -93,6 +93,20 @@ class MemoryRelatedCodeRequest(BaseModel):
 
     memory_uuid: str = Field(..., description="Memory UUID")
     limit: int = Field(default=10, ge=1, le=50)
+
+
+class CodeIndexStatusRequest(BaseModel):
+    """Request model for updating code index status."""
+
+    status: str | None = Field(default=None, description="Status: idle, indexing, watching")
+    watchers: int | None = Field(default=None, description="Number of active watchers")
+    projects_watching: list[str] | None = Field(default=None, description="Projects being watched")
+    indexing_in_progress: bool | None = Field(default=None, description="Whether indexing is running")
+    files_done: int | None = Field(default=None, description="Files indexed so far")
+    files_total: int | None = Field(default=None, description="Total files to index")
+    current_file: str | None = Field(default=None, description="Currently indexing file")
+    total_files: int | None = Field(default=None, description="Total indexed files (stats)")
+    total_chunks: int | None = Field(default=None, description="Total code chunks (stats)")
 
 
 @router.post("/index")
@@ -257,4 +271,49 @@ async def memory_related_code(request: MemoryRelatedCodeRequest) -> dict:
 
     except Exception as e:
         log.error(f"Failed to get memory-related code: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/status")
+async def update_code_index_status(request: CodeIndexStatusRequest) -> dict:
+    """Update code index status for statusline display.
+
+    Called by the MCP watcher to report indexing/watching state.
+    The status is included in the /stats endpoint response.
+    """
+    try:
+        job_manager = get_job_manager()
+        job_manager.update_code_index_status(
+            status=request.status,
+            watchers=request.watchers,
+            projects_watching=request.projects_watching,
+            indexing_in_progress=request.indexing_in_progress,
+            files_done=request.files_done,
+            files_total=request.files_total,
+            current_file=request.current_file,
+            total_files=request.total_files,
+            total_chunks=request.total_chunks,
+        )
+        log.debug(f"Code index status updated: {request.status or 'inferred'}")
+        return {
+            "status": "updated",
+            "code_index": job_manager.get_code_index_status(),
+        }
+
+    except Exception as e:
+        log.error(f"Failed to update code index status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/status")
+async def get_code_index_status() -> dict:
+    """Get current code index status for statusline display."""
+    try:
+        job_manager = get_job_manager()
+        return {
+            "code_index": job_manager.get_code_index_status(),
+        }
+
+    except Exception as e:
+        log.error(f"Failed to get code index status: {e}")
         raise HTTPException(status_code=500, detail=str(e))

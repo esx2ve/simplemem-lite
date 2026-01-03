@@ -700,6 +700,13 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
             # Job stats
             job_stats = _deps.job_manager.get_active_stats() if _deps.job_manager else {}
 
+            # Code index status (from job_manager for statusline)
+            code_index_status = (
+                _deps.job_manager.get_code_index_status()
+                if _deps.job_manager
+                else {}
+            )
+
             # Todo count (query for pending todos)
             todo_count = 0
             try:
@@ -719,10 +726,11 @@ class HookHTTPHandler(BaseHTTPRequestHandler):
                 "relations": mem_stats.get("total_relations", 0),
                 "code_files": code_stats.get("unique_files", 0),
                 "code_chunks": code_stats.get("chunk_count", 0),
-                "watchers": watcher_status.get("watching", 0),
+                "watchers": watcher_status.get("watching_count", 0),
                 "jobs_running": job_stats.get("active", 0),
                 "job_current": job_stats.get("current"),
                 "todos_pending": todo_count,
+                "code_index": code_index_status,
             })
         except Exception as e:
             log.error(f"Stats endpoint failed: {e}")
