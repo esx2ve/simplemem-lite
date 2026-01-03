@@ -9,6 +9,21 @@ import gzip
 import json
 from typing import Any
 
+# Default maximum decompressed size: 100MB
+# Can be overridden via BackendConfig.max_decompressed_size_mb
+DEFAULT_MAX_DECOMPRESSED_SIZE = 100 * 1024 * 1024
+
+
+class DecompressionLimitExceeded(ValueError):
+    """Raised when decompressed data exceeds size limit."""
+
+    def __init__(self, actual_size: int, max_size: int):
+        self.actual_size = actual_size
+        self.max_size = max_size
+        super().__init__(
+            f"Decompressed payload ({actual_size:,} bytes) exceeds limit ({max_size:,} bytes)"
+        )
+
 
 def compress_payload(data: Any) -> str:
     """Gzip compress and base64 encode data for JSON transport.
@@ -24,17 +39,29 @@ def compress_payload(data: Any) -> str:
     return base64.b64encode(compressed).decode("ascii")
 
 
-def decompress_payload(data: str) -> Any:
-    """Decode base64 and gunzip data.
+def decompress_payload(
+    data: str,
+    max_size: int = DEFAULT_MAX_DECOMPRESSED_SIZE,
+) -> Any:
+    """Decode base64 and gunzip data with size limit.
 
     Args:
         data: Base64-encoded gzip-compressed string
+        max_size: Maximum allowed decompressed size in bytes (default: 100MB)
 
     Returns:
         Original JSON-deserialized data
+
+    Raises:
+        DecompressionLimitExceeded: If decompressed data exceeds max_size
     """
     compressed = base64.b64decode(data.encode("ascii"))
     json_bytes = gzip.decompress(compressed)
+
+    # Enforce size limit to prevent compression bombs
+    if len(json_bytes) > max_size:
+        raise DecompressionLimitExceeded(len(json_bytes), max_size)
+
     return json.loads(json_bytes.decode("utf-8"))
 
 
