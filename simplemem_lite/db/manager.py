@@ -2027,7 +2027,7 @@ class DatabaseManager:
 
         # Entity type breakdown
         result = self.graph.query(
-            "MATCH (e:Entity) RETURN e.type, count(e) ORDER BY count(e) DESC"
+            "MATCH (e:Entity) RETURN e.type, count(e) AS cnt ORDER BY cnt DESC"
         )
         entity_breakdown = {}
         for record in result.result_set:
