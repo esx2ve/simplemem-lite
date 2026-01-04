@@ -2052,8 +2052,6 @@ class DatabaseManager:
     def get_pagerank_scores(
         self,
         uuids: list[str] | None = None,
-        max_iterations: int = 20,
-        damping_factor: float = 0.85,
     ) -> dict[str, float]:
         """Compute PageRank scores for Memory nodes.
 
@@ -2061,10 +2059,11 @@ class DatabaseManager:
         based on graph structure. Nodes with more high-quality incoming edges
         get higher scores.
 
+        Note: FalkorDB's algo.pageRank only accepts 2 arguments (label, relationship-type).
+        Custom iteration/damping parameters are not supported.
+
         Args:
             uuids: Optional list of UUIDs to get scores for (None = all)
-            max_iterations: PageRank iterations (default: 20)
-            damping_factor: PageRank damping factor (default: 0.85)
 
         Returns:
             Dictionary mapping UUID -> PageRank score (0.0 to 1.0)
@@ -2073,21 +2072,15 @@ class DatabaseManager:
 
         try:
             # Call FalkorDB's PageRank algorithm
-            # Note: FalkorDB uses algo.pageRank procedure
+            # FalkorDB syntax: CALL algo.pageRank(label, relationship-type)
+            # Only 2 arguments supported - no config options available
             result = self.graph.query(
                 """
-                CALL algo.pageRank('Memory', 'RELATES_TO', {
-                    maxIterations: $max_iter,
-                    dampingFactor: $damping
-                })
+                CALL algo.pageRank('Memory', 'RELATES_TO')
                 YIELD node, score
                 MATCH (m:Memory) WHERE id(m) = id(node)
                 RETURN m.uuid AS uuid, score
                 """,
-                {
-                    "max_iter": max_iterations,
-                    "damping": damping_factor,
-                },
             )
 
             scores = {}

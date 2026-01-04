@@ -8,6 +8,8 @@ P2: Git-based staleness detection for code index freshness.
 import asyncio
 import re
 import subprocess
+import threading
+import time
 import uuid as uuid_lib
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +22,11 @@ from simplemem_lite.embeddings import embed, embed_batch
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("code_index")
+
+# Rate limiting for graph operations to prevent FalkorDB SIGSEGV crashes
+# FalkorDB has thread-safety issues in Schema_AddNodeToIndex under heavy concurrent load
+GRAPH_OPS_BATCH_SIZE = 50  # Flush to graph every N operations
+GRAPH_OPS_BATCH_DELAY = 0.05  # Seconds to wait between batches (50ms)
 
 # Regex patterns for Python entity extraction
 _PYTHON_PATTERNS = {
@@ -128,6 +135,10 @@ class CodeIndexer:
         self.config = config
         # Cache pathspec objects per project root
         self._pathspec_cache: dict[str, pathspec.PathSpec] = {}
+        # Rate limiting for graph operations (prevents FalkorDB SIGSEGV)
+        self._graph_ops_lock = threading.Lock()
+        self._graph_ops_count = 0
+        self._last_graph_batch_time = 0.0
         log.info("CodeIndexer initialized")
 
     def get_stats(self) -> dict[str, Any]:
@@ -907,6 +918,25 @@ class CodeIndexer:
         log.trace(f"Extracted {len(entities)} entities from {filepath}")
         return entities
 
+    def _rate_limit_graph_op(self) -> None:
+        """Rate limit graph operations to prevent FalkorDB SIGSEGV.
+
+        FalkorDB has thread-safety issues in Schema_AddNodeToIndex when
+        many concurrent MERGE operations hit the same index. This adds
+        small delays between batches of operations to prevent crashes.
+        """
+        with self._graph_ops_lock:
+            self._graph_ops_count += 1
+            if self._graph_ops_count >= GRAPH_OPS_BATCH_SIZE:
+                # Time since last batch delay
+                elapsed = time.time() - self._last_graph_batch_time
+                if elapsed < GRAPH_OPS_BATCH_DELAY:
+                    sleep_time = GRAPH_OPS_BATCH_DELAY - elapsed
+                    time.sleep(sleep_time)
+                self._last_graph_batch_time = time.time()
+                self._graph_ops_count = 0
+                log.trace(f"Graph ops batch complete, paused {GRAPH_OPS_BATCH_DELAY}s")
+
     def _link_chunk_entities(
         self,
         chunk_uuid: str,
@@ -929,6 +959,9 @@ class CodeIndexer:
         Returns:
             Number of entities linked
         """
+        # Rate limit to prevent FalkorDB SIGSEGV under heavy load
+        self._rate_limit_graph_op()
+
         # Create CodeChunk node in graph
         self.db.add_code_chunk_node(
             uuid=chunk_uuid,
@@ -941,6 +974,8 @@ class CodeIndexer:
         # Extract and link entities from this chunk
         entities = self._extract_entities(chunk_content, filepath)
         for entity in entities:
+            # Rate limit each entity link operation
+            self._rate_limit_graph_op()
             self.db.link_code_to_entity(
                 chunk_uuid=chunk_uuid,
                 entity_name=entity["name"],
