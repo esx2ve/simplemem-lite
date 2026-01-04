@@ -37,6 +37,7 @@ class ProcessTraceRequest(BaseModel):
     trace_content: str | dict | list = Field(..., description="Trace content (raw or compressed)")
     compressed: bool = Field(default=False, description="Whether trace_content is gzip+base64")
     background: bool = Field(default=True, description="Run processing in background")
+    project_id: str | None = Field(default=None, description="Project ID for memory isolation")
 
 
 class ProcessTraceResponse(BaseModel):
@@ -120,6 +121,7 @@ async def _process_trace_task(
     job_id: str,
     session_id: str,
     trace_data: str | dict | list,
+    project_id: str | None = None,
 ) -> None:
     """Background task to process a trace."""
     try:
@@ -138,6 +140,7 @@ async def _process_trace_task(
             session_id=session_id,
             trace_content=trace_data,
             progress_callback=progress_callback,
+            project_id=project_id,
         )
 
         if result:
@@ -195,7 +198,9 @@ async def process_trace(
     if request.background:
         # Background processing
         job_id = _create_job("process_trace", request.session_id)
-        background_tasks.add_task(_process_trace_task, job_id, request.session_id, trace_data)
+        background_tasks.add_task(
+            _process_trace_task, job_id, request.session_id, trace_data, request.project_id
+        )
         return ProcessTraceResponse(
             job_id=job_id,
             status="submitted",
@@ -208,6 +213,7 @@ async def process_trace(
             result = await indexer.index_session_content(
                 session_id=request.session_id,
                 trace_content=trace_data,
+                project_id=request.project_id,
             )
 
             if result:

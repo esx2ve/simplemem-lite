@@ -1212,6 +1212,7 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
         session_id: str,
         trace_content: str | dict | list,
         progress_callback: Callable[[int, str], None] | None = None,
+        project_id: str | None = None,
     ) -> SessionIndex | None:
         """Index a trace from content directly (for cloud/remote backend).
 
@@ -1222,6 +1223,7 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
             session_id: Session UUID to index
             trace_content: Trace data (JSONL string, dict, or list)
             progress_callback: Optional callback(progress: int, message: str)
+            project_id: Optional project ID for memory isolation
 
         Returns:
             SessionIndex with created memory IDs, or None if no messages
@@ -1298,13 +1300,19 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
         report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
 
         # 3. Batch store all chunk summaries
+        chunk_metadata_base = {
+            "type": "chunk_summary",
+            "session_id": session_id,
+            "source": "claude_trace",
+        }
+        if project_id:
+            chunk_metadata_base["project_id"] = project_id
+
         chunk_items = [
             MemoryItem(
                 content=summary,
                 metadata={
-                    "type": "chunk_summary",
-                    "session_id": session_id,
-                    "source": "claude_trace",
+                    **chunk_metadata_base,
                     "message_count": len(chunk),
                 },
             )
@@ -1365,15 +1373,19 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
                 if entity_parts:
                     content += f"\n\n[Context: {' | '.join(entity_parts)}]"
 
+                msg_metadata = {
+                    "type": "message",
+                    "session_id": session_id,
+                    "source": "claude_trace",
+                    "msg_type": msg.type,
+                    **extraction.to_metadata(),
+                }
+                if project_id:
+                    msg_metadata["project_id"] = project_id
+
                 msg_items.append(MemoryItem(
                     content=content,
-                    metadata={
-                        "type": "message",
-                        "session_id": session_id,
-                        "source": "claude_trace",
-                        "msg_type": msg.type,
-                        **extraction.to_metadata(),
-                    },
+                    metadata=msg_metadata,
                 ))
 
             report(85, f"Storing {len(msg_items)} messages...")
@@ -1413,15 +1425,19 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
         session_summary = await self._summarize_session(messages, chunk_summaries)
 
         report(95, "Storing session summary...")
+        session_metadata = {
+            "type": "session_summary",
+            "session_id": session_id,
+            "source": "claude_trace",
+            "goal_id": goal_id,
+        }
+        if project_id:
+            session_metadata["project_id"] = project_id
+
         session_summary_id = self.store.store(
             MemoryItem(
                 content=session_summary,
-                metadata={
-                    "type": "session_summary",
-                    "session_id": session_id,
-                    "source": "claude_trace",
-                    "goal_id": goal_id,
-                },
+                metadata=session_metadata,
                 relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
             )
         )
@@ -1452,4 +1468,5 @@ Provide a 3-5 sentence overview covering: main goal, key accomplishments, final 
             chunk_summary_ids=chunk_ids,
             message_ids=message_ids,
             goal_id=goal_id,
+            project_id=project_id,
         )
