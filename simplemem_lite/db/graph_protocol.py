@@ -133,6 +133,16 @@ class BaseGraphBackend(ABC):
         """Initialize schema."""
         pass
 
+    def reinit_code_chunk_indexes(self) -> None:
+        """Drop and recreate CodeChunk indexes.
+
+        CRITICAL for FalkorDB: Must call after mass-deleting CodeChunk nodes
+        to prevent SIGSEGV crashes in Schema_AddNodeToIndex.
+
+        Default implementation is a no-op (not all backends need this).
+        """
+        pass
+
     def _translate_cypher(self, cypher: str) -> str:
         """Translate Cypher dialect differences if needed.
 

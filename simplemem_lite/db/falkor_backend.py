@@ -151,6 +151,34 @@ class FalkorDBBackend(BaseGraphBackend):
             # Indexes may already exist - this is fine
             log.trace(f"Index creation (may already exist): {e}")
 
+    def reinit_code_chunk_indexes(self) -> None:
+        """Drop and recreate CodeChunk indexes.
+
+        CRITICAL: Call this after mass-deleting CodeChunk nodes to prevent
+        SIGSEGV crashes in Schema_AddNodeToIndex. FalkorDB indexes can become
+        corrupted after DETACH DELETE operations on all nodes of a label.
+        """
+        log.info("Reinitializing CodeChunk indexes after mass deletion")
+
+        # Drop existing indexes (ignore errors if they don't exist)
+        try:
+            self._graph.query("DROP INDEX ON :CodeChunk(uuid)")
+        except Exception as e:
+            log.trace(f"Drop CodeChunk uuid index (may not exist): {e}")
+
+        try:
+            self._graph.query("DROP INDEX ON :CodeChunk(filepath)")
+        except Exception as e:
+            log.trace(f"Drop CodeChunk filepath index (may not exist): {e}")
+
+        # Recreate indexes
+        try:
+            self._graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.uuid)")
+            self._graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.filepath)")
+            log.info("CodeChunk indexes recreated successfully")
+        except Exception as e:
+            log.warning(f"Failed to recreate CodeChunk indexes: {e}")
+
     def reconnect(self) -> bool:
         """Attempt to reconnect to FalkorDB.
 

@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
-from simplemem_lite.backend.services import get_hierarchical_indexer
+from simplemem_lite.backend.services import get_hierarchical_indexer, get_job_manager
 from simplemem_lite.compression import decompress_payload
 from simplemem_lite.log_config import get_logger
 
@@ -275,23 +275,48 @@ async def process_trace_batch(
 
 @router.get("/job/{job_id}")
 async def get_job_status(job_id: str) -> dict:
-    """Get status of a background processing job."""
-    if job_id not in _jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    """Get status of a background processing job.
 
-    return _jobs[job_id]
+    Checks both trace jobs (in-memory) and code indexing jobs (JobManager).
+    """
+    # Check trace jobs first
+    if job_id in _jobs:
+        return _jobs[job_id]
+
+    # Check services JobManager (used by code indexing)
+    try:
+        job_manager = get_job_manager()
+        job_info = job_manager.get_status(job_id)
+        if job_info:
+            return job_info
+    except Exception as e:
+        log.debug(f"JobManager lookup failed: {e}")
+
+    raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
 
 @router.get("/jobs")
 async def list_jobs(include_completed: bool = True, limit: int = 20) -> dict:
-    """List all background jobs."""
+    """List all background jobs.
+
+    Includes both trace jobs (in-memory) and code indexing jobs (JobManager).
+    """
+    # Get trace jobs
     jobs = list(_jobs.values())
 
+    # Get code indexing jobs from services JobManager
+    try:
+        job_manager = get_job_manager()
+        code_jobs = job_manager.list_jobs(include_completed=include_completed, limit=limit)
+        jobs.extend(code_jobs)
+    except Exception as e:
+        log.debug(f"JobManager list failed: {e}")
+
     if not include_completed:
-        jobs = [j for j in jobs if j["status"] in ("pending", "running")]
+        jobs = [j for j in jobs if j.get("status") in ("pending", "running")]
 
     # Sort by created timestamp (newest first)
-    jobs.sort(key=lambda j: j["timestamps"]["created"], reverse=True)
+    jobs.sort(key=lambda j: j.get("timestamps", {}).get("created", "") or j.get("created_at", ""), reverse=True)
 
     # Apply limit
     jobs = jobs[:limit]

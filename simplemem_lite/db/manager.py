@@ -260,25 +260,45 @@ class DatabaseManager:
             self._init_code_table()
 
     def _init_code_table(self) -> None:
-        """Initialize LanceDB table for code chunks."""
+        """Initialize LanceDB table for code chunks.
+
+        Includes corruption recovery: if the table exists but is corrupted,
+        it will be dropped and recreated automatically.
+        """
         log.trace("Checking code_chunks table")
+
+        schema = pa.schema([
+            pa.field("uuid", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), self.config.embedding_dim)),
+            pa.field("content", pa.string()),
+            pa.field("filepath", pa.string()),
+            pa.field("project_root", pa.string()),
+            pa.field("start_line", pa.int32()),
+            pa.field("end_line", pa.int32()),
+        ])
+
         if self.CODE_TABLE_NAME not in self.lance_db.table_names():
             log.debug(f"Creating code_chunks table with embedding_dim={self.config.embedding_dim}")
-            schema = pa.schema([
-                pa.field("uuid", pa.string()),
-                pa.field("vector", pa.list_(pa.float32(), self.config.embedding_dim)),
-                pa.field("content", pa.string()),
-                pa.field("filepath", pa.string()),
-                pa.field("project_root", pa.string()),
-                pa.field("start_line", pa.int32()),
-                pa.field("end_line", pa.int32()),
-            ])
             self.lance_db.create_table(self.CODE_TABLE_NAME, schema=schema)
             log.info(f"LanceDB table '{self.CODE_TABLE_NAME}' created")
         else:
             log.debug(f"LanceDB table '{self.CODE_TABLE_NAME}' already exists")
 
-        self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
+        # Open table and verify it's not corrupted
+        try:
+            self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
+            # Verify table is readable with a simple operation
+            _ = self.code_table.count_rows()
+        except Exception as e:
+            log.warning(f"Code table corrupted, recreating: {e}")
+            # Table is corrupted - drop and recreate
+            try:
+                self.lance_db.drop_table(self.CODE_TABLE_NAME)
+            except Exception:
+                pass  # May fail if partially corrupted
+            self.lance_db.create_table(self.CODE_TABLE_NAME, schema=schema)
+            self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
+            log.info(f"LanceDB table '{self.CODE_TABLE_NAME}' recreated after corruption")
 
     # Keywords that indicate mutation queries (used for validation)
     MUTATION_KEYWORDS = frozenset({"CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DETACH"})
@@ -1368,25 +1388,43 @@ class DatabaseManager:
                                .limit(100000).to_list())
                 except Exception:
                     count = 0
-                self.code_table.delete(f"project_root = '{project_root}'")
+
+                # Delete with corruption recovery
+                try:
+                    self.code_table.delete(f"project_root = '{project_root}'")
+                except Exception as e:
+                    log.warning(f"Code table corrupted during delete, recreating: {e}")
+                    # Table is corrupted - drop and recreate (losing all data)
+                    try:
+                        self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                    except Exception:
+                        pass
+                    self._init_code_table()
 
                 # Also clear CodeChunk nodes from graph for this project
                 self.graph.query(
                     "MATCH (c:CodeChunk {project_root: $project_root}) DETACH DELETE c",
                     {"project_root": project_root},
                 )
+                # Reinitialize indexes to prevent FalkorDB SIGSEGV on subsequent inserts
+                self._graph_backend.reinit_code_chunk_indexes()
             else:
                 log.info("Clearing entire code index")
                 try:
                     count = self.code_table.count_rows()
                 except Exception:
                     count = 0
-                # Drop and recreate table
-                self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                # Drop and recreate table (with corruption recovery)
+                try:
+                    self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                except Exception as e:
+                    log.warning(f"Failed to drop code table (may be corrupted): {e}")
                 self._init_code_table()
 
                 # Also clear ALL CodeChunk nodes from graph
                 self.graph.query("MATCH (c:CodeChunk) DETACH DELETE c")
+                # Reinitialize indexes to prevent FalkorDB SIGSEGV on subsequent inserts
+                self._graph_backend.reinit_code_chunk_indexes()
 
             # Clean up orphaned Entity nodes
             orphans_deleted = self._cleanup_orphan_entities()
