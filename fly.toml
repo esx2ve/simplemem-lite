@@ -45,9 +45,9 @@ primary_region = "sjc"
   initial_size = "1gb"
 
 [[vm]]
-  memory = "8gb"
+  memory = "64gb"
   cpu_kind = "performance"
-  cpus = 4
+  cpus = 8
 
 # Graceful shutdown timeout (default is 5s)
 # Give LanceDB + FalkorDB time to flush pending writes before SIGKILL
