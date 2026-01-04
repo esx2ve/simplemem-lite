@@ -1,12 +1,17 @@
 """Graph backend factory with auto-detection and fallback.
 
 Provides intelligent backend selection:
-1. Try FalkorDB first (if Docker available)
-2. Fall back to KuzuDB (embedded, works everywhere)
+1. Try Memgraph first (preferred - native C++ engine, no SIGSEGV issues)
+2. Try FalkorDB if Memgraph unavailable
+3. Fall back to KuzuDB (embedded, works everywhere)
 
 Environment variables for override:
-- SIMPLEMEM_GRAPH_BACKEND: Force specific backend ('falkordb', 'kuzu')
+- SIMPLEMEM_GRAPH_BACKEND: Force specific backend ('memgraph', 'falkordb', 'kuzu')
 - SIMPLEMEM_KUZU_PATH: Override KuzuDB database path
+- SIMPLEMEM_MEMGRAPH_HOST: Memgraph host (default: localhost)
+- SIMPLEMEM_MEMGRAPH_PORT: Memgraph Bolt port (default: 7687)
+- SIMPLEMEM_MEMGRAPH_USERNAME: Memgraph username for authentication
+- SIMPLEMEM_MEMGRAPH_PASSWORD: Memgraph password for authentication
 - SIMPLEMEM_FALKOR_HOST: FalkorDB host (default: localhost)
 - SIMPLEMEM_FALKOR_PORT: FalkorDB port (default: 6379)
 - SIMPLEMEM_FALKOR_PASSWORD: FalkorDB/Redis password for authentication
@@ -29,12 +34,20 @@ FALKORDB_READY_TIMEOUT = int(os.environ.get("SIMPLEMEM_FALKOR_READY_TIMEOUT", "1
 FALKORDB_READY_INTERVAL = float(os.environ.get("SIMPLEMEM_FALKOR_READY_INTERVAL", "0.5"))  # seconds
 FALKORDB_MAX_INTERVAL = float(os.environ.get("SIMPLEMEM_FALKOR_MAX_INTERVAL", "5.0"))  # seconds (for backoff)
 
+# Memgraph startup settings
+MEMGRAPH_READY_TIMEOUT = int(os.environ.get("SIMPLEMEM_MEMGRAPH_READY_TIMEOUT", "60"))  # seconds
+MEMGRAPH_READY_INTERVAL = float(os.environ.get("SIMPLEMEM_MEMGRAPH_READY_INTERVAL", "0.5"))  # seconds
+
 # Type alias for backend names
-BackendType = Literal["falkordb", "kuzu", "auto"]
+BackendType = Literal["memgraph", "falkordb", "kuzu", "auto"]
 
 
 def create_graph_backend(
     backend: BackendType = "auto",
+    memgraph_host: str | None = None,
+    memgraph_port: int | None = None,
+    memgraph_username: str | None = None,
+    memgraph_password: str | None = None,
     falkor_host: str | None = None,
     falkor_port: int | None = None,
     falkor_password: str | None = None,
@@ -45,10 +58,14 @@ def create_graph_backend(
     Selection order:
     1. Environment variable SIMPLEMEM_GRAPH_BACKEND if set
     2. Explicit backend parameter if not "auto"
-    3. Auto-detection: FalkorDB if available, else KuzuDB
+    3. Auto-detection: Memgraph first, then FalkorDB, else KuzuDB
 
     Args:
-        backend: Backend type - "falkordb", "kuzu", or "auto"
+        backend: Backend type - "memgraph", "falkordb", "kuzu", or "auto"
+        memgraph_host: Memgraph host address (default: localhost, or SIMPLEMEM_MEMGRAPH_HOST)
+        memgraph_port: Memgraph Bolt port (default: 7687, or SIMPLEMEM_MEMGRAPH_PORT)
+        memgraph_username: Memgraph username (or SIMPLEMEM_MEMGRAPH_USERNAME)
+        memgraph_password: Memgraph password (or SIMPLEMEM_MEMGRAPH_PASSWORD)
         falkor_host: FalkorDB host address (default: localhost, or SIMPLEMEM_FALKOR_HOST)
         falkor_port: FalkorDB port (default: 6379, or SIMPLEMEM_FALKOR_PORT)
         falkor_password: FalkorDB password (or SIMPLEMEM_FALKOR_PASSWORD)
@@ -62,9 +79,19 @@ def create_graph_backend(
     """
     # Check environment override first
     env_backend = os.environ.get("SIMPLEMEM_GRAPH_BACKEND", "").lower()
-    if env_backend in ("falkordb", "kuzu"):
+    if env_backend in ("memgraph", "falkordb", "kuzu"):
         backend = env_backend
         log.info(f"Using backend from environment: {backend}")
+
+    # Override Memgraph settings from environment
+    if memgraph_host is None:
+        memgraph_host = os.environ.get("SIMPLEMEM_MEMGRAPH_HOST", "localhost")
+    if memgraph_port is None:
+        memgraph_port = int(os.environ.get("SIMPLEMEM_MEMGRAPH_PORT", "7687"))
+    if memgraph_username is None:
+        memgraph_username = os.environ.get("SIMPLEMEM_MEMGRAPH_USERNAME", "")
+    if memgraph_password is None:
+        memgraph_password = os.environ.get("SIMPLEMEM_MEMGRAPH_PASSWORD", "")
 
     # Override FalkorDB settings from environment
     if falkor_host is None:
@@ -87,6 +114,9 @@ def create_graph_backend(
     # BACKEND SELECTION
     # ══════════════════════════════════════════════════════════════════════════════
 
+    if backend == "memgraph":
+        return _create_memgraph(memgraph_host, memgraph_port, memgraph_username, memgraph_password)
+
     if backend == "falkordb":
         return _create_falkordb(falkor_host, falkor_port, falkor_password)
 
@@ -96,13 +126,18 @@ def create_graph_backend(
     # Auto-detection mode
     log.info("Auto-detecting graph backend...")
 
-    # Try FalkorDB first
+    # Try Memgraph first (preferred - no SIGSEGV issues)
+    if _is_memgraph_available(memgraph_host, memgraph_port, memgraph_username, memgraph_password):
+        log.info("Memgraph detected and healthy, using Memgraph backend")
+        return _create_memgraph(memgraph_host, memgraph_port, memgraph_username, memgraph_password)
+
+    # Try FalkorDB second
     if _is_falkordb_available(falkor_host, falkor_port, falkor_password):
         log.info("FalkorDB detected and healthy, using FalkorDB backend")
         return _create_falkordb(falkor_host, falkor_port, falkor_password)
 
     # Fall back to KuzuDB
-    log.info("FalkorDB not available, falling back to KuzuDB")
+    log.info("Memgraph and FalkorDB not available, falling back to KuzuDB")
     return _create_kuzu(kuzu_path)
 
 
@@ -301,6 +336,183 @@ def _create_kuzu(db_path: str | Path) -> GraphBackend:
         raise RuntimeError(f"KuzuDB initialization failed: {e}") from e
 
 
+def _wait_for_memgraph_ready(
+    host: str,
+    port: int,
+    username: str = "",
+    password: str = "",
+) -> bool:
+    """Wait for Memgraph to be ready.
+
+    Uses Bolt protocol connectivity check with exponential backoff.
+
+    Args:
+        host: Memgraph host
+        port: Memgraph Bolt port
+        username: Optional username
+        password: Optional password
+
+    Returns:
+        True if Memgraph is ready, False if timeout
+    """
+    start_time = time.time()
+    last_error = None
+    attempts = 0
+    current_interval = MEMGRAPH_READY_INTERVAL
+
+    while (time.time() - start_time) < MEMGRAPH_READY_TIMEOUT:
+        attempts += 1
+        try:
+            from neo4j import GraphDatabase
+
+            uri = f"bolt://{host}:{port}"
+            if username or password:
+                driver = GraphDatabase.driver(uri, auth=(username, password))
+            else:
+                driver = GraphDatabase.driver(uri)
+
+            driver.verify_connectivity()
+            driver.close()
+
+            elapsed = time.time() - start_time
+            if attempts > 1:
+                log.info(f"Memgraph ready after {elapsed:.1f}s ({attempts} attempts)")
+            else:
+                log.debug(f"Memgraph available at {host}:{port}")
+            return True
+
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            # Connection errors - Memgraph not started yet
+            if "connection refused" in error_msg or "connect" in error_msg:
+                if attempts == 1:
+                    log.debug(f"Waiting for Memgraph to start at {host}:{port}...")
+                time.sleep(current_interval)
+                current_interval = min(current_interval * 1.5, 5.0)
+                continue
+
+            # Other errors - don't retry
+            log.debug(f"Memgraph not available at {host}:{port}: {e}")
+            return False
+
+    # Timeout reached
+    elapsed = time.time() - start_time
+    log.warning(
+        f"Memgraph not ready after {elapsed:.1f}s ({attempts} attempts): {last_error}"
+    )
+    return False
+
+
+def _is_memgraph_available(
+    host: str,
+    port: int,
+    username: str = "",
+    password: str = "",
+    timeout: float = 2.0,
+) -> bool:
+    """Check if Memgraph is available and ready to accept queries.
+
+    Uses socket-level pre-check before neo4j driver to avoid long hangs.
+
+    Args:
+        host: Memgraph host
+        port: Memgraph Bolt port
+        username: Optional username
+        password: Optional password
+        timeout: Connection timeout in seconds (default: 2.0)
+
+    Returns:
+        True if Memgraph is reachable and ready
+    """
+    import socket
+
+    try:
+        from neo4j import GraphDatabase
+    except ImportError:
+        log.debug("neo4j package not installed")
+        return False
+
+    # Quick socket-level check first (avoids neo4j driver's long timeout)
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+    except (socket.timeout, socket.error, OSError) as e:
+        log.debug(f"Memgraph socket check failed at {host}:{port}: {e}")
+        return False
+
+    # Socket is open, now verify with neo4j driver
+    try:
+        uri = f"bolt://{host}:{port}"
+        if username or password:
+            driver = GraphDatabase.driver(
+                uri,
+                auth=(username, password),
+                connection_timeout=timeout,
+            )
+        else:
+            driver = GraphDatabase.driver(uri, connection_timeout=timeout)
+
+        driver.verify_connectivity()
+
+        # Verify with a simple query
+        with driver.session() as session:
+            session.run("RETURN 1").consume()
+
+        driver.close()
+        log.debug(f"Memgraph verified at {host}:{port}")
+        return True
+
+    except Exception as e:
+        log.debug(f"Memgraph not available at {host}:{port}: {e}")
+        return False
+
+
+def _create_memgraph(
+    host: str,
+    port: int,
+    username: str = "",
+    password: str = "",
+) -> GraphBackend:
+    """Create Memgraph backend.
+
+    Args:
+        host: Memgraph host
+        port: Memgraph Bolt port
+        username: Optional username
+        password: Optional password
+
+    Returns:
+        MemgraphBackend instance
+
+    Raises:
+        RuntimeError: If connection fails
+    """
+    from simplemem_lite.db.memgraph_backend import create_memgraph_backend
+
+    # Wait for Memgraph to be ready
+    if not _wait_for_memgraph_ready(host, port, username, password):
+        raise RuntimeError(
+            f"Memgraph not ready at {host}:{port} after {MEMGRAPH_READY_TIMEOUT}s"
+        )
+
+    try:
+        backend = create_memgraph_backend(host, port, username, password)
+
+        # Explicit health check after creation
+        if hasattr(backend, 'health_check'):
+            if not backend.health_check():
+                raise RuntimeError("Memgraph health check failed after backend creation")
+
+        log.info(f"Memgraph backend initialized and verified at {host}:{port}")
+        return backend
+
+    except Exception as e:
+        log.error(f"Failed to create Memgraph backend: {e}")
+        raise RuntimeError(f"Memgraph initialization failed: {e}") from e
+
+
 def get_backend_info() -> dict:
     """Get information about available backends.
 
@@ -308,6 +520,11 @@ def get_backend_info() -> dict:
         Dict with availability status for each backend
     """
     info = {
+        "memgraph": {
+            "installed": False,
+            "available": False,
+            "error": None,
+        },
         "falkordb": {
             "installed": False,
             "available": False,
@@ -321,6 +538,14 @@ def get_backend_info() -> dict:
         "active": None,
         "env_override": os.environ.get("SIMPLEMEM_GRAPH_BACKEND"),
     }
+
+    # Check Memgraph (preferred)
+    try:
+        import neo4j  # noqa: F401
+        info["memgraph"]["installed"] = True
+        info["memgraph"]["available"] = _is_memgraph_available("localhost", 7687)
+    except ImportError as e:
+        info["memgraph"]["error"] = str(e)
 
     # Check FalkorDB
     try:
@@ -338,8 +563,10 @@ def get_backend_info() -> dict:
     except ImportError as e:
         info["kuzu"]["error"] = str(e)
 
-    # Determine which would be active
-    if info["falkordb"]["available"]:
+    # Determine which would be active (priority: memgraph > falkordb > kuzu)
+    if info["memgraph"]["available"]:
+        info["active"] = "memgraph"
+    elif info["falkordb"]["available"]:
         info["active"] = "falkordb"
     elif info["kuzu"]["available"]:
         info["active"] = "kuzu"

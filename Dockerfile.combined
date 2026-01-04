@@ -1,30 +1,40 @@
 # SimpleMem-Lite Combined Deployment
-# Co-locates FalkorDB + Backend API on the same machine
+# Co-locates Memgraph + Backend API on the same machine
 # Eliminates LanceDB corruption from Fly.io auto-suspend
 #
 # Architecture:
-#   MCP (local, always) → Backend API + FalkorDB (this, cloud)
+#   MCP (local, always) → Backend API + Memgraph (this, cloud)
 #   MCP handles: stdio protocol, local file access, compression
-#   Backend handles: LanceDB vectors, FalkorDB graph, LLM calls
+#   Backend handles: LanceDB vectors, Memgraph graph, LLM calls
+#
+# Memgraph replaces FalkorDB to eliminate SIGSEGV crashes in
+# Schema_AddNodeToIndex after DETACH DELETE operations.
 
-# Stage 1: Get FalkorDB module from official image
-# Using v4.16.0 - fixes various crash bugs in 4.14.x series
-FROM falkordb/falkordb:v4.16.0 AS falkordb
+# Stage 1: Memgraph with MAGE algorithms
+FROM memgraph/memgraph-mage:latest AS memgraph
 
 # Stage 2: Build combined image
 FROM python:3.12-slim
 
-# Install system dependencies including Redis
+# Install system dependencies (no Redis needed - Memgraph uses Bolt protocol)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     curl \
-    redis-server \
     supervisor \
+    libssl3 \
+    libcurl4 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy FalkorDB module from official image (path changed in v4.14+)
-COPY --from=falkordb /var/lib/falkordb /var/lib/falkordb
+# Copy Memgraph binaries and libraries from official image
+# Note: memgraph-mage has binary at /usr/lib/memgraph/memgraph (not /usr/bin)
+COPY --from=memgraph /usr/lib/memgraph /usr/lib/memgraph
+
+# Create symlink for convenient access and supervisord compatibility
+RUN ln -s /usr/lib/memgraph/memgraph /usr/bin/memgraph
+
+# Set library path for Memgraph
+ENV LD_LIBRARY_PATH=/usr/lib/memgraph:$LD_LIBRARY_PATH
 
 # Set working directory
 WORKDIR /app
@@ -36,8 +46,8 @@ RUN pip install uv==0.5.14
 COPY pyproject.toml ./
 COPY uv.lock* ./
 
-# Install dependencies with FalkorDB support
-RUN uv pip install --system --no-cache ".[falkordb]"
+# Install dependencies with Memgraph support (neo4j driver)
+RUN uv pip install --system --no-cache ".[memgraph]"
 
 # Copy application code
 COPY simplemem_lite/ ./simplemem_lite/
@@ -45,24 +55,24 @@ COPY simplemem_lite/ ./simplemem_lite/
 # Copy supervisord configuration
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Create data directory for persistence (LanceDB + FalkorDB)
+# Create data directory for persistence (LanceDB + Memgraph WAL)
 RUN mkdir -p /data /var/log
 
 # Environment variables
 ENV SIMPLEMEM_DATA_DIR=/data
 ENV HOST=0.0.0.0
 ENV PORT=8420
-# Use FalkorDB graph backend (co-located)
-ENV SIMPLEMEM_GRAPH_BACKEND=falkordb
-ENV SIMPLEMEM_FALKOR_HOST=localhost
-ENV SIMPLEMEM_FALKOR_PORT=6379
+# Use Memgraph graph backend (co-located)
+ENV SIMPLEMEM_GRAPH_BACKEND=memgraph
+ENV SIMPLEMEM_MEMGRAPH_HOST=localhost
+ENV SIMPLEMEM_MEMGRAPH_PORT=7687
 
-# Expose backend API port
+# Expose backend API port (Memgraph Bolt port is internal only)
 EXPOSE 8420
 
-# Health check - verify both API and FalkorDB are responsive
+# Health check - verify API is responsive (Memgraph checked internally)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:8420/health --max-time 5 && redis-cli -p 6379 ping | grep -q PONG || exit 1
+    CMD curl -sf http://localhost:8420/health --max-time 5 || exit 1
 
 # Run supervisord to manage both processes
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

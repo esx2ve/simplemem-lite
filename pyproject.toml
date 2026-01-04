@@ -49,13 +49,16 @@ local = [
 falkordb = [
     "falkordb>=1.0.0",
 ]
+memgraph = [
+    "neo4j>=5.0.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
 ]
 all = [
-    "simplemem-lite[local,falkordb,dev]",
+    "simplemem-lite[local,falkordb,memgraph,dev]",
 ]
 
 [project.scripts]

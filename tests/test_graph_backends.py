@@ -1,6 +1,6 @@
 """Tests for graph backend abstraction layer.
 
-Tests both FalkorDB and KuzuDB backends through the common GraphBackend protocol.
+Tests FalkorDB, KuzuDB, and Memgraph backends through the common GraphBackend protocol.
 """
 
 import tempfile
@@ -173,6 +173,49 @@ class TestFalkorDBBackend:
         assert isinstance(falkor_backend, GraphBackend)
 
 
+class TestMemgraphBackend:
+    """Test Memgraph backend implementation."""
+
+    @pytest.fixture
+    def memgraph_backend(self):
+        """Create Memgraph backend if available."""
+        try:
+            from simplemem_lite.db.memgraph_backend import MemgraphBackend, is_memgraph_available
+        except ImportError:
+            pytest.skip("neo4j package not installed")
+
+        if not is_memgraph_available():
+            pytest.skip("Memgraph server not running")
+
+        backend = MemgraphBackend()
+        backend.init_schema()
+        yield backend
+        backend.close()
+
+    def test_backend_name(self, memgraph_backend):
+        """Should return 'memgraph'."""
+        assert memgraph_backend.backend_name == "memgraph"
+
+    def test_health_check(self, memgraph_backend):
+        """Health check should pass."""
+        assert memgraph_backend.health_check() is True
+
+    def test_simple_query(self, memgraph_backend):
+        """Should execute simple Cypher."""
+        result = memgraph_backend.query("RETURN 1 AS num")
+        assert len(result) == 1
+        assert result.result_set[0][0] == 1
+
+    def test_protocol_compliance(self, memgraph_backend):
+        """MemgraphBackend should implement GraphBackend protocol."""
+        assert isinstance(memgraph_backend, GraphBackend)
+
+    def test_reinit_code_chunk_indexes_noop(self, memgraph_backend):
+        """reinit_code_chunk_indexes should be a no-op for Memgraph."""
+        # Should not raise - just a no-op
+        memgraph_backend.reinit_code_chunk_indexes()
+
+
 class TestGraphFactory:
     """Test graph factory auto-detection."""
 
@@ -180,12 +223,13 @@ class TestGraphFactory:
         """Should return backend availability info."""
         info = get_backend_info()
 
+        assert "memgraph" in info
         assert "falkordb" in info
         assert "kuzu" in info
         assert "active" in info
 
         # At least one should be installed
-        assert info["falkordb"]["installed"] or info["kuzu"]["installed"]
+        assert info["memgraph"]["installed"] or info["falkordb"]["installed"] or info["kuzu"]["installed"]
 
     def test_create_kuzu_backend(self):
         """Should create KuzuDB backend when forced."""
@@ -214,7 +258,7 @@ class TestGraphFactory:
                 backend="auto",
                 kuzu_path=Path(tmpdir) / "test_db",
             )
-            assert backend.backend_name in ("falkordb", "kuzu")
+            assert backend.backend_name in ("memgraph", "falkordb", "kuzu")
             assert backend.health_check()
 
 

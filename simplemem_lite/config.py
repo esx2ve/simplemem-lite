@@ -68,7 +68,21 @@ class Config:
         default_factory=lambda: _get_env("LOCAL_MODEL", "all-MiniLM-L6-v2")
     )
 
-    # FalkorDB connection settings (use os.getenv directly to support both prefixed and unprefixed)
+    # Memgraph connection settings (preferred graph backend)
+    memgraph_host: str = field(
+        default_factory=lambda: os.getenv("SIMPLEMEM_MEMGRAPH_HOST", os.getenv("SIMPLEMEM_LITE_MEMGRAPH_HOST", "localhost"))
+    )
+    memgraph_port: int = field(
+        default_factory=lambda: int(os.getenv("SIMPLEMEM_MEMGRAPH_PORT", os.getenv("SIMPLEMEM_LITE_MEMGRAPH_PORT", "7687")))
+    )
+    memgraph_username: str = field(
+        default_factory=lambda: os.getenv("SIMPLEMEM_MEMGRAPH_USERNAME", os.getenv("SIMPLEMEM_LITE_MEMGRAPH_USERNAME", ""))
+    )
+    memgraph_password: str = field(
+        default_factory=lambda: os.getenv("SIMPLEMEM_MEMGRAPH_PASSWORD", os.getenv("SIMPLEMEM_LITE_MEMGRAPH_PASSWORD", ""))
+    )
+
+    # FalkorDB connection settings (legacy, use os.getenv directly to support both prefixed and unprefixed)
     falkor_host: str = field(
         default_factory=lambda: os.getenv("SIMPLEMEM_FALKOR_HOST", os.getenv("SIMPLEMEM_LITE_FALKOR_HOST", "localhost"))
     )
@@ -182,6 +196,7 @@ class Config:
         log.debug(f"summary_model={self.summary_model}")
         log.debug(f"use_local_embeddings={self.use_local_embeddings}")
         log.debug(f"embedding_dim={self.embedding_dim}")
+        log.debug(f"memgraph_host={self.memgraph_host}, memgraph_port={self.memgraph_port}, memgraph_password={'***' if self.memgraph_password else 'None'}")
         log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}, falkor_password={'***' if self.falkor_password else 'None'}")
         log.debug(f"code_index_enabled={self.code_index_enabled}")
         log.debug(f"code_index_patterns={self.code_index_patterns}")
