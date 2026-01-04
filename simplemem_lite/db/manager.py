@@ -2063,7 +2063,7 @@ class DatabaseManager:
             self.graph.query("MATCH (n) DETACH DELETE n")
 
             # Recreate indexes
-            self._init_graph_indexes()
+            self._graph_backend.init_schema()
 
             # Drop and recreate LanceDB table
             log.debug("RESET_ALL: Dropping LanceDB table")
