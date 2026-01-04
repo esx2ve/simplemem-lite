@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from simplemem_lite.db import DatabaseManager
     from simplemem_lite.job_manager import JobManager
     from simplemem_lite.memory import MemoryStore
+    from simplemem_lite.projects import ProjectManager
     from simplemem_lite.traces import HierarchicalIndexer
 
 log = get_logger("backend.services")
@@ -102,6 +103,19 @@ def get_job_manager() -> "JobManager":
     return JobManager(data_dir=config.data_dir)
 
 
+@lru_cache(maxsize=1)
+def get_project_manager() -> "ProjectManager":
+    """Get the ProjectManager instance (cached).
+
+    Manages project bootstrap status and metadata.
+    """
+    from simplemem_lite.projects import ProjectManager
+
+    config = get_simplemem_config()
+    log.info("Initializing ProjectManager")
+    return ProjectManager(config)
+
+
 def clear_service_caches() -> None:
     """Clear all service caches (for testing)."""
     get_simplemem_config.cache_clear()
@@ -110,6 +124,7 @@ def clear_service_caches() -> None:
     get_code_indexer.cache_clear()
     get_hierarchical_indexer.cache_clear()
     get_job_manager.cache_clear()
+    get_project_manager.cache_clear()
     log.info("Service caches cleared")
 
 
