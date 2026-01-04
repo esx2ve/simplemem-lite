@@ -10,7 +10,7 @@ import re
 import subprocess
 import uuid as uuid_lib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pathspec
 
@@ -327,6 +327,7 @@ class CodeIndexer:
         patterns: list[str] | None = None,
         clear_existing: bool = True,
         yield_interval: int = 5,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> dict[str, Any]:
         """Async version of index_directory that yields to event loop.
 
@@ -338,6 +339,7 @@ class CodeIndexer:
             patterns: Glob patterns to match (default: from config)
             clear_existing: Whether to clear existing index for this root
             yield_interval: Yield to event loop every N files (default: 5)
+            progress_callback: Optional callback for progress updates (percent, message)
 
         Returns:
             Dict with indexing stats
@@ -350,7 +352,7 @@ class CodeIndexer:
         patterns = patterns or self.config.code_patterns_list
         log.info(f"Async indexing directory: {root} with patterns: {patterns}")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Clear existing index in executor (DB operation)
         if clear_existing:
@@ -378,6 +380,7 @@ class CodeIndexer:
         total_chunks = 0
         files_indexed = 0
         errors = []
+        total_files = len(files)
 
         for i, file_path in enumerate(files):
             try:
@@ -388,12 +391,20 @@ class CodeIndexer:
                 total_chunks += chunks
                 files_indexed += 1
 
-                if files_indexed % 10 == 0:
-                    log.debug(f"Progress: {files_indexed}/{len(files)} files indexed")
-
             except Exception as e:
                 log.error(f"Failed to index {file_path}: {e}")
                 errors.append({"file": str(file_path), "error": str(e)})
+
+            # Report progress (isolated from indexing to prevent callback errors affecting results)
+            if progress_callback:
+                try:
+                    pct = int((i + 1) / total_files * 100) if total_files else 100
+                    rel_path = str(file_path.relative_to(root))
+                    progress_callback(pct, f"Indexing {rel_path} ({i + 1}/{total_files})")
+                except Exception as cb_err:
+                    log.debug(f"progress_callback failed: {cb_err}")
+            elif files_indexed % 10 == 0:
+                log.debug(f"Progress: {files_indexed}/{total_files} files indexed")
 
             # Yield to event loop periodically to allow health checks and API requests
             if (i + 1) % yield_interval == 0:
@@ -490,6 +501,7 @@ class CodeIndexer:
         files: list[dict[str, Any]],
         clear_existing: bool = True,
         yield_interval: int = 5,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> dict[str, Any]:
         """Async version of index_files_content that yields to event loop.
 
@@ -501,13 +513,14 @@ class CodeIndexer:
             files: List of dicts with {path, content} keys
             clear_existing: Whether to clear existing index for this root
             yield_interval: Yield to event loop every N files (default: 5)
+            progress_callback: Optional callback for progress updates (percent, message)
 
         Returns:
             Dict with indexing stats
         """
         log.info(f"Async indexing {len(files)} files from content for {project_root}")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         if clear_existing:
             cleared = await loop.run_in_executor(
@@ -522,12 +535,13 @@ class CodeIndexer:
         files_indexed = 0
         errors = []
 
-        for i, file_info in enumerate(files):
-            filepath = file_info.get("path", "")
-            content = file_info.get("content", "")
+        # Pre-filter processable files for accurate progress
+        processable = [f for f in files if f.get("path") and f.get("content")]
+        total_files = len(processable)
 
-            if not filepath or not content:
-                continue
+        for i, file_info in enumerate(processable):
+            filepath = file_info["path"]
+            content = file_info["content"]
 
             try:
                 # Run blocking content indexing in thread pool
@@ -536,9 +550,18 @@ class CodeIndexer:
                 )
                 total_chunks += chunks
                 files_indexed += 1
+
             except Exception as e:
                 log.error(f"Failed to index {filepath}: {e}")
                 errors.append({"file": filepath, "error": str(e)})
+
+            # Report progress (isolated from indexing to prevent callback errors affecting results)
+            if progress_callback:
+                try:
+                    pct = int((i + 1) / total_files * 100) if total_files else 100
+                    progress_callback(pct, f"Indexing {filepath} ({i + 1}/{total_files})")
+                except Exception as cb_err:
+                    log.debug(f"progress_callback failed: {cb_err}")
 
             # Yield to event loop periodically to allow health checks and API requests
             if (i + 1) % yield_interval == 0:

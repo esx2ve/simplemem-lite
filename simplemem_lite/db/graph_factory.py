@@ -13,6 +13,7 @@ Environment variables for override:
 """
 
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +21,13 @@ from simplemem_lite.db.graph_protocol import GraphBackend
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("graph_factory")
+
+# FalkorDB startup can take time when loading AOF data
+# These settings control how long we wait for it to be ready
+# 120s default handles large AOF files (consensus: GPT-5.2 + DeepSeek recommended 120-300s)
+FALKORDB_READY_TIMEOUT = int(os.environ.get("SIMPLEMEM_FALKOR_READY_TIMEOUT", "120"))  # seconds
+FALKORDB_READY_INTERVAL = float(os.environ.get("SIMPLEMEM_FALKOR_READY_INTERVAL", "0.5"))  # seconds
+FALKORDB_MAX_INTERVAL = float(os.environ.get("SIMPLEMEM_FALKOR_MAX_INTERVAL", "5.0"))  # seconds (for backoff)
 
 # Type alias for backend names
 BackendType = Literal["falkordb", "kuzu", "auto"]
@@ -98,8 +106,91 @@ def create_graph_backend(
     return _create_kuzu(kuzu_path)
 
 
+def _wait_for_redis_ready(host: str, port: int, password: str | None = None) -> bool:
+    """Wait for Redis/FalkorDB to finish loading and be ready.
+
+    CRITICAL: Uses Redis-level PING command instead of graph queries.
+    Graph queries during AOF loading can cause SIGSEGV crashes in FalkorDB.
+    This function is safe to call during the loading phase.
+
+    Uses exponential backoff with jitter to reduce load during long AOF replays.
+
+    Args:
+        host: Redis/FalkorDB host
+        port: Redis/FalkorDB port
+        password: Optional Redis password
+
+    Returns:
+        True if Redis is ready, False if timeout or unavailable
+    """
+    import redis
+
+    start_time = time.time()
+    last_error = None
+    attempts = 0
+    current_interval = FALKORDB_READY_INTERVAL
+
+    while (time.time() - start_time) < FALKORDB_READY_TIMEOUT:
+        attempts += 1
+        try:
+            # Use raw Redis client for PING - safe during loading
+            r = redis.Redis(host=host, port=port, password=password, socket_timeout=5)
+            r.ping()  # Returns True if ready, raises if loading
+
+            elapsed = time.time() - start_time
+            if attempts > 1:
+                log.info(f"Redis ready after {elapsed:.1f}s ({attempts} attempts)")
+            else:
+                log.debug(f"Redis available at {host}:{port}")
+            return True
+
+        except redis.exceptions.BusyLoadingError:
+            # Redis is loading AOF/RDB - this is expected, wait and retry
+            if attempts == 1:
+                log.info(f"Redis is loading data at {host}:{port}, waiting...")
+            time.sleep(current_interval)
+            # Exponential backoff with cap
+            current_interval = min(current_interval * 1.5, FALKORDB_MAX_INTERVAL)
+            continue
+
+        except Exception as e:
+            last_error = e
+            error_msg = str(e).lower()
+
+            # Case-insensitive check for loading state (consensus fix)
+            if "loading" in error_msg or "busy" in error_msg:
+                if attempts == 1:
+                    log.info(f"Redis is loading data at {host}:{port}, waiting...")
+                time.sleep(current_interval)
+                current_interval = min(current_interval * 1.5, FALKORDB_MAX_INTERVAL)
+                continue
+
+            # Connection errors - Redis not started yet
+            if "connection refused" in error_msg or "connect" in error_msg:
+                if attempts == 1:
+                    log.debug(f"Waiting for Redis to start at {host}:{port}...")
+                time.sleep(current_interval)
+                current_interval = min(current_interval * 1.5, FALKORDB_MAX_INTERVAL)
+                continue
+
+            # Other errors - don't retry
+            log.debug(f"Redis not available at {host}:{port}: {e}")
+            return False
+
+    # Timeout reached
+    elapsed = time.time() - start_time
+    log.warning(
+        f"Redis not ready after {elapsed:.1f}s ({attempts} attempts): {last_error}"
+    )
+    return False
+
+
 def _is_falkordb_available(host: str, port: int, password: str | None = None) -> bool:
-    """Check if FalkorDB is available.
+    """Check if FalkorDB is available and ready to accept queries.
+
+    Two-phase check (consensus recommendation):
+    1. Wait for Redis to be ready (using safe PING command)
+    2. Verify FalkorDB graph module is functional
 
     Args:
         host: FalkorDB host
@@ -107,28 +198,40 @@ def _is_falkordb_available(host: str, port: int, password: str | None = None) ->
         password: Optional Redis password
 
     Returns:
-        True if FalkorDB is reachable
+        True if FalkorDB is reachable and ready
     """
     try:
         from falkordb import FalkorDB
-
-        db = FalkorDB(host=host, port=port, password=password)
-        graph = db.select_graph("simplemem_health_check")
-        graph.query("RETURN 1")
-        log.debug(f"FalkorDB available at {host}:{port}")
-        return True
-
     except ImportError:
         log.debug("FalkorDB package not installed")
         return False
 
+    # Phase 1: Wait for Redis to be ready (safe during loading)
+    if not _wait_for_redis_ready(host, port, password):
+        return False
+
+    # Phase 2: Verify FalkorDB module is functional (Redis is now ready)
+    try:
+        db = FalkorDB(host=host, port=port, password=password)
+        graph = db.select_graph("simplemem_health_check")
+        graph.query("RETURN 1")
+        log.debug(f"FalkorDB module verified at {host}:{port}")
+        return True
+
     except Exception as e:
-        log.debug(f"FalkorDB not available at {host}:{port}: {e}")
+        log.debug(f"FalkorDB module not available at {host}:{port}: {e}")
         return False
 
 
 def _create_falkordb(host: str, port: int, password: str | None = None) -> GraphBackend:
-    """Create FalkorDB backend.
+    """Create FalkorDB backend with safe startup synchronization.
+
+    Two-phase approach (consensus recommendation):
+    1. Wait for Redis to be ready using PING (safe during AOF loading)
+    2. Create backend and verify with health check
+
+    This prevents SIGSEGV crashes that occur when graph queries are
+    sent while FalkorDB is still loading AOF data.
 
     Args:
         host: FalkorDB host
@@ -139,13 +242,28 @@ def _create_falkordb(host: str, port: int, password: str | None = None) -> Graph
         FalkorDBBackend instance
 
     Raises:
-        RuntimeError: If connection fails
+        RuntimeError: If connection fails after timeout
     """
-    try:
-        from simplemem_lite.db.falkor_backend import create_falkor_backend
+    from simplemem_lite.db.falkor_backend import create_falkor_backend
 
+    # Phase 1: Wait for Redis to be ready (safe during loading)
+    # This is CRITICAL - graph queries during loading cause SIGSEGV
+    if not _wait_for_redis_ready(host, port, password):
+        raise RuntimeError(
+            f"FalkorDB/Redis not ready at {host}:{port} after {FALKORDB_READY_TIMEOUT}s"
+        )
+
+    # Phase 2: Create backend (Redis is now ready)
+    try:
         backend = create_falkor_backend(host, port, password)
-        log.info(f"FalkorDB backend initialized at {host}:{port}")
+
+        # Phase 3: Explicit health check after creation (handles lazy init)
+        # FalkorDB client may be lazy - force a query to verify connection
+        if hasattr(backend, 'health_check'):
+            if not backend.health_check():
+                raise RuntimeError("FalkorDB health check failed after backend creation")
+
+        log.info(f"FalkorDB backend initialized and verified at {host}:{port}")
         return backend
 
     except Exception as e:

@@ -4,6 +4,8 @@ The MCP thin layer reads code files locally, compresses them,
 and sends the content here for indexing.
 """
 
+from collections.abc import Callable
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -142,7 +144,10 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
             job_manager = get_job_manager()
 
             async def _index_job(
-                proj_root: str, files: list[dict], clear: bool
+                proj_root: str,
+                files: list[dict],
+                clear: bool,
+                progress_callback: Callable[[int, str], None] | None = None,
             ) -> dict:
                 """Background job wrapper for indexing."""
                 log.info(f"Background job: index_code starting for {proj_root}")
@@ -150,6 +155,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
                     project_root=proj_root,
                     files=files,
                     clear_existing=clear,
+                    progress_callback=progress_callback,
                 )
                 log.info(
                     f"Background job: index_code complete: "
