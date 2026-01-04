@@ -369,6 +369,7 @@ class HierarchicalIndexer:
         ctx=None,
         session_path: Path | str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        project_id: str | None = None,
     ) -> SessionIndex | None:
         """Index a Claude Code session with hierarchical summaries.
 
@@ -383,6 +384,7 @@ class HierarchicalIndexer:
             ctx: Optional MCP Context for progress reporting
             session_path: Optional path to session file (bypasses find_session lookup)
             progress_callback: Optional callback(progress: int, message: str) for job progress
+            project_id: Optional project ID for memory isolation (inferred from session_path if None)
 
         Returns:
             SessionIndex with created memory IDs, or None if session not found
@@ -411,6 +413,15 @@ class HierarchicalIndexer:
             if not session_path:
                 log.error(f"Session {session_id} not found by parser")
                 return None
+
+        # Infer project_id from session_path if not provided
+        if not project_id:
+            from simplemem_lite.projects_utils import infer_project_from_session_path
+            project_id = infer_project_from_session_path(session_path)
+            if project_id:
+                log.debug(f"Inferred project_id from session path: {project_id}")
+            else:
+                log.debug("Could not infer project_id from session path")
 
         # Acquire lock if SessionStateDB available (prevents race condition during UPSERT)
         lock_acquired = False
@@ -492,13 +503,19 @@ class HierarchicalIndexer:
             await report(70, f"Generated {len(chunk_summaries)} summaries, batch storing...")
 
             # 3. Batch store all chunk summaries (single embedding call!)
+            chunk_metadata_base = {
+                "type": "chunk_summary",
+                "session_id": session_id,
+                "source": "claude_trace",
+            }
+            if project_id:
+                chunk_metadata_base["project_id"] = project_id
+
             chunk_items = [
                 MemoryItem(
                     content=summary,
                     metadata={
-                        "type": "chunk_summary",
-                        "session_id": session_id,
-                        "source": "claude_trace",
+                        **chunk_metadata_base,
                         "message_count": len(chunk),
                     },
                 )
@@ -576,15 +593,19 @@ class HierarchicalIndexer:
                     if entity_parts:
                         content += f"\n\n[Context: {' | '.join(entity_parts)}]"
 
+                    msg_metadata = {
+                        "type": "message",
+                        "session_id": session_id,
+                        "source": "claude_trace",
+                        "msg_type": msg.type,
+                        **extraction.to_metadata(),
+                    }
+                    if project_id:
+                        msg_metadata["project_id"] = project_id
+
                     msg_items.append(MemoryItem(
                         content=content,
-                        metadata={
-                            "type": "message",
-                            "session_id": session_id,
-                            "source": "claude_trace",
-                            "msg_type": msg.type,
-                            **extraction.to_metadata(),
-                        },
+                        metadata=msg_metadata,
                     ))
 
                 await report(85, f"Storing {len(msg_items)} messages...")
@@ -633,15 +654,19 @@ class HierarchicalIndexer:
             session_summary = await self._summarize_session(messages, chunk_summaries)
 
             await report(95, "Storing session summary...")
+            session_metadata = {
+                "type": "session_summary",
+                "session_id": session_id,
+                "source": "claude_trace",
+                "goal_id": goal_id,
+            }
+            if project_id:
+                session_metadata["project_id"] = project_id
+
             session_summary_id = self.store.store(
                 MemoryItem(
                     content=session_summary,
-                    metadata={
-                        "type": "session_summary",
-                        "session_id": session_id,
-                        "source": "claude_trace",
-                        "goal_id": goal_id,
-                    },
+                    metadata=session_metadata,
                     relations=[{"target_id": cid, "type": "contains"} for cid in chunk_ids],
                 )
             )
@@ -709,7 +734,7 @@ class HierarchicalIndexer:
                 chunk_summary_ids=chunk_ids,
                 message_ids=message_ids,
                 goal_id=goal_id,
-                project_id=project_dir,
+                project_id=project_id,  # Use canonical path, not encoded dir
             )
 
         finally:
@@ -835,15 +860,25 @@ class HierarchicalIndexer:
             messages = [msg for _, msg in new_messages]
             interesting = [m for m in messages if self._is_interesting(m)][:20]
 
+            # Get canonical project_id from project_root
+            from simplemem_lite.projects_utils import get_project_id
+            project_id = get_project_id(project_root) if project_root else None
+
             stored_count = 0
             if interesting:
+                msg_metadata_base = {
+                    "type": "message",
+                    "session_id": session_id,
+                    "source": "claude_trace_delta",
+                }
+                if project_id:
+                    msg_metadata_base["project_id"] = project_id
+
                 msg_items = [
                     MemoryItem(
                         content=msg.content[:2000],
                         metadata={
-                            "type": "message",
-                            "session_id": session_id,
-                            "source": "claude_trace_delta",
+                            **msg_metadata_base,
                             "msg_type": msg.type,
                         },
                     )
