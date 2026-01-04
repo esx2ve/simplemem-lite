@@ -318,9 +318,19 @@ class DatabaseManager:
         return self.graph.query(query)
 
     def _serialize_graph_value(self, value: Any) -> Any:
-        """Serialize FalkorDB graph objects to JSON-safe Python types.
+        """Serialize graph objects to JSON-safe Python types.
 
-        Handles Node, Edge, Path objects from FalkorDB query results.
+        Handles Node, Edge, Path objects from both FalkorDB and neo4j/Memgraph.
+
+        FalkorDB objects have:
+        - Node: .properties (dict), .labels
+        - Edge: .properties (dict), .relation
+        - Path: .nodes() method, .edges() method
+
+        Neo4j/Memgraph objects have:
+        - Node: dict-like access (keys(), items()), .labels
+        - Relationship: dict-like access, .type
+        - Path: .nodes (property), .relationships (property)
 
         Args:
             value: Any value from a query result
@@ -328,7 +338,7 @@ class DatabaseManager:
         Returns:
             JSON-serializable Python value
         """
-        # Check for FalkorDB Node
+        # Check for FalkorDB Node (has .properties attribute)
         if hasattr(value, 'properties') and hasattr(value, 'labels'):
             return {
                 "_type": "node",
@@ -336,7 +346,15 @@ class DatabaseManager:
                 "properties": dict(value.properties) if value.properties else {},
             }
 
-        # Check for FalkorDB Edge
+        # Check for Neo4j/Memgraph Node (dict-like with .labels, no .properties)
+        if hasattr(value, 'labels') and hasattr(value, 'keys') and not hasattr(value, 'properties'):
+            return {
+                "_type": "node",
+                "labels": list(value.labels) if value.labels else [],
+                "properties": dict(value),  # neo4j Node is dict-like
+            }
+
+        # Check for FalkorDB Edge (has .properties and .relation)
         if hasattr(value, 'properties') and hasattr(value, 'relation'):
             return {
                 "_type": "edge",
@@ -344,12 +362,28 @@ class DatabaseManager:
                 "properties": dict(value.properties) if value.properties else {},
             }
 
-        # Check for FalkorDB Path
-        if hasattr(value, 'nodes') and hasattr(value, 'edges'):
+        # Check for Neo4j/Memgraph Relationship (dict-like with .type, no .relation)
+        if hasattr(value, 'type') and hasattr(value, 'keys') and not hasattr(value, 'relation'):
+            return {
+                "_type": "edge",
+                "relation": value.type,  # neo4j uses .type instead of .relation
+                "properties": dict(value),  # neo4j Relationship is dict-like
+            }
+
+        # Check for FalkorDB Path (has .nodes() and .edges() methods)
+        if hasattr(value, 'nodes') and hasattr(value, 'edges') and callable(getattr(value, 'nodes', None)):
             return {
                 "_type": "path",
                 "nodes": [self._serialize_graph_value(n) for n in value.nodes()],
                 "edges": [self._serialize_graph_value(e) for e in value.edges()],
+            }
+
+        # Check for Neo4j/Memgraph Path (has .nodes and .relationships properties)
+        if hasattr(value, 'nodes') and hasattr(value, 'relationships') and not callable(getattr(value, 'nodes', None)):
+            return {
+                "_type": "path",
+                "nodes": [self._serialize_graph_value(n) for n in value.nodes],
+                "edges": [self._serialize_graph_value(e) for e in value.relationships],
             }
 
         # Handle lists recursively
