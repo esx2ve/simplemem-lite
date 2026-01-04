@@ -1568,6 +1568,7 @@ async def ask_memories(
     query: str,
     max_memories: int = 8,
     max_hops: int = 2,
+    project_id: str | None = None,
 ) -> dict:
     """Ask a question and get an LLM-synthesized answer from memory graph.
 
@@ -1587,16 +1588,18 @@ async def ask_memories(
         query: Natural language question
         max_memories: Maximum memories to include in context (default: 8)
         max_hops: Maximum graph traversal depth (default: 2)
+        project_id: Optional project identifier for cross-project isolation
 
     Returns:
         {answer, memories_used, cross_session_insights, confidence, sources}
     """
-    log.info(f"Tool: ask_memories called (query='{query[:50]}...')")
+    log.info(f"Tool: ask_memories called (query='{query[:50]}...', project={project_id})")
 
     result = await _deps.store.ask_memories(
         query=query,
         max_memories=max_memories,
         max_hops=max_hops,
+        project_id=project_id,
     )
 
     log.info(f"Tool: ask_memories complete: confidence={result['confidence']}")
