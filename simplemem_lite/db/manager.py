@@ -338,6 +338,45 @@ class DatabaseManager:
         Returns:
             JSON-serializable Python value
         """
+        # Get class info for explicit type detection (neo4j objects need this)
+        value_type = type(value)
+        type_name = value_type.__name__
+        module_name = value_type.__module__ if hasattr(value_type, '__module__') else ''
+
+        # ══════════════════════════════════════════════════════════════════════════════
+        # EXPLICIT NEO4J/MEMGRAPH TYPE DETECTION (must come first!)
+        # The hasattr-based checks below can fail for neo4j objects because:
+        # 1. neo4j 5.x removed .properties attribute (now dict-like only)
+        # 2. Mapping ABC inheritance may not be detected reliably by hasattr
+        # ══════════════════════════════════════════════════════════════════════════════
+
+        if module_name.startswith('neo4j.graph'):
+            if type_name == 'Node':
+                # Neo4j Node: dict-like with .labels (frozenset)
+                return {
+                    "_type": "node",
+                    "labels": list(value.labels) if hasattr(value, 'labels') and value.labels else [],
+                    "properties": dict(value),  # Node is dict-like in neo4j 5.x
+                }
+            elif type_name == 'Relationship':
+                # Neo4j Relationship: dict-like with .type (string)
+                return {
+                    "_type": "edge",
+                    "relation": value.type if hasattr(value, 'type') else "RELATED",
+                    "properties": dict(value),  # Relationship is dict-like
+                }
+            elif type_name == 'Path':
+                # Neo4j Path: has .nodes and .relationships properties
+                return {
+                    "_type": "path",
+                    "nodes": [self._serialize_graph_value(n) for n in value.nodes],
+                    "edges": [self._serialize_graph_value(r) for r in value.relationships],
+                }
+
+        # ══════════════════════════════════════════════════════════════════════════════
+        # FALLBACK: HASATTR-BASED DETECTION FOR FALKORDB AND OTHER BACKENDS
+        # ══════════════════════════════════════════════════════════════════════════════
+
         # Check for FalkorDB Node (has .properties attribute)
         if hasattr(value, 'properties') and hasattr(value, 'labels'):
             return {
@@ -347,6 +386,7 @@ class DatabaseManager:
             }
 
         # Check for Neo4j/Memgraph Node (dict-like with .labels, no .properties)
+        # This is a fallback for neo4j versions not caught by module check
         if hasattr(value, 'labels') and hasattr(value, 'keys') and not hasattr(value, 'properties'):
             return {
                 "_type": "node",
@@ -363,6 +403,7 @@ class DatabaseManager:
             }
 
         # Check for Neo4j/Memgraph Relationship (dict-like with .type, no .relation)
+        # This is a fallback for neo4j versions not caught by module check
         if hasattr(value, 'type') and hasattr(value, 'keys') and not hasattr(value, 'relation'):
             return {
                 "_type": "edge",
@@ -379,6 +420,7 @@ class DatabaseManager:
             }
 
         # Check for Neo4j/Memgraph Path (has .nodes and .relationships properties)
+        # This is a fallback for neo4j versions not caught by module check
         if hasattr(value, 'nodes') and hasattr(value, 'relationships') and not callable(getattr(value, 'nodes', None)):
             return {
                 "_type": "path",
