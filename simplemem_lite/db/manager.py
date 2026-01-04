@@ -2131,12 +2131,10 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Compute PageRank scores for Memory nodes.
 
-        Uses FalkorDB's built-in PageRank algorithm to compute node importance
-        based on graph structure. Nodes with more high-quality incoming edges
-        get higher scores.
-
-        Note: FalkorDB's algo.pageRank only accepts 2 arguments (label, relationship-type).
-        Custom iteration/damping parameters are not supported.
+        Delegates to the graph backend's PageRank implementation:
+        - FalkorDB: algo.pageRank()
+        - Memgraph: pagerank.get() via MAGE
+        - KuzuDB: degree-based fallback
 
         Args:
             uuids: Optional list of UUIDs to get scores for (None = all)
@@ -2147,21 +2145,8 @@ class DatabaseManager:
         log.trace("Computing PageRank scores")
 
         try:
-            # Call FalkorDB's PageRank algorithm
-            # FalkorDB syntax: CALL algo.pageRank(label, relationship-type)
-            # Only 2 arguments supported - no config options available
-            result = self.graph.query(
-                """
-                CALL algo.pageRank('Memory', 'RELATES_TO')
-                YIELD node, score
-                MATCH (m:Memory) WHERE id(m) = id(node)
-                RETURN m.uuid AS uuid, score
-                """,
-            )
-
-            scores = {}
-            for record in result.result_set:
-                scores[record[0]] = record[1]
+            # Delegate to graph backend (handles FalkorDB/Memgraph/KuzuDB differences)
+            scores = self._graph_backend.get_pagerank_scores()
 
             log.debug(f"PageRank computed for {len(scores)} nodes")
 

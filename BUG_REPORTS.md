@@ -1,92 +1,96 @@
----
-  Bug Report: Code indexing entity/relation counts don't match Cypher query results
+ ---
+  Bug Report: Processed session memories exist in graph but are not searchable/queryable
 
   Environment
 
   - simplemem MCP server (PROD mode)
-  - Project indexed: /weka/home-shimon/repo/3dtex
+  - Project: /weka/home-shimon/repo/3dtex
 
   Steps Performed
 
-  1. Indexed directory:
-  index_directory(
-    path="/weka/home-shimon/repo/3dtex",
-    patterns=["**/*.py", "**/*.yaml", "**/*.yml"],
-    clear_existing=true
-  )
-  Result: {"files_indexed": 420, "chunks_created": 5507}
+  1. Processed two session traces:
+  process_trace(session_id="01db03c9-ed8a-4395-8482-9e1be68e31f8")
+  # Result: {"session_summary_id": "f7534919-99f6-4ec6-a4ee-706480169aa3", "chunk_count": 9, "message_count": 4}
 
-  2. Queried stats:
+  process_trace(session_id="372b8ec5-fd6d-4297-ab6e-a58b82d1d059")
+  # Result: {"session_summary_id": "decb058c-b15f-412c-b653-612d728f24ca", "chunk_count": 2, "message_count": 1}
+
+  2. Verified memories exist via stats:
   get_stats()
-  Result:
-  {
-    "total_memories": 0,
-    "total_relations": 10554,
-    "types_breakdown": {
-      "function": 823,
-      "class": 766,
-      "module": 430,
-      "file": 414
-    },
-    "entities": 2433,
-    "code_chunks": 6366
-  }
+  # Returns: {"total_memories": 19, ...}
 
-  3. Tested semantic search:
-  search_code(
-    query="VAE encoder forward pass",
-    project_root="/weka/home-shimon/repo/3dtex",
-    limit=5
-  )
-  Result: Returns 5 relevant code chunks with scores 0.28-0.43. ✅ Working.
+  3. Verified memories exist via Cypher count:
+  run_cypher_query(query="count_memories", params={})
+  # Returns: {"results": [{"count": 19}]}
 
-  4. Tested Cypher queries:
+  run_cypher_query(query="count_by_type", params={"type": "session_summary"})
+  # Returns: {"results": [{"count": 2}]}
 
-  | Query              | Params                    | Result                             |
-  |--------------------|---------------------------|------------------------------------|
-  | count_by_type      | {"type": "function"}      | {"count": 0}                       |
-  | count_by_type      | {"type": "class"}         | {"count": 0}                       |
-  | count_by_type      | {"type": "file"}          | {"count": 0}                       |
-  | count_by_type      | {"type": "module"}        | {"count": 0}                       |
-  | count_memories     | {}                        | {"count": 0}                       |
-  | recent_memories    | {"limit": 10}             | {"results": []}                    |
-  | get_entities       | {"limit": 20}             | {"error": "Internal server error"} |
-  | get_entity_by_name | {"name": "ColorFieldVAE"} | {"error": "Internal server error"} |
+  run_cypher_query(query="count_by_type", params={"type": "chunk_summary"})
+  # Returns: {"results": [{"count": 11}]}
 
-  5. Queried code_stats:
-  code_stats(project_root="/weka/home-shimon/repo/3dtex")
-  Result: {"chunk_count": 6366, "unique_files": 0}
+  run_cypher_query(query="count_by_type", params={"type": "message"})
+  # Returns: {"results": [{"count": 5}]}
 
-  Observed Inconsistencies
+  4. Attempted semantic search - returns empty:
+  search_memories(query="simplemem indexing session", limit=10)
+  # Returns: {"results": []}
 
-  | Metric    | get_stats() | Cypher Query             |
-  |-----------|-------------|--------------------------|
-  | Entities  | 2,433       | 0                        |
-  | Relations | 10,554      | N/A (no nodes to relate) |
-  | Functions | 823         | 0                        |
-  | Classes   | 766         | 0                        |
-  | Modules   | 430         | 0                        |
-  | Files     | 414         | 0                        |
-  | Memories  | 0           | 0                        |
+  search_memories(query="What was done in this session?", limit=10)
+  # Returns: {"results": []}
 
-  | Metric         | index_directory result | code_stats()       |
-  |----------------|------------------------|--------------------|
-  | Files indexed  | 420                    | unique_files: 0    |
-  | Chunks created | 5,507                  | chunk_count: 6,366 |
+  5. Attempted ask_memories - returns empty:
+  ask_memories(query="What was done in this session?", project_id="/weka/home-shimon/repo/3dtex")
+  # Returns: {"answer": "I don't have any relevant memories...", "memories_used": 0}
 
-  Graph Schema Reference
+  ask_memories(query="What was done in this session?")  # without project_id
+  # Returns: {"answer": "I don't have any relevant memories...", "memories_used": 0}
 
-  From get_graph_schema(), these node types are defined:
-  - Entity with properties: name, type, version, created_at, last_modified
-  - CodeChunk with properties: uuid, filepath, project_root, start_line, end_line, created_at
-  - Relationship REFERENCES from Memory|CodeChunk to Entity
+  6. Attempted reason_memories - returns empty:
+  reason_memories(query="What issues were discovered with simplemem?", project_id="/weka/home-shimon/repo/3dtex")
+  # Returns: {"conclusions": [], "count": 0}
+
+  7. Attempted to retrieve memory content via Cypher - internal errors:
+  run_cypher_query(query="recent_memories", params={"limit": 5})
+  # Returns: {"error": "Internal server error"}
+
+  run_cypher_query(query="get_memory_by_type", params={"type": "session_summary", "limit": 2})
+  # Returns: {"error": "Internal server error"}
+
+  run_cypher_query(query="get_memory", params={"uuid": "f7534919-99f6-4ec6-a4ee-706480169aa3"})
+  # Returns: {"error": "Internal server error"}
+
+  Summary Table
+
+  | Operation                       | Expected            | Actual                 |
+  |---------------------------------|---------------------|------------------------|
+  | count_memories                  | 19                  | 19 ✅                  |
+  | count_by_type (session_summary) | 2                   | 2 ✅                   |
+  | count_by_type (chunk_summary)   | 11                  | 11 ✅                  |
+  | count_by_type (message)         | 5                   | 5 ✅                   |
+  | search_memories                 | Results             | Empty array            |
+  | ask_memories                    | Answer with sources | "no relevant memories" |
+  | reason_memories                 | Conclusions         | Empty array            |
+  | recent_memories                 | Memory list         | Internal server error  |
+  | get_memory                      | Memory content      | Internal server error  |
+  | get_memory_by_type              | Memory list         | Internal server error  |
+
+  Observed Behavior
+
+  1. process_trace reports success with chunk/message counts
+  2. get_stats and count_* Cypher queries confirm 19 Memory nodes exist
+  3. Semantic search (search_memories) returns no results
+  4. LLM-based queries (ask_memories, reason_memories) find no memories
+  5. Cypher queries that return memory content fail with "Internal server error"
+  6. Cypher queries that return counts succeed
 
   Facts
 
-  1. search_code returns results → vector index contains data
-  2. get_stats shows 2,433 entities and 10,554 relations → some storage has this metadata
-  3. All Cypher queries return 0 or error → graph database has no nodes
-  4. code_stats returns unique_files: 0 after indexing 420 files
-  5. No process_trace or store_memory was called - only index_directory
+  - 19 Memory nodes exist in FalkorDB graph (confirmed by count queries)
+  - Memory nodes have types: session_summary(2), chunk_summary(11), message(5), unknown(1)
+  - Vector search returns empty for any query
+  - Any Cypher template that would return memory content/properties fails
+  - Only aggregate queries (counts) succeed
 
   ---
+
