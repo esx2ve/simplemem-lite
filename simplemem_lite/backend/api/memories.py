@@ -257,3 +257,26 @@ async def get_stats() -> dict:
     except Exception as e:
         log.error(f"Failed to get stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/reset")
+async def reset_all(confirm: bool = False) -> dict:
+    """Reset all memories, vectors, and relationships.
+
+    WARNING: This is a destructive operation that cannot be undone.
+
+    Args:
+        confirm: Must be True to proceed with reset
+    """
+    if not confirm:
+        return {"error": "Must set confirm=True to reset all data"}
+
+    try:
+        store = get_memory_store()
+        log.warning("API: reset_all called with confirm=True")
+        result = store.reset_all()
+        log.warning(f"API: reset_all complete: {result}")
+        return result
+    except Exception as e:
+        log.error(f"Failed to reset: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
