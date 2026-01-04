@@ -203,6 +203,7 @@ class MemoryStore:
             mem_type = item.metadata.get("type", "fact")
             source = item.metadata.get("source", "user")
             session_id = item.metadata.get("session_id")
+            project_id = item.metadata.get("project_id")
             created_at = int(time.time())
 
             batch_data.append({
@@ -211,6 +212,7 @@ class MemoryStore:
                 "type": mem_type,
                 "source": source,
                 "session_id": session_id,
+                "project_id": project_id,
                 "created_at": created_at,
                 "relations": item.relations,
                 "metadata": item.metadata,
@@ -235,6 +237,7 @@ class MemoryStore:
                         source=data["source"],
                         session_id=data["session_id"],
                         created_at=data["created_at"],
+                        project_id=data["project_id"],
                     )
 
                     # Phase 2: Write to vectors
