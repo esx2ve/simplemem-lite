@@ -1661,9 +1661,13 @@ async def index_directory(
     if background:
         # Submit to background job manager
         async def _index_directory_job(p: str, pats: list[str] | None, clear: bool) -> dict:
-            """Background job wrapper for index_directory."""
+            """Background job wrapper for index_directory.
+
+            Uses async version that yields to event loop, preventing server unresponsiveness.
+            """
             log.info(f"Background job: index_directory starting for path {p}")
-            result = _deps.code_indexer.index_directory(p, pats, clear)
+            # Use async version that yields to event loop during indexing
+            result = await _deps.code_indexer.index_directory_async(p, pats, clear)
             log.info(f"Background job: index_directory complete: {result.get('files_indexed', 0)} files")
             return result
 

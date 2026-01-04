@@ -5,6 +5,7 @@ P1: Entity linking bridges code chunks with memory graph.
 P2: Git-based staleness detection for code index freshness.
 """
 
+import asyncio
 import re
 import subprocess
 import uuid as uuid_lib
@@ -320,6 +321,109 @@ class CodeIndexer:
             "errors": errors if errors else None,
         }
 
+    async def index_directory_async(
+        self,
+        root_path: str | Path,
+        patterns: list[str] | None = None,
+        clear_existing: bool = True,
+        yield_interval: int = 5,
+    ) -> dict[str, Any]:
+        """Async version of index_directory that yields to event loop.
+
+        This prevents blocking the FastAPI server during large indexing operations.
+        Heavy operations (file I/O, embedding, DB writes) run in thread pool executor.
+
+        Args:
+            root_path: Root directory to index
+            patterns: Glob patterns to match (default: from config)
+            clear_existing: Whether to clear existing index for this root
+            yield_interval: Yield to event loop every N files (default: 5)
+
+        Returns:
+            Dict with indexing stats
+        """
+        root = Path(root_path).resolve()
+        if not root.exists():
+            log.error(f"Directory does not exist: {root}")
+            return {"error": f"Directory not found: {root}", "files_indexed": 0}
+
+        patterns = patterns or self.config.code_patterns_list
+        log.info(f"Async indexing directory: {root} with patterns: {patterns}")
+
+        loop = asyncio.get_event_loop()
+
+        # Clear existing index in executor (DB operation)
+        if clear_existing:
+            cleared = await loop.run_in_executor(
+                None, self.db.clear_code_index, str(root)
+            )
+            log.info(f"Cleared {cleared} existing chunks")
+
+        # Find all matching files (file system operation in executor)
+        def _find_files():
+            files = []
+            for pattern in patterns:
+                for f in root.glob(pattern):
+                    if f.is_file() and not self._should_exclude(f, root):
+                        files.append(f)
+            return sorted(set(files))
+
+        files = await loop.run_in_executor(None, _find_files)
+        log.info(f"Found {len(files)} files to index")
+
+        if not files:
+            return {"files_indexed": 0, "chunks_created": 0, "project_root": str(root)}
+
+        # Process files with periodic yielding
+        total_chunks = 0
+        files_indexed = 0
+        errors = []
+
+        for i, file_path in enumerate(files):
+            try:
+                # Run blocking file indexing in thread pool
+                chunks = await loop.run_in_executor(
+                    None, self._index_file, file_path, root
+                )
+                total_chunks += chunks
+                files_indexed += 1
+
+                if files_indexed % 10 == 0:
+                    log.debug(f"Progress: {files_indexed}/{len(files)} files indexed")
+
+            except Exception as e:
+                log.error(f"Failed to index {file_path}: {e}")
+                errors.append({"file": str(file_path), "error": str(e)})
+
+            # Yield to event loop periodically to allow health checks and API requests
+            if (i + 1) % yield_interval == 0:
+                await asyncio.sleep(0)
+
+        log.info(f"Async indexing complete: {files_indexed} files, {total_chunks} chunks")
+
+        # Save project index metadata (in executor)
+        def _save_metadata():
+            git_info = self._get_git_info(root)
+            commit_hash = git_info.get("commit_hash") if git_info.get("is_git_repo") else None
+            self.db.set_project_index_metadata(
+                project_root=str(root),
+                commit_hash=commit_hash,
+                file_count=files_indexed,
+                chunk_count=total_chunks,
+            )
+            return git_info, commit_hash
+
+        git_info, commit_hash = await loop.run_in_executor(None, _save_metadata)
+
+        return {
+            "files_indexed": files_indexed,
+            "chunks_created": total_chunks,
+            "project_root": str(root),
+            "commit_hash": commit_hash,
+            "is_git_repo": git_info.get("is_git_repo", False),
+            "errors": errors if errors else None,
+        }
+
     def index_files_content(
         self,
         project_root: str,
@@ -372,6 +476,75 @@ class CodeIndexer:
                 errors.append({"file": filepath, "error": str(e)})
 
         log.info(f"Content indexing complete: {files_indexed} files, {total_chunks} chunks")
+
+        return {
+            "files_indexed": files_indexed,
+            "chunks_created": total_chunks,
+            "project_root": project_root,
+            "errors": errors if errors else None,
+        }
+
+    async def index_files_content_async(
+        self,
+        project_root: str,
+        files: list[dict[str, Any]],
+        clear_existing: bool = True,
+        yield_interval: int = 5,
+    ) -> dict[str, Any]:
+        """Async version of index_files_content that yields to event loop.
+
+        This prevents blocking the FastAPI server during large indexing operations.
+        Heavy operations (embedding, DB writes) run in thread pool executor.
+
+        Args:
+            project_root: Project root path (for identification)
+            files: List of dicts with {path, content} keys
+            clear_existing: Whether to clear existing index for this root
+            yield_interval: Yield to event loop every N files (default: 5)
+
+        Returns:
+            Dict with indexing stats
+        """
+        log.info(f"Async indexing {len(files)} files from content for {project_root}")
+
+        loop = asyncio.get_event_loop()
+
+        if clear_existing:
+            cleared = await loop.run_in_executor(
+                None, self.db.clear_code_index, project_root
+            )
+            log.info(f"Cleared {cleared} existing chunks")
+
+        if not files:
+            return {"files_indexed": 0, "chunks_created": 0, "project_root": project_root}
+
+        total_chunks = 0
+        files_indexed = 0
+        errors = []
+
+        for i, file_info in enumerate(files):
+            filepath = file_info.get("path", "")
+            content = file_info.get("content", "")
+
+            if not filepath or not content:
+                continue
+
+            try:
+                # Run blocking content indexing in thread pool
+                chunks = await loop.run_in_executor(
+                    None, self._index_content, content, filepath, project_root
+                )
+                total_chunks += chunks
+                files_indexed += 1
+            except Exception as e:
+                log.error(f"Failed to index {filepath}: {e}")
+                errors.append({"file": filepath, "error": str(e)})
+
+            # Yield to event loop periodically to allow health checks and API requests
+            if (i + 1) % yield_interval == 0:
+                await asyncio.sleep(0)
+
+        log.info(f"Async content indexing complete: {files_indexed} files, {total_chunks} chunks")
 
         return {
             "files_indexed": files_indexed,

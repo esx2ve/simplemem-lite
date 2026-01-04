@@ -114,6 +114,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
     """Index code files for semantic search.
 
     The MCP layer reads files locally and sends content here.
+    Runs in background by default to return immediately.
     """
     require_project_id(request.project_root, "index_code")
     try:
@@ -135,7 +136,44 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
             })
 
         indexer = get_code_indexer()
-        result = indexer.index_files_content(
+
+        if request.background:
+            # Submit background job and return immediately
+            job_manager = get_job_manager()
+
+            async def _index_job(
+                proj_root: str, files: list[dict], clear: bool
+            ) -> dict:
+                """Background job wrapper for indexing."""
+                log.info(f"Background job: index_code starting for {proj_root}")
+                result = await indexer.index_files_content_async(
+                    project_root=proj_root,
+                    files=files,
+                    clear_existing=clear,
+                )
+                log.info(
+                    f"Background job: index_code complete: "
+                    f"{result.get('files_indexed', 0)} files"
+                )
+                return result
+
+            job_id = await job_manager.submit(
+                "index_code",
+                _index_job,
+                request.project_root,
+                processed_files,
+                request.clear_existing,
+            )
+            log.info(f"index_code submitted as background job {job_id}")
+            return {
+                "job_id": job_id,
+                "status": "submitted",
+                "message": f"Use job_status('{job_id}') to check progress",
+            }
+
+        # Synchronous execution (not recommended for large codebases)
+        log.debug("index_code running synchronously")
+        result = await indexer.index_files_content_async(
             project_root=request.project_root,
             files=processed_files,
             clear_existing=request.clear_existing,

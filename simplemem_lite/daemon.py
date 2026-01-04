@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from simplemem_lite.config import Config
+from simplemem_lite.job_manager import JobManager
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("daemon")
@@ -60,6 +61,7 @@ class SimplememDaemon:
         self._project_manager = None
         self._bootstrap = None
         self._trace_indexer = None
+        self._job_manager = None
 
         # Method dispatch table
         self._handlers: dict[str, callable] = {}
@@ -108,6 +110,9 @@ class SimplememDaemon:
         log.debug("Creating HierarchicalIndexer (trace indexer)...")
         self._trace_indexer = HierarchicalIndexer(self._memory_store, self.config)
 
+        log.debug("Creating JobManager...")
+        self._job_manager = JobManager()
+
         # Register all handlers
         self._register_handlers()
 
@@ -146,6 +151,11 @@ class SimplememDaemon:
         # Trace operations
         self._handlers["process_trace"] = self._handle_process_trace
 
+        # Job management
+        self._handlers["job_status"] = self._handle_job_status
+        self._handlers["list_jobs"] = self._handle_list_jobs
+        self._handlers["cancel_job"] = self._handle_cancel_job
+
         # Daemon-specific
         self._handlers["ping"] = self._handle_ping
         self._handlers["daemon_status"] = self._handle_daemon_status
@@ -169,6 +179,34 @@ class SimplememDaemon:
             "request_count": self._request_count,
             "handlers": list(self._handlers.keys()),
         }
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # JOB MANAGEMENT HANDLERS
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _handle_job_status(self, params: dict) -> dict:
+        """Get status of a background job."""
+        job_id = params["job_id"]
+        log.debug(f"job_status: {job_id}")
+        return await self._job_manager.get_status(job_id)
+
+    async def _handle_list_jobs(self, params: dict) -> dict:
+        """List all background jobs."""
+        include_completed = params.get("include_completed", True)
+        limit = params.get("limit", 20)
+        log.debug(f"list_jobs: include_completed={include_completed}, limit={limit}")
+        jobs = await self._job_manager.list_jobs(
+            include_completed=include_completed,
+            limit=limit,
+        )
+        return {"jobs": jobs}
+
+    async def _handle_cancel_job(self, params: dict) -> dict:
+        """Cancel a running background job."""
+        job_id = params["job_id"]
+        log.debug(f"cancel_job: {job_id}")
+        cancelled = await self._job_manager.cancel(job_id)
+        return {"cancelled": cancelled, "job_id": job_id}
 
     async def _handle_store_memory(self, params: dict) -> dict:
         """Store a memory."""
@@ -289,15 +327,42 @@ class SimplememDaemon:
         return {"results": results}
 
     async def _handle_index_directory(self, params: dict) -> dict:
-        """Index a directory for code search."""
-        log.info(f"index_directory: {params['path']}")
+        """Index a directory for code search.
 
-        result = self._code_indexer.index_directory(
-            root_path=params["path"],
-            patterns=params.get("patterns"),
-            clear_existing=params.get("clear_existing", True),
+        Runs in background by default to return immediately.
+        Use job_status to check progress.
+        """
+        path = params["path"]
+        patterns = params.get("patterns")
+        clear_existing = params.get("clear_existing", True)
+        background = params.get("background", True)
+
+        log.info(f"index_directory: {path} (background={background})")
+
+        if background:
+            # Submit to background job manager - returns immediately
+            async def _index_job(p: str, pats: list[str] | None, clear: bool) -> dict:
+                """Background job wrapper using async indexer."""
+                log.info(f"Background job: index_directory starting for {p}")
+                result = await self._code_indexer.index_directory_async(p, pats, clear)
+                log.info(f"Background job: index_directory complete: {result.get('files_indexed', 0)} files")
+                return result
+
+            job_id = await self._job_manager.submit(
+                "index_directory", _index_job, path, patterns, clear_existing
+            )
+            log.info(f"index_directory submitted as background job {job_id}")
+            return {
+                "job_id": job_id,
+                "status": "submitted",
+                "message": f"Use job_status('{job_id}') to check progress",
+            }
+
+        # Synchronous execution (not recommended for large codebases)
+        log.debug("index_directory running synchronously")
+        result = await self._code_indexer.index_directory_async(
+            path, patterns, clear_existing
         )
-
         log.info(f"index_directory complete: {result.get('files_indexed', 0)} files, {result.get('chunks_created', 0)} chunks")
         return result
 
@@ -347,14 +412,78 @@ class SimplememDaemon:
         return self._watcher_manager.get_status()
 
     async def _handle_bootstrap_project(self, params: dict) -> dict:
-        """Bootstrap a project for SimpleMem features."""
-        log.info(f"bootstrap_project: {params['project_root']}")
+        """Bootstrap a project for SimpleMem features.
 
+        Runs indexing in background by default to return immediately.
+        Use job_status to check progress.
+        """
         project_root = params["project_root"]
         index_code = params.get("index_code", True)
         start_watcher = params.get("start_watcher", True)
+        background = params.get("background", True)
 
-        # Use Bootstrap class which handles everything
+        log.info(f"bootstrap_project: {project_root} (background={background})")
+
+        if background and index_code:
+            # Submit indexing to background job - return immediately
+            async def _bootstrap_job(root: str, watcher: bool) -> dict:
+                """Background job for bootstrap with async indexing."""
+                log.info(f"Background job: bootstrap_project starting for {root}")
+
+                # Detect project info (fast)
+                info = self._bootstrap.detect_project_info(root)
+                results: dict = {
+                    "project_root": root,
+                    "success": False,
+                    "project_info": {
+                        "name": info.name,
+                        "type": info.project_type,
+                        "description": info.description,
+                        "frameworks": info.frameworks,
+                        "source": info.source,
+                    },
+                }
+
+                # Index code using async version
+                try:
+                    index_result = await self._code_indexer.index_directory_async(root)
+                    results["index"] = {
+                        "files_indexed": index_result.get("files_indexed", 0),
+                        "chunks_created": index_result.get("chunks_created", 0),
+                    }
+                    log.info(f"Background job: indexed {results['index']['files_indexed']} files")
+                except Exception as e:
+                    log.error(f"Background job: indexing failed: {e}")
+                    results["index"] = {"error": str(e)}
+
+                # Start watcher
+                if watcher:
+                    try:
+                        watcher_result = self._watcher_manager.start_watching(root)
+                        results["watcher"] = watcher_result
+                    except Exception as e:
+                        log.error(f"Background job: watcher failed: {e}")
+                        results["watcher"] = {"error": str(e)}
+
+                # Mark project as bootstrapped
+                self._project_manager.mark_bootstrapped(root)
+                results["success"] = True
+                log.info(f"Background job: bootstrap_project complete for {root}")
+                return results
+
+            job_id = await self._job_manager.submit(
+                "bootstrap_project", _bootstrap_job, project_root, start_watcher
+            )
+            log.info(f"bootstrap_project submitted as background job {job_id}")
+            return {
+                "job_id": job_id,
+                "status": "submitted",
+                "message": f"Use job_status('{job_id}') to check progress",
+                "project_root": project_root,
+            }
+
+        # Synchronous execution (not recommended)
+        log.debug("bootstrap_project running synchronously")
         result = self._bootstrap.bootstrap_project(
             project_root=project_root,
             index_code=index_code,
