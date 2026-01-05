@@ -81,12 +81,19 @@ def infer_project_from_session_path(session_path: str | Path) -> str | None:
     # Note: This is lossy if original path contained hyphens
     decoded = _decode_project_path(encoded_path)
 
-    if decoded and Path(decoded).exists():
-        log.debug(f"Inferred project_id: {decoded}")
-        return decoded
+    if decoded:
+        # Resolve symlinks to get canonical path (matches get_project_id behavior)
+        try:
+            resolved = str(Path(decoded).resolve())
+            log.debug(f"Inferred project_id: {resolved}")
+            return resolved
+        except Exception:
+            # If resolve fails, return decoded as-is
+            log.debug(f"Could not resolve path: {decoded}")
+            return decoded
 
-    # Path doesn't exist - might be lossy decoding issue
-    log.debug(f"Decoded path doesn't exist: {decoded}")
+    # Decoding failed
+    log.debug(f"Failed to decode path: {encoded_path}")
     return None
 
 
