@@ -67,7 +67,10 @@ class DatabaseManager:
         """
         log.trace("DatabaseManager.__init__ starting")
         self.config = config
-        self._write_lock = threading.Lock()
+        # Use RLock (reentrant lock) to allow nested acquisition from same thread
+        # This is needed because MemoryStore.store() acquires write_lock externally
+        # and then calls add_memory_vector() which also needs the lock
+        self._write_lock = threading.RLock()
 
         # Initialize graph backend with auto-detection
         # Falls back from FalkorDB → KuzuDB if Docker not available
@@ -112,19 +115,20 @@ class DatabaseManager:
             try:
                 # LanceDB connections don't have explicit close(),
                 # but we can optimize tables to ensure writes are flushed
-                if hasattr(self, 'lance_table') and self.lance_table is not None:
-                    try:
-                        self.lance_table.optimize()
-                        log.debug("Optimized memories LanceDB table")
-                    except Exception as e:
-                        log.warning(f"Failed to optimize memories table: {e}")
+                with self._write_lock:  # Ensure no concurrent ops during shutdown
+                    if hasattr(self, 'lance_table') and self.lance_table is not None:
+                        try:
+                            self.lance_table.optimize()
+                            log.debug("Optimized memories LanceDB table")
+                        except Exception as e:
+                            log.warning(f"Failed to optimize memories table: {e}")
 
-                if hasattr(self, 'code_table') and self.code_table is not None:
-                    try:
-                        self.code_table.optimize()
-                        log.debug("Optimized code_chunks LanceDB table")
-                    except Exception as e:
-                        log.warning(f"Failed to optimize code_chunks table: {e}")
+                    if hasattr(self, 'code_table') and self.code_table is not None:
+                        try:
+                            self.code_table.optimize()
+                            log.debug("Optimized code_chunks LanceDB table")
+                        except Exception as e:
+                            log.warning(f"Failed to optimize code_chunks table: {e}")
 
                 log.info("LanceDB tables optimized and flushed")
             except Exception as e:
@@ -184,7 +188,8 @@ class DatabaseManager:
         # Check LanceDB
         try:
             # Verify table is accessible
-            _ = self.lance_table.count_rows()
+            with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+                _ = self.lance_table.count_rows()
             result["lancedb"]["healthy"] = True
         except Exception as e:
             result["lancedb"]["error"] = str(e)
@@ -870,16 +875,17 @@ class DatabaseManager:
             metadata: Additional metadata (stored as JSON)
         """
         import json
-        self.lance_table.add([
-            {
-                "uuid": uuid,
-                "vector": vector,
-                "content": content,
-                "type": mem_type,
-                "session_id": session_id or "",
-                "metadata": json.dumps(metadata or {}),
-            }
-        ])
+        with self._write_lock:  # LanceDB not thread-safe for concurrent writes
+            self.lance_table.add([
+                {
+                    "uuid": uuid,
+                    "vector": vector,
+                    "content": content,
+                    "type": mem_type,
+                    "session_id": session_id or "",
+                    "metadata": json.dumps(metadata or {}),
+                }
+            ])
 
     def add_relationship(
         self,
@@ -1301,7 +1307,8 @@ class DatabaseManager:
         Args:
             uuid: Memory UUID to delete
         """
-        self.lance_table.delete(f'uuid = "{uuid}"')
+        with self._write_lock:  # LanceDB not thread-safe for concurrent writes
+            self.lance_table.delete(f'uuid = "{uuid}"')
 
     def delete_session_memories(self, session_id: str) -> dict:
         """Delete all memories for a session (UPSERT semantics).
@@ -1341,7 +1348,8 @@ class DatabaseManager:
             # Escape UUIDs and build IN clause for batch delete
             escaped_uuids = [uid.replace('"', '\\"') for uid in uuids]
             uuid_list = ", ".join(f'"{uid}"' for uid in escaped_uuids)
-            self.lance_table.delete(f"uuid IN ({uuid_list})")
+            with self._write_lock:  # LanceDB not thread-safe for concurrent writes
+                self.lance_table.delete(f"uuid IN ({uuid_list})")
             log.debug(f"Batch deleted {len(uuids)} vectors")
         except Exception as e:
             log.warning(f"Batch vector delete failed: {e}")
@@ -1590,9 +1598,10 @@ class DatabaseManager:
             return {"enabled": False, "chunk_count": 0}
 
         try:
-            total = self.code_table.count_rows()
-            # Get sample to count unique files (approximate)
-            sample = self.code_table.search([0.0] * self.config.embedding_dim).limit(1000).to_list()
+            with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+                total = self.code_table.count_rows()
+                # Get sample to count unique files (approximate)
+                sample = self.code_table.search([0.0] * self.config.embedding_dim).limit(1000).to_list()
             unique_files = len(set(r.get("filepath", "") for r in sample))
             return {
                 "enabled": True,
