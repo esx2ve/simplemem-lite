@@ -999,7 +999,7 @@ async def relate_memories(
 
 @mcp.tool()
 async def process_trace(session_id: str, background: bool = True) -> dict:
-    """Index a Claude Code session trace with hierarchical summaries.
+    """Index a SINGLE Claude Code session trace with hierarchical summaries.
 
     Creates a hierarchy of memories:
     - session_summary (1) - Overall session summary
@@ -1007,6 +1007,9 @@ async def process_trace(session_id: str, background: bool = True) -> dict:
 
     Uses cheap LLM (flash-lite) for summarization with progress updates.
     Runs in background by default to avoid MCP timeout on large sessions.
+
+    FOR MULTIPLE SESSIONS: Use process_trace_batch() instead!
+    It handles concurrency, progress tracking, and is more efficient.
 
     Args:
         session_id: Session UUID to index
@@ -1065,20 +1068,42 @@ async def process_trace_batch(
     sessions: list[dict],
     max_concurrent: int = 3,
 ) -> dict:
-    """Process multiple session traces with full hierarchical indexing.
+    """Process MULTIPLE session traces - the preferred way to index many sessions.
 
-    Unlike index_sessions_batch (which uses delta indexing), this tool runs
-    full process_trace with LLM summarization for each session.
+    WHEN TO USE (prefer this over process_trace for multiple sessions):
+    - Indexing historical sessions after discover_sessions()
+    - Batch processing sessions from the last N days
+    - Regular maintenance to index all unprocessed sessions
 
-    Each session dict should have 'session_id' and 'path' keys (as returned
-    by discover_sessions).
+    HOW IT WORKS:
+    1. Accepts session dicts directly from discover_sessions() output
+    2. Queues up to max_concurrent * 10 sessions (default: 30)
+    3. Runs full LLM summarization for each session
+    4. Creates hierarchical memories (session_summary + chunk_summaries)
+    5. Returns job IDs for progress tracking via job_status()
+
+    WORKFLOW:
+        # Discover unindexed sessions from last 7 days
+        sessions = discover_sessions(days_back=7, include_indexed=False)
+
+        # Process them all in batch
+        result = process_trace_batch(sessions=sessions["sessions"])
+
+        # Check individual job progress
+        for session_id, job_id in result["job_ids"].items():
+            status = job_status(job_id)
 
     Args:
-        sessions: List of session dicts with session_id and path keys
-        max_concurrent: Maximum concurrent jobs (default: 3)
+        sessions: List of session dicts with 'session_id' and 'path' keys
+                  (as returned by discover_sessions)
+        max_concurrent: Maximum concurrent jobs (default: 3, max effective: 30 sessions)
 
     Returns:
-        {queued: [...], errors: [...], job_ids: {...}}
+        {
+            "queued": ["session-id-1", "session-id-2", ...],
+            "errors": [{"session_id": "...", "error": "..."}],
+            "job_ids": {"session-id-1": "job-uuid-1", ...}
+        }
     """
     log.info(f"Tool: process_trace_batch called with {len(sessions)} sessions")
 

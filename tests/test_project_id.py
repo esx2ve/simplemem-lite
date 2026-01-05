@@ -220,14 +220,14 @@ class TestGetProjectId:
             assert result == "git:github.com/user/myrepo"
 
     def test_config_file(self):
-        """Config file should return uuid: prefixed ID."""
+        """Config file should return config: prefixed ID."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             config = {"version": 1, "project_id": "my-unique-id"}
             (tmppath / ".simplemem.json").write_text(json.dumps(config))
 
             result = get_project_id(tmppath)
-            assert result == "uuid:my-unique-id"
+            assert result == "config:my-unique-id"
 
     def test_config_file_already_prefixed(self):
         """Config with prefixed ID should preserve prefix."""
