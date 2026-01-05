@@ -1,0 +1,55 @@
+# SimpleMem-Lite Backend API - Local Development
+# Supports both Memgraph and FalkorDB backends
+#
+# Build:
+#   docker build -f Dockerfile.local -t simplemem-backend:local .
+#
+# Architecture:
+#   MCP (local) → Backend API (this container) → Memgraph (separate container)
+
+FROM python:3.12-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Install uv for fast package management
+RUN pip install uv==0.5.14
+
+# Copy dependency files first (better caching)
+COPY pyproject.toml ./
+COPY uv.lock* ./
+
+# Install all dependencies including both graph backends and dev tools
+RUN uv pip install --system --no-cache ".[memgraph,falkordb,dev]"
+
+# Copy application code
+COPY simplemem_lite/ ./simplemem_lite/
+
+# Copy tests for container-based testing
+COPY tests/ ./tests/
+
+# Create data directory for persistence
+RUN mkdir -p /data
+
+# Environment variables
+ENV SIMPLEMEM_DATA_DIR=/data
+ENV HOST=0.0.0.0
+ENV PORT=8420
+ENV PYTHONUNBUFFERED=1
+
+# Expose backend API port
+EXPOSE 8420
+
+# Health check using the /health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:8420/health --max-time 5 || exit 1
+
+# Run the backend API server
+CMD ["python", "-m", "simplemem_lite.backend.main"]

@@ -1,0 +1,87 @@
+# SimpleMem-Lite Local Development Stack
+# Mirrors Fly.io production setup (Memgraph + Backend API)
+#
+# Usage:
+#   docker-compose -f docker-compose.local.yml up -d
+#   docker-compose -f docker-compose.local.yml logs -f
+#   docker-compose -f docker-compose.local.yml down
+#
+# Test with:
+#   curl http://localhost:8420/health
+#   pytest tests/test_e2e_trace_processing.py -v
+
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: simplemem-memgraph
+    ports:
+      - "7687:7687"  # Bolt protocol
+      - "7444:7444"  # HTTP/Lab
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+    command:
+      - --data-directory=/var/lib/memgraph
+      - --bolt-address=::
+      - --storage-wal-enabled=true
+      - --storage-snapshot-on-exit=true
+      - --storage-properties-on-edges=true
+      - --query-modules-directory=/usr/lib/memgraph/query_modules
+      - --log-level=WARNING
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: simplemem-backend
+    ports:
+      - "8420:8420"
+    volumes:
+      - lancedb_data:/data
+      # Mount source code for development (optional - comment out for testing)
+      # - ./simplemem_lite:/app/simplemem_lite:ro
+    environment:
+      - SIMPLEMEM_DATA_DIR=/data
+      - HOST=0.0.0.0
+      - PORT=8420
+      - SIMPLEMEM_GRAPH_BACKEND=memgraph
+      - SIMPLEMEM_MEMGRAPH_HOST=memgraph
+      - SIMPLEMEM_MEMGRAPH_PORT=7687
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - SIMPLEMEM_MODE=dev
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8420/health", "--max-time", "5"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Memgraph Lab - Web UI for graph visualization (optional)
+  memgraph-lab:
+    image: memgraph/lab:latest
+    container_name: simplemem-lab
+    ports:
+      - "3000:3000"
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - ui  # Only start with: docker-compose --profile ui up
+
+volumes:
+  memgraph_data:
+  lancedb_data:
