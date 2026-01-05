@@ -227,7 +227,7 @@ class KuzuDBBackend(BaseGraphBackend):
             CREATE NODE TABLE CodeChunk(
                 uuid STRING,
                 filepath STRING,
-                project_root STRING,
+                project_id STRING,
                 start_line INT32,
                 end_line INT32,
                 created_at INT64,
@@ -240,12 +240,12 @@ class KuzuDBBackend(BaseGraphBackend):
         self._create_table_if_not_exists(
             """
             CREATE NODE TABLE ProjectIndex(
-                project_root STRING,
+                project_id STRING,
                 last_commit_hash STRING,
                 indexed_at INT64,
                 file_count INT32,
                 chunk_count INT32,
-                PRIMARY KEY (project_root)
+                PRIMARY KEY (project_id)
             )
             """
         )

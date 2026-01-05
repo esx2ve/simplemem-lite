@@ -172,7 +172,7 @@ class MemgraphBackend(BaseGraphBackend):
             "CREATE INDEX ON :CodeChunk(uuid)",
             "CREATE INDEX ON :CodeChunk(filepath)",
             # ProjectIndex index
-            "CREATE INDEX ON :ProjectIndex(project_root)",
+            "CREATE INDEX ON :ProjectIndex(project_id)",
         ]
 
         for index_query in indexes:

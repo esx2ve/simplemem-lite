@@ -1615,23 +1615,73 @@ async def ask_memories(
 async def search_code(
     query: str,
     limit: int = 10,
-    project_root: str | None = None,
+    project_id: str | None = None,
 ) -> dict:
-    """Search the code index for relevant code snippets.
+    """Search indexed code for implementations, patterns, and functionality.
 
-    Use this to find code implementations, patterns, or specific functionality.
-    Results are ranked by semantic similarity to the query.
+    PURPOSE: Find relevant code snippets using semantic search. Unlike grep/ripgrep
+    which match exact text, this finds code by MEANING - "authentication handler"
+    will find login functions even if they don't contain those exact words.
+
+    WHEN TO USE:
+    - Finding implementations: "user authentication", "database connection pool"
+    - Finding patterns: "error handling pattern", "retry logic"
+    - Understanding structure: "API endpoints", "middleware functions"
+    - Before implementing: Check if similar code exists
+    - Debugging: Find code related to an error
+
+    WHEN NOT TO USE:
+    - For exact text matches (use grep/ripgrep instead)
+    - For files that haven't been indexed (use index_directory first)
+    - For memory/insight search (use search_memories instead)
+
+    PREREQUISITE: The codebase must be indexed first using index_directory().
+    If no results found, the codebase may not be indexed.
+
+    EXAMPLES:
+        # Find authentication code
+        search_code(query="user login authentication handler")
+
+        # Find database patterns
+        search_code(
+            query="connection pool database initialization",
+            limit=20
+        )
+
+        # Search in specific project
+        search_code(
+            query="API rate limiting middleware",
+            project_id="git:github.com/user/myproject"
+        )
+
+        # Find error handling
+        search_code(query="exception handling retry logic")
 
     Args:
-        query: Natural language description of what you're looking for
-        limit: Maximum number of results (default: 10)
-        project_root: Optional - filter to specific project directory
+        query: Natural language description of code you're looking for.
+               Be descriptive: "user authentication JWT token validation"
+               is better than just "auth".
+        limit: Maximum results (default: 10). Increase for broader search.
+        project_id: Filter to specific project (preferred). Auto-inferred
+                    from cwd if not specified.
 
     Returns:
-        List of matching code chunks with file paths and line numbers
+        On success: {
+            "results": [
+                {
+                    "file_path": "/path/to/file.py",
+                    "line_start": 45,
+                    "line_end": 78,
+                    "content": "def authenticate_user(...)...",
+                    "score": 0.89
+                },
+                ...
+            ]
+        }
+        On error: {"error": "...", "results": []}
     """
-    log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit})")
-    results = _deps.code_indexer.search(query, limit, project_root)
+    log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit}, project_id={project_id})")
+    results = _deps.code_indexer.search(query, limit, project_id)
     log.info(f"Tool: search_code complete: {len(results)} results")
     return {"results": results, "count": len(results)}
 
@@ -1686,17 +1736,18 @@ async def index_directory(
 
 
 @mcp.tool()
-async def code_stats(project_root: str | None = None) -> dict:
+async def code_stats(project_id: str | None = None) -> dict:
     """Get statistics about the code index.
 
     Args:
-        project_root: Optional - filter to specific project
+        project_id: Optional - filter to specific project (preferred)
+        project_root: Optional - filter by path (deprecated, use project_id)
 
     Returns:
         Statistics including chunk count and unique files
     """
-    log.info(f"Tool: code_stats called (project_root={project_root})")
-    stats = _deps.store.db.get_code_stats(project_root)
+    log.info(f"Tool: code_stats called (project_id={project_id})")
+    stats = _deps.store.db.get_code_stats(project_id)
     log.info(f"Tool: code_stats complete: {stats}")
     return stats
 

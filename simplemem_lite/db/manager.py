@@ -277,7 +277,7 @@ class DatabaseManager:
             pa.field("vector", pa.list_(pa.float32(), self.config.embedding_dim)),
             pa.field("content", pa.string()),
             pa.field("filepath", pa.string()),
-            pa.field("project_root", pa.string()),
+            pa.field("project_id", pa.string()),
             pa.field("start_line", pa.int32()),
             pa.field("end_line", pa.int32()),
         ])
@@ -584,7 +584,7 @@ class DatabaseManager:
                     "properties": {
                         "uuid": "string - Unique identifier",
                         "filepath": "string - Relative file path",
-                        "project_root": "string - Absolute project root path",
+                        "project_id": "string - Canonical project identifier (e.g., git:github.com/user/repo)",
                         "start_line": "integer - Starting line number",
                         "end_line": "integer - Ending line number",
                         "created_at": "integer - Unix timestamp",
@@ -605,13 +605,13 @@ class DatabaseManager:
                 "ProjectIndex": {
                     "description": "Code index metadata for staleness detection",
                     "properties": {
-                        "project_root": "string - Absolute project root path",
+                        "project_id": "string - Canonical project identifier (e.g., git:github.com/user/repo)",
                         "last_commit_hash": "string - Git commit hash when indexed",
                         "indexed_at": "integer - Unix timestamp of last index",
                         "file_count": "integer - Number of files indexed",
                         "chunk_count": "integer - Number of chunks created",
                     },
-                    "indexes": ["project_root"],
+                    "indexes": ["project_id"],
                 },
                 "Goal": {
                     "description": "User objectives for intent-based retrieval",
@@ -1394,7 +1394,7 @@ class DatabaseManager:
         """Add code chunks to the code index.
 
         Args:
-            chunks: List of dicts with keys: uuid, vector, content, filepath, project_root, start_line, end_line
+            chunks: List of dicts with keys: uuid, vector, content, filepath, project_id, start_line, end_line
 
         Returns:
             Number of chunks added
@@ -1418,14 +1418,14 @@ class DatabaseManager:
         self,
         query_vector: list[float],
         limit: int = 10,
-        project_root: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search for similar code chunks.
 
         Args:
             query_vector: Query embedding
             limit: Maximum results
-            project_root: Optional filter by project root path
+            project_id: Optional filter by project ID (canonical identifier)
 
         Returns:
             List of matching code chunks with distance scores
@@ -1434,27 +1434,28 @@ class DatabaseManager:
             log.warning("Code indexing disabled, returning empty results")
             return []
 
-        log.trace(f"Searching code: limit={limit}, project_root={project_root}")
+        log.trace(f"Searching code: limit={limit}, project_id={project_id}")
 
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
             search = self.code_table.search(query_vector).limit(limit)
 
-            if project_root:
-                search = search.where(f"project_root = '{project_root}'")
+            if project_id:
+                safe_project_id = project_id.replace("'", "''")
+                search = search.where(f"project_id = '{safe_project_id}'")
 
             results = search.to_list()
 
         log.debug(f"Code search returned {len(results)} results")
         return results
 
-    def clear_code_index(self, project_root: str | None = None) -> int:
+    def clear_code_index(self, project_id: str | None = None) -> int:
         """Clear code index for a project or all projects.
 
         Clears both LanceDB vectors and graph CodeChunk nodes, then
         cleans up any orphaned Entity nodes.
 
         Args:
-            project_root: If provided, only clear chunks from this project
+            project_id: If provided, only clear chunks from this project
 
         Returns:
             Number of chunks deleted
@@ -1463,19 +1464,20 @@ class DatabaseManager:
             return 0
 
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
-            if project_root:
-                log.info(f"Clearing code index for project: {project_root}")
+            if project_id:
+                log.info(f"Clearing code index for project: {project_id}")
+                safe_project_id = project_id.replace("'", "''")
                 # Count before delete
                 try:
                     count = len(self.code_table.search([0.0] * self.config.embedding_dim)
-                               .where(f"project_root = '{project_root}'")
+                               .where(f"project_id = '{safe_project_id}'")
                                .limit(100000).to_list())
                 except Exception:
                     count = 0
 
                 # Delete with corruption recovery
                 try:
-                    self.code_table.delete(f"project_root = '{project_root}'")
+                    self.code_table.delete(f"project_id = '{safe_project_id}'")
                 except Exception as e:
                     log.warning(f"Code table corrupted during delete, recreating: {e}")
                     # Table is corrupted - drop and recreate (losing all data)
@@ -1487,8 +1489,8 @@ class DatabaseManager:
 
                 # Also clear CodeChunk nodes from graph for this project
                 self.graph.query(
-                    "MATCH (c:CodeChunk {project_root: $project_root}) DETACH DELETE c",
-                    {"project_root": project_root},
+                    "MATCH (c:CodeChunk {project_id: $project_id}) DETACH DELETE c",
+                    {"project_id": project_id},
                 )
                 # Reinitialize indexes to prevent FalkorDB SIGSEGV on subsequent inserts
                 self._graph_backend.reinit_code_chunk_indexes()
@@ -1520,14 +1522,14 @@ class DatabaseManager:
 
     def delete_chunks_by_filepath(
         self,
-        project_root: str,
+        project_id: str,
         filepath: str,
     ) -> int:
         """Delete all chunks for a specific file (for incremental updates).
 
         Args:
-            project_root: Project root path
-            filepath: Relative file path within the project
+            project_id: Project ID (canonical identifier)
+            filepath: File path (relative or absolute)
 
         Returns:
             Number of chunks deleted
@@ -1535,12 +1537,12 @@ class DatabaseManager:
         if not self.config.code_index_enabled:
             return 0
 
-        log.info(f"Deleting chunks for file: {filepath} in {project_root}")
+        log.info(f"Deleting chunks for file: {filepath} in {project_id}")
 
         # Sanitize inputs to prevent issues with special characters
-        safe_project_root = project_root.replace("'", "''")
+        safe_project_id = project_id.replace("'", "''")
         safe_filepath = filepath.replace("'", "''")
-        where_clause = f"project_root = '{safe_project_root}' AND filepath = '{safe_filepath}'"
+        where_clause = f"project_id = '{safe_project_id}' AND filepath = '{safe_filepath}'"
 
         with self._write_lock:
             # Collect all chunk UUIDs using pagination (no arbitrary limit)
@@ -1585,11 +1587,11 @@ class DatabaseManager:
             log.info(f"Deleted {count} chunks for {filepath}")
             return count
 
-    def get_code_stats(self, project_root: str | None = None) -> dict[str, Any]:
+    def get_code_stats(self, project_id: str | None = None) -> dict[str, Any]:
         """Get statistics about the code index.
 
         Args:
-            project_root: Optional filter by project
+            project_id: Optional filter by project ID
 
         Returns:
             Dict with chunk_count and unique files
@@ -1607,7 +1609,7 @@ class DatabaseManager:
                 "enabled": True,
                 "chunk_count": total,
                 "unique_files_sample": unique_files,
-                "project_root": project_root,
+                "project_id": project_id,
             }
         except Exception as e:
             log.error(f"Failed to get code stats: {e}")
@@ -1621,7 +1623,7 @@ class DatabaseManager:
         self,
         uuid: str,
         filepath: str,
-        project_root: str,
+        project_id: str,
         start_line: int,
         end_line: int,
     ) -> None:
@@ -1629,8 +1631,8 @@ class DatabaseManager:
 
         Args:
             uuid: Unique identifier (matches LanceDB)
-            filepath: Relative file path
-            project_root: Project root path
+            filepath: File path
+            project_id: Project ID (canonical identifier)
             start_line: Starting line number
             end_line: Ending line number
         """
@@ -1640,7 +1642,7 @@ class DatabaseManager:
             MERGE (c:CodeChunk {uuid: $uuid})
             ON CREATE SET
                 c.filepath = $filepath,
-                c.project_root = $project_root,
+                c.project_id = $project_id,
                 c.start_line = $start_line,
                 c.end_line = $end_line,
                 c.created_at = timestamp()
@@ -1648,7 +1650,7 @@ class DatabaseManager:
             {
                 "uuid": uuid,
                 "filepath": filepath,
-                "project_root": project_root,
+                "project_id": project_id,
                 "start_line": start_line,
                 "end_line": end_line,
             },
@@ -1750,7 +1752,7 @@ class DatabaseManager:
             RETURN DISTINCT
                 c.uuid AS uuid,
                 c.filepath AS filepath,
-                c.project_root AS project_root,
+                c.project_id AS project_id,
                 c.start_line AS start_line,
                 c.end_line AS end_line,
                 collect(DISTINCT e.name) AS shared_entities
@@ -1765,7 +1767,7 @@ class DatabaseManager:
             rows.append({
                 "uuid": record[0],
                 "filepath": record[1],
-                "project_root": record[2],
+                "project_id": record[2],
                 "start_line": record[3],
                 "end_line": record[4],
                 "shared_entities": record[5],
@@ -1779,7 +1781,7 @@ class DatabaseManager:
 
     def set_project_index_metadata(
         self,
-        project_root: str,
+        project_id: str,
         commit_hash: str | None,
         file_count: int,
         chunk_count: int,
@@ -1787,45 +1789,45 @@ class DatabaseManager:
         """Store/update project index metadata in graph.
 
         Args:
-            project_root: Absolute path to project root
+            project_id: Canonical project identifier (e.g., "git:github.com/user/repo")
             commit_hash: Git commit hash at time of indexing (None if not a git repo)
             file_count: Number of files indexed
             chunk_count: Number of chunks created
         """
-        log.info(f"Setting project index metadata: {project_root} (hash={commit_hash[:8] if commit_hash else 'N/A'})")
+        log.info(f"Setting project index metadata: {project_id} (hash={commit_hash[:8] if commit_hash else 'N/A'})")
         self.graph.query(
             """
-            MERGE (p:ProjectIndex {project_root: $project_root})
+            MERGE (p:ProjectIndex {project_id: $project_id})
             SET p.last_commit_hash = $commit_hash,
                 p.indexed_at = timestamp(),
                 p.file_count = $file_count,
                 p.chunk_count = $chunk_count
             """,
             {
-                "project_root": project_root,
+                "project_id": project_id,
                 "commit_hash": commit_hash,
                 "file_count": file_count,
                 "chunk_count": chunk_count,
             },
         )
 
-    def get_project_index_metadata(self, project_root: str) -> dict[str, Any] | None:
+    def get_project_index_metadata(self, project_id: str) -> dict[str, Any] | None:
         """Get project index metadata from graph.
 
         Args:
-            project_root: Absolute path to project root
+            project_id: Canonical project identifier (e.g., "git:github.com/user/repo")
 
         Returns:
-            Dict with project_root, last_commit_hash, indexed_at, file_count, chunk_count
+            Dict with project_id, last_commit_hash, indexed_at, file_count, chunk_count
             or None if not indexed
         """
-        log.trace(f"Getting project index metadata: {project_root}")
+        log.trace(f"Getting project index metadata: {project_id}")
         result = self.graph.query(
             """
-            MATCH (p:ProjectIndex {project_root: $project_root})
-            RETURN p.project_root, p.last_commit_hash, p.indexed_at, p.file_count, p.chunk_count
+            MATCH (p:ProjectIndex {project_id: $project_id})
+            RETURN p.project_id, p.last_commit_hash, p.indexed_at, p.file_count, p.chunk_count
             """,
-            {"project_root": project_root},
+            {"project_id": project_id},
         )
 
         if not result.result_set:
@@ -1833,7 +1835,7 @@ class DatabaseManager:
 
         row = result.result_set[0]
         return {
-            "project_root": row[0],
+            "project_id": row[0],
             "last_commit_hash": row[1],
             "indexed_at": row[2],
             "file_count": row[3],

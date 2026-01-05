@@ -18,23 +18,21 @@ router = APIRouter()
 log = get_logger("backend.api.code")
 
 
-def require_project_id(project_root: str | None, endpoint: str) -> None:
-    """Validate that project_root/project_id is provided when required.
-
-    For code endpoints, project_root serves as project_id.
+def require_project_id(project_id: str | None, endpoint: str) -> None:
+    """Validate that project_id is provided when required.
 
     Args:
-        project_root: The project_root from the request
+        project_id: The project_id from the request
         endpoint: Name of the endpoint for error message
 
     Raises:
         HTTPException: 400 if project_id is required but not provided
     """
     config = get_config()
-    if config.require_project_id and not project_root:
+    if config.require_project_id and not project_id:
         raise HTTPException(
             status_code=400,
-            detail=f"project_root is required for {endpoint}. "
+            detail=f"project_id is required for {endpoint}. "
             "Cloud API requires project isolation for all operations.",
         )
 
@@ -53,7 +51,7 @@ class IndexDirectoryRequest(BaseModel):
     The MCP layer reads files locally and sends their content here.
     """
 
-    project_root: str = Field(..., description="Project root path (for identification)")
+    project_id: str = Field(..., description="Project identifier for isolation")
     files: list[FileInput] = Field(..., description="List of files to index")
     clear_existing: bool = Field(default=True, description="Clear existing index")
     background: bool = Field(default=True, description="Run in background")
@@ -71,7 +69,7 @@ class FileUpdateInput(BaseModel):
 class UpdateCodeRequest(BaseModel):
     """Request model for incremental code index updates."""
 
-    project_root: str = Field(..., description="Project root path")
+    project_id: str = Field(..., description="Project identifier for isolation")
     updates: list[FileUpdateInput] = Field(..., description="List of file updates")
 
 
@@ -80,7 +78,7 @@ class SearchCodeRequest(BaseModel):
 
     query: str = Field(..., description="Natural language search query")
     limit: int = Field(default=10, ge=1, le=100)
-    project_root: str | None = Field(default=None, description="Filter to specific project")
+    project_id: str | None = Field(default=None, description="Filter to specific project")
 
 
 class CodeRelatedMemoriesRequest(BaseModel):
@@ -118,7 +116,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
     The MCP layer reads files locally and sends content here.
     Runs in background by default to return immediately.
     """
-    require_project_id(request.project_root, "index_code")
+    require_project_id(request.project_id, "index_code")
     try:
         # Decompress files if needed
         processed_files = []
@@ -144,15 +142,15 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
             job_manager = get_job_manager()
 
             async def _index_job(
-                proj_root: str,
+                project_id: str,
                 files: list[dict],
                 clear: bool,
                 progress_callback: Callable[[int, str], None] | None = None,
             ) -> dict:
                 """Background job wrapper for indexing."""
-                log.info(f"Background job: index_code starting for {proj_root}")
+                log.info(f"Background job: index_code starting for {project_id}")
                 result = await indexer.index_files_content_async(
-                    project_root=proj_root,
+                    project_id=project_id,
                     files=files,
                     clear_existing=clear,
                     progress_callback=progress_callback,
@@ -166,7 +164,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
             job_id = await job_manager.submit(
                 "index_code",
                 _index_job,
-                request.project_root,
+                request.project_id,
                 processed_files,
                 request.clear_existing,
             )
@@ -180,7 +178,7 @@ async def index_code(request: IndexDirectoryRequest) -> dict:
         # Synchronous execution (not recommended for large codebases)
         log.debug("index_code running synchronously")
         result = await indexer.index_files_content_async(
-            project_root=request.project_root,
+            project_id=request.project_id,
             files=processed_files,
             clear_existing=request.clear_existing,
         )
@@ -202,7 +200,7 @@ async def update_code(request: UpdateCodeRequest) -> dict:
     Used by the file watcher for real-time updates.
     Supports add, modify, and delete operations.
     """
-    require_project_id(request.project_root, "update_code")
+    require_project_id(request.project_id, "update_code")
     try:
         # Process updates, decompressing content if needed
         processed_updates = []
@@ -224,7 +222,7 @@ async def update_code(request: UpdateCodeRequest) -> dict:
 
         indexer = get_code_indexer()
         result = indexer.update_files_content(
-            project_root=request.project_root,
+            project_id=request.project_id,
             updates=processed_updates,
         )
 
@@ -244,13 +242,13 @@ async def update_code(request: UpdateCodeRequest) -> dict:
 @router.post("/search")
 async def search_code(request: SearchCodeRequest) -> dict:
     """Semantic search over indexed code."""
-    require_project_id(request.project_root, "search_code")
+    require_project_id(request.project_id, "search_code")
     try:
         indexer = get_code_indexer()
         results = indexer.search(
             query=request.query,
             limit=request.limit,
-            project_root=request.project_root,
+            project_id=request.project_id,
         )
         return {
             "results": results,
@@ -263,9 +261,9 @@ async def search_code(request: SearchCodeRequest) -> dict:
 
 
 @router.get("/stats")
-async def code_stats(project_root: str | None = None) -> dict:
+async def code_stats(project_id: str | None = None) -> dict:
     """Get code index statistics."""
-    require_project_id(project_root, "code_stats")
+    require_project_id(project_id, "code_stats")
     try:
         indexer = get_code_indexer()
         stats = indexer.get_stats()

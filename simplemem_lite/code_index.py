@@ -20,6 +20,7 @@ from simplemem_lite.config import Config
 from simplemem_lite.db import DatabaseManager
 from simplemem_lite.embeddings import embed, embed_batch
 from simplemem_lite.log_config import get_logger
+from simplemem_lite.projects_utils import get_project_id
 
 log = get_logger("code_index")
 
@@ -274,11 +275,13 @@ class CodeIndexer:
             log.error(f"Directory does not exist: {root}")
             return {"error": f"Directory not found: {root}", "files_indexed": 0}
 
+        # Get canonical project ID for storage
+        project_id = get_project_id(root)
         patterns = patterns or self.config.code_patterns_list
-        log.info(f"Indexing directory: {root} with patterns: {patterns}")
+        log.info(f"Indexing directory: {root} (project_id={project_id}) with patterns: {patterns}")
 
         if clear_existing:
-            cleared = self.db.clear_code_index(str(root))
+            cleared = self.db.clear_code_index(project_id)
             log.info(f"Cleared {cleared} existing chunks")
 
         # Find all matching files, excluding common non-source directories
@@ -293,7 +296,7 @@ class CodeIndexer:
         log.info(f"Found {len(files)} files to index")
 
         if not files:
-            return {"files_indexed": 0, "chunks_created": 0, "project_root": str(root)}
+            return {"files_indexed": 0, "chunks_created": 0, "project_id": project_id}
 
         # Process files in batches
         total_chunks = 0
@@ -302,7 +305,7 @@ class CodeIndexer:
 
         for file_path in files:
             try:
-                chunks = self._index_file(file_path, root)
+                chunks = self._index_file(file_path, root, project_id)
                 total_chunks += chunks
                 files_indexed += 1
                 if files_indexed % 10 == 0:
@@ -317,7 +320,7 @@ class CodeIndexer:
         git_info = self._get_git_info(root)
         commit_hash = git_info.get("commit_hash") if git_info.get("is_git_repo") else None
         self.db.set_project_index_metadata(
-            project_root=str(root),
+            project_id=project_id,
             commit_hash=commit_hash,
             file_count=files_indexed,
             chunk_count=total_chunks,
@@ -326,7 +329,7 @@ class CodeIndexer:
         return {
             "files_indexed": files_indexed,
             "chunks_created": total_chunks,
-            "project_root": str(root),
+            "project_id": project_id,
             "commit_hash": commit_hash,
             "is_git_repo": git_info.get("is_git_repo", False),
             "errors": errors if errors else None,
@@ -360,15 +363,17 @@ class CodeIndexer:
             log.error(f"Directory does not exist: {root}")
             return {"error": f"Directory not found: {root}", "files_indexed": 0}
 
+        # Get canonical project ID for storage
+        project_id = get_project_id(root)
         patterns = patterns or self.config.code_patterns_list
-        log.info(f"Async indexing directory: {root} with patterns: {patterns}")
+        log.info(f"Async indexing directory: {root} (project_id={project_id}) with patterns: {patterns}")
 
         loop = asyncio.get_running_loop()
 
         # Clear existing index in executor (DB operation)
         if clear_existing:
             cleared = await loop.run_in_executor(
-                None, self.db.clear_code_index, str(root)
+                None, self.db.clear_code_index, project_id
             )
             log.info(f"Cleared {cleared} existing chunks")
 
@@ -385,7 +390,7 @@ class CodeIndexer:
         log.info(f"Found {len(files)} files to index")
 
         if not files:
-            return {"files_indexed": 0, "chunks_created": 0, "project_root": str(root)}
+            return {"files_indexed": 0, "chunks_created": 0, "project_id": project_id}
 
         # Process files with periodic yielding
         total_chunks = 0
@@ -397,7 +402,7 @@ class CodeIndexer:
             try:
                 # Run blocking file indexing in thread pool
                 chunks = await loop.run_in_executor(
-                    None, self._index_file, file_path, root
+                    None, self._index_file, file_path, root, project_id
                 )
                 total_chunks += chunks
                 files_indexed += 1
@@ -428,7 +433,7 @@ class CodeIndexer:
             git_info = self._get_git_info(root)
             commit_hash = git_info.get("commit_hash") if git_info.get("is_git_repo") else None
             self.db.set_project_index_metadata(
-                project_root=str(root),
+                project_id=project_id,
                 commit_hash=commit_hash,
                 file_count=files_indexed,
                 chunk_count=total_chunks,
@@ -440,7 +445,7 @@ class CodeIndexer:
         return {
             "files_indexed": files_indexed,
             "chunks_created": total_chunks,
-            "project_root": str(root),
+            "project_id": project_id,
             "commit_hash": commit_hash,
             "is_git_repo": git_info.get("is_git_repo", False),
             "errors": errors if errors else None,
@@ -448,7 +453,7 @@ class CodeIndexer:
 
     def index_files_content(
         self,
-        project_root: str,
+        project_id: str,
         files: list[dict[str, Any]],
         clear_existing: bool = True,
     ) -> dict[str, Any]:
@@ -458,21 +463,21 @@ class CodeIndexer:
         pre-read file content from the MCP thin layer.
 
         Args:
-            project_root: Project root path (for identification)
+            project_id: Canonical project identifier (e.g., "git:github.com/user/repo")
             files: List of dicts with {path, content} keys
             clear_existing: Whether to clear existing index for this root
 
         Returns:
             Dict with indexing stats
         """
-        log.info(f"Indexing {len(files)} files from content for {project_root}")
+        log.info(f"Indexing {len(files)} files from content for {project_id}")
 
         if clear_existing:
-            cleared = self.db.clear_code_index(project_root)
+            cleared = self.db.clear_code_index(project_id)
             log.info(f"Cleared {cleared} existing chunks")
 
         if not files:
-            return {"files_indexed": 0, "chunks_created": 0, "project_root": project_root}
+            return {"files_indexed": 0, "chunks_created": 0, "project_id": project_id}
 
         total_chunks = 0
         files_indexed = 0
@@ -489,7 +494,7 @@ class CodeIndexer:
                 chunks = self._index_content(
                     content=content,
                     filepath=filepath,
-                    project_root=project_root,
+                    project_id=project_id,
                 )
                 total_chunks += chunks
                 files_indexed += 1
@@ -502,13 +507,13 @@ class CodeIndexer:
         return {
             "files_indexed": files_indexed,
             "chunks_created": total_chunks,
-            "project_root": project_root,
+            "project_id": project_id,
             "errors": errors if errors else None,
         }
 
     async def index_files_content_async(
         self,
-        project_root: str,
+        project_id: str,
         files: list[dict[str, Any]],
         clear_existing: bool = True,
         yield_interval: int = 5,
@@ -520,7 +525,7 @@ class CodeIndexer:
         Heavy operations (embedding, DB writes) run in thread pool executor.
 
         Args:
-            project_root: Project root path (for identification)
+            project_id: Canonical project identifier (e.g., "git:github.com/user/repo")
             files: List of dicts with {path, content} keys
             clear_existing: Whether to clear existing index for this root
             yield_interval: Yield to event loop every N files (default: 5)
@@ -529,18 +534,18 @@ class CodeIndexer:
         Returns:
             Dict with indexing stats
         """
-        log.info(f"Async indexing {len(files)} files from content for {project_root}")
+        log.info(f"Async indexing {len(files)} files from content for {project_id}")
 
         loop = asyncio.get_running_loop()
 
         if clear_existing:
             cleared = await loop.run_in_executor(
-                None, self.db.clear_code_index, project_root
+                None, self.db.clear_code_index, project_id
             )
             log.info(f"Cleared {cleared} existing chunks")
 
         if not files:
-            return {"files_indexed": 0, "chunks_created": 0, "project_root": project_root}
+            return {"files_indexed": 0, "chunks_created": 0, "project_id": project_id}
 
         total_chunks = 0
         files_indexed = 0
@@ -557,7 +562,7 @@ class CodeIndexer:
             try:
                 # Run blocking content indexing in thread pool
                 chunks = await loop.run_in_executor(
-                    None, self._index_content, content, filepath, project_root
+                    None, self._index_content, content, filepath, project_id
                 )
                 total_chunks += chunks
                 files_indexed += 1
@@ -583,13 +588,13 @@ class CodeIndexer:
         return {
             "files_indexed": files_indexed,
             "chunks_created": total_chunks,
-            "project_root": project_root,
+            "project_id": project_id,
             "errors": errors if errors else None,
         }
 
     def update_files_content(
         self,
-        project_root: str,
+        project_id: str,
         updates: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Incrementally update code index with file changes.
@@ -598,21 +603,21 @@ class CodeIndexer:
         Used by the file watcher for real-time cloud-based updates.
 
         Args:
-            project_root: Project root path (for identification)
+            project_id: Canonical project identifier (e.g., "git:github.com/user/repo")
             updates: List of dicts with {path, content, action} where
                      action is "add", "modify", or "delete"
 
         Returns:
             Dict with update statistics
         """
-        log.info(f"Incremental update: {len(updates)} files for {project_root}")
+        log.info(f"Incremental update: {len(updates)} files for {project_id}")
 
         if not updates:
             return {
                 "files_updated": 0,
                 "chunks_created": 0,
                 "chunks_deleted": 0,
-                "project_root": project_root,
+                "project_id": project_id,
             }
 
         total_created = 0
@@ -631,7 +636,7 @@ class CodeIndexer:
             try:
                 if action == "delete":
                     # Delete chunks for this file
-                    deleted = self.db.delete_chunks_by_filepath(project_root, filepath)
+                    deleted = self.db.delete_chunks_by_filepath(project_id, filepath)
                     total_deleted += deleted
                     files_updated += 1
                     log.debug(f"Deleted {deleted} chunks for {filepath}")
@@ -639,7 +644,7 @@ class CodeIndexer:
                 elif action in ("add", "modify"):
                     # For modify: delete existing chunks first
                     if action == "modify":
-                        deleted = self.db.delete_chunks_by_filepath(project_root, filepath)
+                        deleted = self.db.delete_chunks_by_filepath(project_id, filepath)
                         total_deleted += deleted
                         log.debug(f"Deleted {deleted} existing chunks for {filepath}")
 
@@ -648,7 +653,7 @@ class CodeIndexer:
                         chunks = self._index_content(
                             content=content,
                             filepath=filepath,
-                            project_root=project_root,
+                            project_id=project_id,
                         )
                         total_created += chunks
                         files_updated += 1
@@ -669,7 +674,7 @@ class CodeIndexer:
             "files_updated": files_updated,
             "chunks_created": total_created,
             "chunks_deleted": total_deleted,
-            "project_root": project_root,
+            "project_id": project_id,
             "errors": errors if errors else None,
         }
 
@@ -677,14 +682,14 @@ class CodeIndexer:
         self,
         content: str,
         filepath: str,
-        project_root: str,
+        project_id: str,
     ) -> int:
         """Index content of a single file.
 
         Args:
             content: File content as string
             filepath: Relative path within project
-            project_root: Project root path
+            project_id: Canonical project identifier
 
         Returns:
             Number of chunks created
@@ -710,7 +715,7 @@ class CodeIndexer:
                 "vector": embedding,
                 "content": chunk["content"],
                 "filepath": filepath,
-                "project_root": project_root,
+                "project_id": project_id,
                 "start_line": chunk["start_line"],
                 "end_line": chunk["end_line"],
             })
@@ -724,7 +729,7 @@ class CodeIndexer:
                 self._link_chunk_entities(
                     chunk_uuid=record["uuid"],
                     filepath=record["filepath"],
-                    project_root=record["project_root"],
+                    project_id=record["project_id"],
                     start_line=record["start_line"],
                     end_line=record["end_line"],
                     chunk_content=record["content"],
@@ -735,12 +740,13 @@ class CodeIndexer:
 
         return len(records)
 
-    def _index_file(self, file_path: Path, project_root: Path) -> int:
+    def _index_file(self, file_path: Path, project_root: Path, project_id: str) -> int:
         """Index a single file.
 
         Args:
             file_path: Path to the file
-            project_root: Project root directory
+            project_root: Project root directory (for relative path computation)
+            project_id: Canonical project identifier for storage
 
         Returns:
             Number of chunks created
@@ -775,7 +781,7 @@ class CodeIndexer:
                 "vector": embedding,
                 "content": chunk["content"],
                 "filepath": relative_path,
-                "project_root": str(project_root),
+                "project_id": project_id,
                 "start_line": chunk["start_line"],
                 "end_line": chunk["end_line"],
             })
@@ -790,7 +796,7 @@ class CodeIndexer:
                 entities_linked = self._link_chunk_entities(
                     chunk_uuid=record["uuid"],
                     filepath=record["filepath"],
-                    project_root=record["project_root"],
+                    project_id=record["project_id"],
                     start_line=record["start_line"],
                     end_line=record["end_line"],
                     chunk_content=record["content"],
@@ -941,7 +947,7 @@ class CodeIndexer:
         self,
         chunk_uuid: str,
         filepath: str,
-        project_root: str,
+        project_id: str,
         start_line: int,
         end_line: int,
         chunk_content: str,
@@ -951,7 +957,7 @@ class CodeIndexer:
         Args:
             chunk_uuid: UUID of the chunk
             filepath: Relative file path
-            project_root: Project root path
+            project_id: Canonical project identifier
             start_line: Start line number
             end_line: End line number
             chunk_content: Content of the chunk
@@ -966,7 +972,7 @@ class CodeIndexer:
         self.db.add_code_chunk_node(
             uuid=chunk_uuid,
             filepath=filepath,
-            project_root=project_root,
+            project_id=project_id,
             start_line=start_line,
             end_line=end_line,
         )
@@ -1023,20 +1029,22 @@ class CodeIndexer:
             log.error(f"File {file_path} is not under project root {project_root}")
             return {"error": "File not under project root", "chunks_created": 0}
 
-        log.info(f"Indexing single file: {relative_path}")
+        # Get canonical project ID for storage
+        project_id = get_project_id(project_root)
+        log.info(f"Indexing single file: {relative_path} (project_id={project_id})")
 
         # Delete existing chunks for this file
-        deleted = self.db.delete_chunks_by_filepath(str(project_root), relative_path)
+        deleted = self.db.delete_chunks_by_filepath(project_id, relative_path)
         if deleted > 0:
             log.debug(f"Deleted {deleted} existing chunks for {relative_path}")
 
         # Re-index the file
         try:
-            chunks_created = self._index_file(file_path, project_root)
+            chunks_created = self._index_file(file_path, project_root, project_id)
             log.info(f"Indexed {relative_path}: {chunks_created} chunks created")
             return {
                 "filepath": relative_path,
-                "project_root": str(project_root),
+                "project_id": project_id,
                 "chunks_created": chunks_created,
                 "chunks_deleted": deleted,
             }
@@ -1044,7 +1052,7 @@ class CodeIndexer:
             log.error(f"Failed to index {relative_path}: {e}")
             return {
                 "filepath": relative_path,
-                "project_root": str(project_root),
+                "project_id": project_id,
                 "error": str(e),
                 "chunks_created": 0,
             }
@@ -1074,14 +1082,16 @@ class CodeIndexer:
             # If file_path is already relative, use it directly
             relative_path = str(file_path)
 
-        log.info(f"Deleting file from index: {relative_path}")
+        # Get canonical project ID for storage
+        project_id = get_project_id(project_root)
+        log.info(f"Deleting file from index: {relative_path} (project_id={project_id})")
 
-        deleted = self.db.delete_chunks_by_filepath(str(project_root), relative_path)
+        deleted = self.db.delete_chunks_by_filepath(project_id, relative_path)
         log.info(f"Deleted {deleted} chunks for {relative_path}")
 
         return {
             "filepath": relative_path,
-            "project_root": str(project_root),
+            "project_id": project_id,
             "chunks_deleted": deleted,
         }
 
@@ -1089,25 +1099,25 @@ class CodeIndexer:
         self,
         query: str,
         limit: int = 10,
-        project_root: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search the code index.
 
         Args:
             query: Search query
             limit: Maximum results
-            project_root: Optional filter by project
+            project_id: Optional filter by project (canonical identifier)
 
         Returns:
             List of matching code chunks with scores
         """
-        log.info(f"Code search: '{query[:50]}...' limit={limit}")
+        log.info(f"Code search: '{query[:50]}...' limit={limit} project_id={project_id}")
 
         # Generate query embedding
         query_vector = embed(query, self.config)
 
         # Search
-        results = self.db.search_code(query_vector, limit, project_root)
+        results = self.db.search_code(query_vector, limit, project_id)
 
         # Format results
         formatted = []
@@ -1118,7 +1128,7 @@ class CodeIndexer:
                 "content": r.get("content", ""),
                 "start_line": r.get("start_line", 0),
                 "end_line": r.get("end_line", 0),
-                "project_root": r.get("project_root", ""),
+                "project_id": r.get("project_id", ""),
                 "score": 1.0 - r.get("_distance", 0.0),  # Convert distance to similarity
             })
 
@@ -1244,16 +1254,17 @@ class CodeIndexer:
             Dict with staleness status and details
         """
         root = Path(project_root).resolve()
-        log.info(f"Checking staleness for: {root}")
+        project_id = get_project_id(root)
+        log.info(f"Checking staleness for: {root} (project_id={project_id})")
 
         # Get stored index metadata
-        metadata = self.db.get_project_index_metadata(str(root))
+        metadata = self.db.get_project_index_metadata(project_id)
         if metadata is None:
             return {
                 "is_indexed": False,
                 "is_stale": True,  # Not indexed = stale
                 "reason": "Project not indexed",
-                "project_root": str(root),
+                "project_id": project_id,
             }
 
         # Get current git info
@@ -1266,7 +1277,7 @@ class CodeIndexer:
                 "indexed_at": metadata.get("indexed_at"),
                 "file_count": metadata.get("file_count"),
                 "chunk_count": metadata.get("chunk_count"),
-                "project_root": str(root),
+                "project_id": project_id,
                 "reason": "Not a git repository - staleness cannot be detected",
             }
 
@@ -1295,7 +1306,7 @@ class CodeIndexer:
             "chunk_count": metadata.get("chunk_count"),
             "changed_files": changed_files,
             "uncommitted_files": uncommitted if has_uncommitted else [],
-            "project_root": str(root),
+            "project_id": project_id,
         }
 
         if is_stale:

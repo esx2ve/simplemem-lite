@@ -648,7 +648,7 @@ async def ask_memories(
 async def search_code(
     query: str,
     limit: int = 10,
-    project_root: str | None = None,
+    project_id: str | None = None,
 ) -> dict:
     """Search the code index for relevant code snippets.
 
@@ -658,14 +658,14 @@ async def search_code(
     Args:
         query: Natural language description of what you're looking for
         limit: Maximum number of results (default: 10)
-        project_root: Optional - filter to specific project directory
+        project_id: Optional - filter to specific project
 
     Returns:
         List of matching code chunks with file paths and line numbers
     """
     log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit})")
     client = await get_client()
-    result = await client.search_code(query, limit, project_root)
+    result = await client.search_code(query, limit, project_id)
     results = result.get("results", [])
     log.info(f"Tool: search_code complete: {len(results)} results")
     return {"results": results, "count": len(results)}
@@ -698,18 +698,18 @@ async def index_directory(
 
 
 @mcp.tool()
-async def code_stats(project_root: str | None = None) -> dict:
+async def code_stats(project_id: str | None = None) -> dict:
     """Get statistics about the code index.
 
     Args:
-        project_root: Optional - filter to specific project
+        project_id: Optional - filter to specific project
 
     Returns:
         Statistics including chunk count and unique files
     """
-    log.info(f"Tool: code_stats called (project_root={project_root})")
+    log.info(f"Tool: code_stats called (project_id={project_id})")
     client = await get_client()
-    result = await client.code_stats(project_root)
+    result = await client.code_stats(project_id)
     log.info(f"Tool: code_stats complete: {result}")
     return result
 
@@ -763,14 +763,14 @@ async def memory_related_code(
 
 
 @mcp.tool()
-async def check_code_staleness(project_root: str) -> dict:
+async def check_code_staleness(project_id: str) -> dict:
     """Check if the code index is stale and needs refreshing.
 
     Uses git to detect changes since last indexing. Returns staleness status
     with details about changed files.
 
     Args:
-        project_root: Absolute path to the project root directory
+        project_id: Project identifier
 
     Returns:
         Dict with:
@@ -783,9 +783,9 @@ async def check_code_staleness(project_root: str) -> dict:
         - uncommitted_files: Uncommitted changes
         - reason: Human-readable explanation
     """
-    log.info(f"Tool: check_code_staleness called (project={project_root})")
+    log.info(f"Tool: check_code_staleness called (project={project_id})")
     client = await get_client()
-    result = await client.check_code_staleness(project_root)
+    result = await client.check_code_staleness(project_id)
     log.info(f"Tool: check_code_staleness complete: is_stale={result.get('is_stale')}")
     return result
 

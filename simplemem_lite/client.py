@@ -368,7 +368,7 @@ class DaemonClient:
         self,
         query: str,
         limit: int = 10,
-        project_root: str | None = None,
+        project_id: str | None = None,
     ) -> dict:
         """Search code index.
 
@@ -376,8 +376,8 @@ class DaemonClient:
             {"results": [...]}
         """
         params = {"query": query, "limit": limit}
-        if project_root:
-            params["project_root"] = project_root
+        if project_id:
+            params["project_id"] = project_id
         return await self.call("search_code", params)
 
     async def index_directory(
@@ -396,16 +396,16 @@ class DaemonClient:
             params["patterns"] = patterns
         return await self.call("index_directory", params, timeout=LONG_TIMEOUT)
 
-    async def code_stats(self, project_root: str | None = None) -> dict:
+    async def code_stats(self, project_id: str | None = None) -> dict:
         """Get code index statistics."""
         params = {}
-        if project_root:
-            params["project_root"] = project_root
+        if project_id:
+            params["project_id"] = project_id
         return await self.call("code_stats", params)
 
-    async def check_code_staleness(self, project_root: str) -> dict:
+    async def check_code_staleness(self, project_id: str) -> dict:
         """Check if code index is stale."""
-        return await self.call("check_code_staleness", {"project_root": project_root})
+        return await self.call("check_code_staleness", {"project_id": project_id})
 
     async def code_related_memories(
         self,
@@ -565,8 +565,8 @@ class SyncDaemonClient:
     def code_stats(self, **kwargs) -> dict:
         return self._run(self._async_client.code_stats(**kwargs))
 
-    def check_code_staleness(self, project_root: str) -> dict:
-        return self._run(self._async_client.check_code_staleness(project_root))
+    def check_code_staleness(self, project_id: str) -> dict:
+        return self._run(self._async_client.check_code_staleness(project_id))
 
     def code_related_memories(self, **kwargs) -> dict:
         return self._run(self._async_client.code_related_memories(**kwargs))

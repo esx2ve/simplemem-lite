@@ -143,7 +143,7 @@ class FalkorDBBackend(BaseGraphBackend):
             self._graph.query("CREATE INDEX FOR (c:CodeChunk) ON (c.filepath)")
 
             # ProjectIndex index
-            self._graph.query("CREATE INDEX FOR (p:ProjectIndex) ON (p.project_root)")
+            self._graph.query("CREATE INDEX FOR (p:ProjectIndex) ON (p.project_id)")
 
             log.debug("FalkorDB indexes created")
 
