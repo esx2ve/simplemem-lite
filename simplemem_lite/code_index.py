@@ -254,6 +254,70 @@ class CodeIndexer:
 
         return False
 
+    def _find_files_efficient(self, root: Path, patterns: list[str]) -> list[Path]:
+        """Find files matching patterns with efficient directory pruning.
+
+        Uses os.walk(topdown=True) to prune excluded directories DURING
+        traversal, avoiding the performance penalty of walking into
+        node_modules, .venv, .git, etc.
+
+        This fixes the performance bug where Path.glob("**/*.py") would
+        walk ALL directories (including multi-GB node_modules) before
+        filtering with _should_exclude().
+
+        Args:
+            root: Project root directory
+            patterns: Glob patterns like ["**/*.py", "**/*.ts"]
+
+        Returns:
+            Sorted list of unique file paths matching patterns
+        """
+        import os
+
+        exclude_spec = self._build_pathspec(root)
+        # Build include spec for matching files against patterns
+        include_spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+        files = []
+        root_str = str(root)
+
+        for dirpath, dirnames, filenames in os.walk(root_str, topdown=True):
+            # Get relative path for matching
+            if dirpath == root_str:
+                rel_dir = ""
+            else:
+                rel_dir = os.path.relpath(dirpath, root_str)
+
+            # CRITICAL: Prune excluded directories IN PLACE
+            # This prevents os.walk from descending into them at all
+            # The [:] slice assignment modifies the list in-place
+            original_count = len(dirnames)
+            dirnames[:] = [
+                d for d in dirnames
+                if not exclude_spec.match_file(
+                    (rel_dir + "/" + d + "/" if rel_dir else d + "/")
+                )
+            ]
+            pruned = original_count - len(dirnames)
+            if pruned > 0:
+                log.trace(f"Pruned {pruned} directories in {rel_dir or '.'}")
+
+            # Collect matching, non-excluded files
+            for filename in filenames:
+                rel_path = os.path.join(rel_dir, filename) if rel_dir else filename
+
+                # Check include patterns first (usually more selective)
+                if not include_spec.match_file(rel_path):
+                    continue
+
+                # Check exclude patterns (file-level exclusions like *.pyc)
+                if exclude_spec.match_file(rel_path):
+                    continue
+
+                files.append(root / rel_path)
+
+        return sorted(set(files))
+
     def index_directory(
         self,
         root_path: str | Path,
@@ -284,15 +348,9 @@ class CodeIndexer:
             cleared = self.db.clear_code_index(project_id)
             log.info(f"Cleared {cleared} existing chunks")
 
-        # Find all matching files, excluding common non-source directories
-        files = []
-        for pattern in patterns:
-            for f in root.glob(pattern):
-                if f.is_file() and not self._should_exclude(f, root):
-                    files.append(f)
-
-        # Remove duplicates
-        files = sorted(set(files))
+        # Find all matching files with efficient directory pruning
+        # Uses os.walk to prune excluded directories DURING traversal
+        files = self._find_files_efficient(root, patterns)
         log.info(f"Found {len(files)} files to index")
 
         if not files:
@@ -377,16 +435,11 @@ class CodeIndexer:
             )
             log.info(f"Cleared {cleared} existing chunks")
 
-        # Find all matching files (file system operation in executor)
-        def _find_files():
-            files = []
-            for pattern in patterns:
-                for f in root.glob(pattern):
-                    if f.is_file() and not self._should_exclude(f, root):
-                        files.append(f)
-            return sorted(set(files))
-
-        files = await loop.run_in_executor(None, _find_files)
+        # Find all matching files with efficient directory pruning (in executor)
+        # Uses os.walk to prune excluded directories DURING traversal
+        files = await loop.run_in_executor(
+            None, self._find_files_efficient, root, patterns
+        )
         log.info(f"Found {len(files)} files to index")
 
         if not files:
