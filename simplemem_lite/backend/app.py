@@ -80,6 +80,8 @@ def _log_security_mode() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup/shutdown."""
+    import os
+
     from simplemem_lite.backend.services import shutdown_services
 
     config = get_config()
@@ -91,7 +93,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # These will be lazily initialized when first accessed
     app.state.config = config
 
+    # Start consolidation scheduler if enabled via environment
+    scheduler_enabled = os.getenv("SIMPLEMEM_CONSOLIDATION_SCHEDULER", "").lower() == "true"
+    if scheduler_enabled:
+        from simplemem_lite.backend.consolidation.scheduler import (
+            SchedulerConfig,
+            start_scheduler,
+        )
+
+        scheduler_config = SchedulerConfig(
+            enabled=True,
+            check_interval_hours=int(os.getenv("SIMPLEMEM_CONSOLIDATION_INTERVAL_HOURS", "24")),
+            min_days_between_runs=int(os.getenv("SIMPLEMEM_CONSOLIDATION_MIN_DAYS", "7")),
+            min_new_memories=int(os.getenv("SIMPLEMEM_CONSOLIDATION_MIN_MEMORIES", "100")),
+            run_at_hour=int(os.getenv("SIMPLEMEM_CONSOLIDATION_RUN_HOUR", "3")),
+        )
+        await start_scheduler(scheduler_config)
+        log.info("Consolidation scheduler started")
+
     yield
+
+    # Shutdown: Stop scheduler
+    if scheduler_enabled:
+        from simplemem_lite.backend.consolidation.scheduler import stop_scheduler
+
+        await stop_scheduler()
+        log.info("Consolidation scheduler stopped")
 
     # Shutdown: Gracefully close all services
     # Critical for preventing LanceDB corruption on Fly.io auto-suspend

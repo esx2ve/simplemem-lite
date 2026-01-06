@@ -1,0 +1,105 @@
+{
+  "entity_dedup": {
+    "same_entities": [
+      {
+        "pair": 1,
+        "same": true,
+        "confidence": 0.95,
+        "canonical": "main.py",
+        "reason": "Same file with different path formats"
+      }
+    ],
+    "different_entities": [
+      {
+        "pair": 1,
+        "same": false,
+        "confidence": 0.1,
+        "canonical": null,
+        "reason": "Unrelated files with different purposes"
+      }
+    ],
+    "uncertain": [
+      {
+        "pair": 1,
+        "same": true,
+        "confidence": 0.75,
+        "canonical": "utils.py",
+        "reason": "Possibly same but need review"
+      }
+    ]
+  },
+  "memory_merge": {
+    "should_merge": [
+      {
+        "pair": 1,
+        "merge": true,
+        "confidence": 0.92,
+        "merged": "Combined insight about database connection handling: when debugging connection pool timeouts, check both the pool size configuration and connection timeout settings. The fix involves increasing pool size and adding retry logic.",
+        "reason": "Near duplicate content with complementary details"
+      }
+    ],
+    "should_not_merge": [
+      {
+        "pair": 1,
+        "merge": false,
+        "confidence": 0.15,
+        "merged": null,
+        "reason": "Different topics - authentication vs database"
+      }
+    ],
+    "uncertain": [
+      {
+        "pair": 1,
+        "merge": true,
+        "confidence": 0.78,
+        "merged": "Potential combined content for review",
+        "reason": "Related but distinct insights"
+      }
+    ]
+  },
+  "supersession": {
+    "full_replace": [
+      {
+        "pair": 1,
+        "supersedes": true,
+        "confidence": 0.88,
+        "type": "full_replace",
+        "reason": "Newer memory provides complete updated solution"
+      }
+    ],
+    "partial_update": [
+      {
+        "pair": 1,
+        "supersedes": true,
+        "confidence": 0.82,
+        "type": "partial_update",
+        "reason": "Newer adds additional context to older insight"
+      }
+    ],
+    "no_supersession": [
+      {
+        "pair": 1,
+        "supersedes": false,
+        "confidence": 0.2,
+        "type": "none",
+        "reason": "Different aspects of the same topic"
+      }
+    ]
+  },
+  "batch_responses": {
+    "entity_batch_3": [
+      {"pair": 1, "same": true, "confidence": 0.95, "canonical": "main.py", "reason": "Same file"},
+      {"pair": 2, "same": false, "confidence": 0.1, "canonical": null, "reason": "Different"},
+      {"pair": 3, "same": true, "confidence": 0.78, "canonical": "utils.py", "reason": "Probably same"}
+    ],
+    "memory_batch_2": [
+      {"pair": 1, "merge": true, "confidence": 0.91, "merged": "Combined DB insight", "reason": "Similar"},
+      {"pair": 2, "merge": false, "confidence": 0.25, "merged": null, "reason": "Unrelated"}
+    ]
+  },
+  "edge_cases": {
+    "empty_response": [],
+    "malformed_response": "not valid json",
+    "markdown_wrapped": "```json\n[{\"pair\": 1, \"same\": true, \"confidence\": 0.9}]\n```"
+  }
+}

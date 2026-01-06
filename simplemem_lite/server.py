@@ -2365,6 +2365,405 @@ async def index_sessions_batch(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# GRAPH CONSOLIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def consolidate_project(
+    project_id: str | None = None,
+    operations: list[str] | None = None,
+    dry_run: bool = False,
+    confidence_threshold: float = 0.9,
+) -> dict[str, Any]:
+    """Run graph consolidation for a project.
+
+    Performs LLM-assisted graph maintenance:
+    - Entity deduplication (merge `main.py` ↔ `./main.py`)
+    - Memory merging (combine near-duplicate memories)
+    - Supersession detection (mark older memories as superseded)
+
+    Uses blocking + LSH strategy for O(n) complexity instead of O(n²),
+    with batch LLM calls to gemini-flash for cheap, fast classification.
+
+    WHEN TO USE:
+    - After significant work to clean up duplicate entities
+    - Before querying to improve retrieval quality
+    - Periodically (weekly) for active projects
+    - When graph feels "messy" with redundant information
+
+    HOW IT WORKS:
+    1. Candidate generation: Uses embeddings to find similar pairs (no LLM)
+    2. LLM scoring: Batch prompts to gemini-flash for classification
+    3. Execution: Auto-merge high confidence (>=0.9), queue medium (0.7-0.9)
+
+    Args:
+        project_id: Project to consolidate (auto-inferred from cwd if not specified)
+        operations: List of operations to run (default: all):
+            - "entity_dedup": Merge duplicate entities (file paths, tool names)
+            - "memory_merge": Combine near-duplicate memories
+            - "supersession": Detect and mark memory supersession
+        dry_run: If True, report candidates without executing changes
+        confidence_threshold: Auto-merge threshold (default 0.9).
+            Values >= this are auto-merged, 0.7-threshold go to review queue.
+
+    Returns:
+        Consolidation report with:
+        - project_id: Project that was consolidated
+        - operations_run: Which operations were performed
+        - dry_run: Whether this was a preview
+        - entity_dedup: {candidates_found, merges_executed, merges_queued}
+        - memory_merge: {candidates_found, merges_executed, merges_queued}
+        - supersession: {candidates_found, supersessions_executed, supersessions_queued}
+        - errors: Any errors encountered
+        - review_queue_count: Items requiring manual review
+
+    Examples:
+        # Full consolidation (auto-inferred project)
+        consolidate_project()
+
+        # Preview what would be consolidated (dry run)
+        consolidate_project(dry_run=True)
+
+        # Only deduplicate entities
+        consolidate_project(operations=["entity_dedup"])
+
+        # Lower threshold for more aggressive merging
+        consolidate_project(confidence_threshold=0.85)
+
+        # Specific project
+        consolidate_project(project_id="config:simplemem")
+    """
+    from simplemem_lite.backend.consolidation import consolidate_project as run_consolidation
+
+    log.info(
+        f"Tool: consolidate_project called with project_id={project_id}, "
+        f"operations={operations}, dry_run={dry_run}, threshold={confidence_threshold}"
+    )
+
+    try:
+        # Resolve project_id if not provided
+        resolved_project_id = project_id
+        if not resolved_project_id:
+            resolved_project_id = _deps.project_manager.get_project_id()
+            if not resolved_project_id:
+                return {
+                    "error": "SIMPLEMEM_NOT_BOOTSTRAPPED",
+                    "message": "Project not bootstrapped. Run bootstrap_project() first.",
+                    "suggested_action": "bootstrap_project",
+                }
+            log.info(f"Auto-resolved project_id: {resolved_project_id}")
+
+        # Run consolidation
+        report = await run_consolidation(
+            project_id=resolved_project_id,
+            operations=operations,
+            dry_run=dry_run,
+            confidence_threshold=confidence_threshold,
+        )
+
+        result = report.to_dict()
+        log.info(f"Tool: consolidate_project complete: {result}")
+        return result
+
+    except Exception as e:
+        log.error(f"Tool: consolidate_project failed: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_review_queue(
+    project_id: str | None = None,
+    limit: int = 20,
+    type_filter: str | None = None,
+) -> dict[str, Any]:
+    """Get pending consolidation candidates requiring human review.
+
+    Returns candidates with confidence 0.7-0.9 that need manual approval
+    before merge/supersession is executed.
+
+    WHEN TO USE:
+    - After running consolidate_project() to see what needs review
+    - To check pending items before approving/rejecting
+    - To understand what consolidation would do with lower thresholds
+
+    Args:
+        project_id: Filter to specific project (auto-inferred if not specified)
+        limit: Maximum candidates to return (default: 20)
+        type_filter: Filter by type: entity_dedup, memory_merge, supersession
+
+    Returns:
+        {
+            items: List of candidates with uuid, type, confidence, reason, decision_data
+            count: Number of candidates returned
+            project_id: Project these candidates belong to
+        }
+
+    Examples:
+        # Get all pending items for current project
+        get_review_queue()
+
+        # Get only entity deduplication candidates
+        get_review_queue(type_filter="entity_dedup")
+
+        # Get more results
+        get_review_queue(limit=50)
+    """
+    log.info(f"Tool: get_review_queue called with project_id={project_id}, limit={limit}, type_filter={type_filter}")
+
+    try:
+        # Resolve project_id if not provided
+        resolved_project_id = project_id
+        if not resolved_project_id:
+            resolved_project_id = _deps.project_manager.get_project_id()
+            if not resolved_project_id:
+                return {
+                    "error": "SIMPLEMEM_NOT_BOOTSTRAPPED",
+                    "message": "Project not bootstrapped. Run bootstrap_project() first.",
+                }
+
+        candidates = _deps.store.db.get_review_candidates(
+            project_id=resolved_project_id,
+            status="pending",
+            type_filter=type_filter,
+            limit=limit,
+        )
+
+        return {
+            "items": candidates,
+            "count": len(candidates),
+            "project_id": resolved_project_id,
+        }
+
+    except Exception as e:
+        log.error(f"Tool: get_review_queue failed: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def approve_review_item(candidate_id: str) -> dict[str, Any]:
+    """Approve and execute a pending consolidation candidate.
+
+    Executes the merge/supersession that was queued for review.
+    Idempotent - approving twice returns success without re-executing.
+
+    WHEN TO USE:
+    - After reviewing a candidate from get_review_queue()
+    - When you agree the items should be merged/superseded
+
+    Args:
+        candidate_id: UUID of the ReviewCandidate to approve
+
+    Returns:
+        {
+            status: "approved" | "already_resolved" | "error"
+            candidate_id: The candidate that was approved
+            type: entity_dedup | memory_merge | supersession
+        }
+
+    Examples:
+        # Approve a specific candidate
+        approve_review_item(candidate_id="abc-123-def")
+    """
+    import time
+
+    log.info(f"Tool: approve_review_item called with candidate_id={candidate_id}")
+
+    try:
+        candidate = _deps.store.db.get_review_candidate(candidate_id)
+
+        if not candidate:
+            return {
+                "error": "CANDIDATE_NOT_FOUND",
+                "candidate_id": candidate_id,
+            }
+
+        if candidate["status"] != "pending":
+            return {
+                "status": "already_resolved",
+                "candidate_id": candidate_id,
+                "previous_status": candidate["status"],
+            }
+
+        decision_data = candidate["decision_data"]
+
+        # Execute the merge based on type
+        if candidate["type"] == "entity_dedup":
+            entity_a = decision_data.get("entity_a_name")
+            entity_b = decision_data.get("entity_b_name")
+            canonical = decision_data.get("canonical_name") or entity_a
+            entity_type = decision_data.get("entity_type", "file")
+            deprecated = entity_b if entity_a == canonical else entity_a
+
+            log.info(f"Executing entity merge: {deprecated} -> {canonical}")
+
+            _deps.store.db.graph.query(
+                """
+                MATCH (m)-[r]->(e:Entity {name: $deprecated_name, type: $type})
+                MATCH (canonical:Entity {name: $canonical_name, type: $type})
+                CREATE (m)-[r2:REFERENCES]->(canonical)
+                DELETE r
+                """,
+                {
+                    "deprecated_name": deprecated,
+                    "canonical_name": canonical,
+                    "type": entity_type,
+                },
+            )
+
+            _deps.store.db.graph.query(
+                """
+                MATCH (e:Entity {name: $name, type: $type})
+                WHERE NOT EXISTS((e)-[]-())
+                DELETE e
+                """,
+                {"name": deprecated, "type": entity_type},
+            )
+
+        elif candidate["type"] == "memory_merge":
+            mem_a_uuid = decision_data.get("memory_a_uuid")
+            mem_b_uuid = decision_data.get("memory_b_uuid")
+            merged_content = decision_data.get("merged_content")
+
+            result = _deps.store.db.graph.query(
+                """
+                MATCH (a:Memory {uuid: $uuid_a})
+                MATCH (b:Memory {uuid: $uuid_b})
+                RETURN a.created_at, b.created_at
+                """,
+                {"uuid_a": mem_a_uuid, "uuid_b": mem_b_uuid},
+            )
+
+            if result.result_set:
+                time_a, time_b = result.result_set[0]
+                if (time_a or 0) >= (time_b or 0):
+                    newer_uuid, older_uuid = mem_a_uuid, mem_b_uuid
+                else:
+                    newer_uuid, older_uuid = mem_b_uuid, mem_a_uuid
+            else:
+                newer_uuid, older_uuid = mem_a_uuid, mem_b_uuid
+
+            log.info(f"Executing memory merge: {older_uuid[:8]}... -> {newer_uuid[:8]}...")
+
+            if merged_content:
+                _deps.store.db.graph.query(
+                    """
+                    MATCH (m:Memory {uuid: $uuid})
+                    SET m.content = $content,
+                        m.merged_from = $older_uuid
+                    """,
+                    {
+                        "uuid": newer_uuid,
+                        "content": merged_content,
+                        "older_uuid": older_uuid,
+                    },
+                )
+
+            _deps.store.db.mark_merged(older_uuid, newer_uuid)
+
+        elif candidate["type"] == "supersession":
+            newer_uuid = decision_data.get("newer_uuid")
+            older_uuid = decision_data.get("older_uuid")
+            supersession_type = decision_data.get("supersession_type", "full_replace")
+
+            log.info(f"Executing supersession: {newer_uuid[:8]}... supersedes {older_uuid[:8]}...")
+
+            _deps.store.db.add_supersession(
+                newer_uuid=newer_uuid,
+                older_uuid=older_uuid,
+                confidence=candidate["confidence"],
+                supersession_type=supersession_type,
+            )
+
+        _deps.store.db.update_candidate_status(candidate_id, "approved", int(time.time()))
+
+        return {
+            "status": "approved",
+            "candidate_id": candidate_id,
+            "type": candidate["type"],
+        }
+
+    except Exception as e:
+        log.error(f"Tool: approve_review_item failed: {e}", exc_info=True)
+        return {"error": str(e), "candidate_id": candidate_id}
+
+
+@mcp.tool()
+async def reject_review_item(
+    candidate_id: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Reject a candidate and mark pair to skip in future runs.
+
+    Creates a REJECTED_PAIR edge so future consolidation runs will
+    automatically skip this pair.
+
+    WHEN TO USE:
+    - After reviewing a candidate from get_review_queue()
+    - When you disagree that items should be merged/superseded
+    - When the suggested merge is incorrect
+
+    Args:
+        candidate_id: UUID of the ReviewCandidate to reject
+        reason: Optional reason for rejection (stored for reference)
+
+    Returns:
+        {
+            status: "rejected" | "already_resolved" | "error"
+            candidate_id: The candidate that was rejected
+            type: entity_dedup | memory_merge | supersession
+            reason: The reason provided (if any)
+        }
+
+    Examples:
+        # Reject a candidate
+        reject_review_item(candidate_id="abc-123-def")
+
+        # Reject with reason
+        reject_review_item(candidate_id="abc-123-def", reason="These are actually different concepts")
+    """
+    import time
+
+    log.info(f"Tool: reject_review_item called with candidate_id={candidate_id}, reason={reason}")
+
+    try:
+        candidate = _deps.store.db.get_review_candidate(candidate_id)
+
+        if not candidate:
+            return {
+                "error": "CANDIDATE_NOT_FOUND",
+                "candidate_id": candidate_id,
+            }
+
+        if candidate["status"] != "pending":
+            return {
+                "status": "already_resolved",
+                "candidate_id": candidate_id,
+                "previous_status": candidate["status"],
+            }
+
+        # Add rejected pair edge for future skip
+        _deps.store.db.add_rejected_pair(
+            candidate["source_id"],
+            candidate["target_id"],
+            candidate_id,
+        )
+
+        _deps.store.db.update_candidate_status(candidate_id, "rejected", int(time.time()))
+
+        return {
+            "status": "rejected",
+            "candidate_id": candidate_id,
+            "type": candidate["type"],
+            "reason": reason,
+        }
+
+    except Exception as e:
+        log.error(f"Tool: reject_review_item failed: {e}", exc_info=True)
+        return {"error": str(e), "candidate_id": candidate_id}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RESOURCES (4 Browsable Data Sources)
 # ═══════════════════════════════════════════════════════════════════════════════
 
