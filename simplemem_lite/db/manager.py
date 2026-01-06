@@ -9,7 +9,13 @@ Graph Backend Selection:
 The backend is auto-detected at startup, or can be forced via SIMPLEMEM_GRAPH_BACKEND env var.
 """
 
+import gc
+import os
+import shutil
 import threading
+import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import lancedb
@@ -2091,6 +2097,65 @@ class DatabaseManager:
             "relations_deleted": relations_count,
         }
 
+    def _detach_lancedb_handles(self) -> None:
+        """Best-effort disposal of LanceDB handles before directory rotation.
+
+        LanceDB python APIs don't reliably expose a close() method that guarantees
+        file handles are released. The critical piece is the global lock + dropping refs.
+        """
+        self.lance_table = None
+        self.code_table = None
+        self.lance_db = None
+        gc.collect()
+
+    def _rotate_vectors_dir(self, vectors_dir: Path) -> Path | None:
+        """Atomically move vectors_dir aside and recreate it empty.
+
+        Uses os.replace() for atomic rename on same filesystem.
+        Falls back to shutil.rmtree() if rename fails.
+
+        Args:
+            vectors_dir: Path to the vectors directory
+
+        Returns:
+            Path to backup directory if rotation happened, None otherwise
+        """
+        vectors_dir = vectors_dir.resolve()
+        parent = vectors_dir.parent
+        parent.mkdir(parents=True, exist_ok=True)
+
+        bak_dir: Path | None = None
+        if vectors_dir.exists():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            bak_dir = parent / f"{vectors_dir.name}.bak.{ts}.{uuid.uuid4().hex[:8]}"
+            try:
+                os.replace(str(vectors_dir), str(bak_dir))  # atomic on same filesystem
+                log.info(f"WIPE: Rotated vectors_dir to {bak_dir}")
+            except OSError as e:
+                # If atomic move fails (different filesystem, permissions, open handles),
+                # fall back to delete-in-place (less ideal but better than failing wipe)
+                log.warning(f"WIPE: Atomic rename failed ({e}), falling back to rmtree")
+                shutil.rmtree(vectors_dir, ignore_errors=True)
+                bak_dir = None
+
+        vectors_dir.mkdir(parents=True, exist_ok=True)
+        return bak_dir
+
+    def _delete_dir_async(self, path: Path) -> None:
+        """Fire-and-forget deletion of a directory.
+
+        Safe for dev-mode wipes; avoids blocking the HTTP response.
+        """
+        def _worker(p: Path) -> None:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                log.debug(f"WIPE: Async deleted {p}")
+            except Exception as e:
+                log.warning(f"WIPE: Async delete failed for {p}: {e}")
+
+        t = threading.Thread(target=_worker, args=(path,), name="vectors-bak-cleanup", daemon=True)
+        t.start()
+
     def wipe_all_data(self, include_logs: bool = False) -> dict[str, Any]:
         """Wipe ALL data including databases, vectors, and metadata files.
 
@@ -2109,8 +2174,6 @@ class DatabaseManager:
         Returns:
             Dictionary with detailed stats of what was deleted
         """
-        import shutil
-
         log.warning("=" * 70)
         log.warning("  WIPE_ALL_DATA: Starting COMPLETE data wipe")
         log.warning("=" * 70)
@@ -2123,6 +2186,7 @@ class DatabaseManager:
             "memories_deleted": 0,
             "relations_deleted": 0,
             "code_chunks_deleted": 0,
+            "wipe_mode": None,  # "soft" or "hard"
         }
 
         with self._write_lock:
@@ -2143,32 +2207,66 @@ class DatabaseManager:
                 log.error(f"WIPE: Failed to clear graph: {e}")
                 stats["graph_error"] = str(e)
 
-            # 2. Drop and recreate LanceDB memories table
-            try:
-                if self.VECTOR_TABLE_NAME in self.lance_db.table_names():
-                    self.lance_db.drop_table(self.VECTOR_TABLE_NAME)
-                    stats["tables_dropped"].append(self.VECTOR_TABLE_NAME)
-                    log.info(f"WIPE: Dropped table '{self.VECTOR_TABLE_NAME}'")
-                self._init_lance_table()
-            except Exception as e:
-                log.error(f"WIPE: Failed to reset memories table: {e}")
-                stats["memories_table_error"] = str(e)
+            # 2. Two-tier LanceDB wipe (soft + hard)
+            # This handles corruption gracefully - if soft wipe fails, do a hard reset
+            vectors_dir = Path(self.config.vectors_dir)
+            tables_to_drop = [self.VECTOR_TABLE_NAME, self.CODE_TABLE_NAME]
 
-            # 3. Drop and recreate code_chunks table
+            # Always detach handles first so they can't be used during wipe
+            self._detach_lancedb_handles()
+
+            # Tier A: Soft wipe - try drop_table directly (don't call table_names)
+            soft_wipe_failed = False
+            soft_error: str | None = None
             try:
-                if self.CODE_TABLE_NAME in self.lance_db.table_names():
-                    # Count before dropping
-                    code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
-                    stats["code_chunks_deleted"] = code_table.count_rows()
-                    self.lance_db.drop_table(self.CODE_TABLE_NAME)
-                    stats["tables_dropped"].append(self.CODE_TABLE_NAME)
-                    log.info(f"WIPE: Dropped table '{self.CODE_TABLE_NAME}' ({stats['code_chunks_deleted']} chunks)")
-                # Recreate if code search is enabled
+                db = lancedb.connect(str(vectors_dir))
+
+                for table_name in tables_to_drop:
+                    try:
+                        db.drop_table(table_name)
+                        stats["tables_dropped"].append(table_name)
+                        log.info(f"WIPE: Soft-dropped table '{table_name}'")
+                    except Exception as e:
+                        # Accept "not found"-like cases; anything else triggers hard wipe
+                        msg = str(e).lower()
+                        if "not found" in msg or "does not exist" in msg or "no such" in msg:
+                            log.debug(f"WIPE: Table '{table_name}' not found (OK)")
+                        else:
+                            raise  # Re-raise to trigger hard wipe
+
+                # Reconnect and init tables
+                self.lance_db = lancedb.connect(str(vectors_dir))
+                self._init_lance_table()
                 if self.config.code_index_enabled:
                     self._init_code_table()
+                stats["wipe_mode"] = "soft"
+                log.info("WIPE: Soft wipe succeeded")
+
             except Exception as e:
-                log.error(f"WIPE: Failed to reset code_chunks table: {e}")
-                stats["code_table_error"] = str(e)
+                soft_wipe_failed = True
+                soft_error = repr(e)
+                log.warning(f"WIPE: Soft wipe failed ({soft_error}), falling back to hard wipe")
+
+            # Tier B: Hard wipe - rotate entire vectors_dir and recreate fresh
+            if soft_wipe_failed:
+                bak_dir = self._rotate_vectors_dir(vectors_dir)
+
+                # Fresh connect + init
+                self.lance_db = lancedb.connect(str(vectors_dir))
+                self._init_lance_table()
+                if self.config.code_index_enabled:
+                    self._init_code_table()
+
+                stats["wipe_mode"] = "hard"
+                stats["soft_error"] = soft_error
+                if bak_dir:
+                    stats["bak_dir"] = str(bak_dir)
+                    stats["directories_deleted"].append(f"vectors/ (backed up to {bak_dir.name})")
+                    # Schedule async deletion of backup
+                    self._delete_dir_async(bak_dir)
+                else:
+                    stats["directories_deleted"].append("vectors/ (deleted in-place)")
+                log.info(f"WIPE: Hard wipe succeeded (bak_dir={bak_dir})")
 
             # 4. Delete metadata files
             metadata_files = [
@@ -2211,10 +2309,12 @@ class DatabaseManager:
                         log.error(f"WIPE: Failed to clear logs directory: {e}")
 
         log.warning("=" * 70)
-        log.warning("  WIPE_ALL_DATA: Complete")
+        log.warning(f"  WIPE_ALL_DATA: Complete (mode={stats['wipe_mode']})")
         log.warning(f"  Tables dropped: {stats['tables_dropped']}")
         log.warning(f"  Files deleted: {stats['files_deleted']}")
         log.warning(f"  Directories cleared: {stats['directories_deleted']}")
+        if stats.get("soft_error"):
+            log.warning(f"  Soft wipe error (recovered): {stats['soft_error']}")
         log.warning("=" * 70)
 
         return stats

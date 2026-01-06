@@ -57,6 +57,7 @@ class TraceInput(BaseModel):
     session_id: str = Field(..., description="Session UUID")
     trace_content: str | dict | list = Field(..., description="Trace content (raw or compressed)")
     compressed: bool = Field(default=False, description="Whether trace_content is gzip+base64")
+    project_id: str | None = Field(default=None, description="Project ID for this trace")
 
 
 class ProcessTraceBatchRequest(BaseModel):
@@ -64,6 +65,7 @@ class ProcessTraceBatchRequest(BaseModel):
 
     traces: list[TraceInput] = Field(..., description="List of trace objects to process")
     max_concurrent: int = Field(default=3, ge=1, le=10)
+    project_id: str | None = Field(default=None, description="Project ID for memory isolation (applied to all traces)")
 
 
 def _cleanup_old_jobs() -> None:
@@ -260,8 +262,10 @@ async def process_trace_batch(
                 trace_data = trace_input.trace_content
 
             # Create job and queue background task
+            # Per-trace project_id takes precedence, fallback to request-level
+            effective_project_id = trace_input.project_id or request.project_id
             job_id = _create_job("process_trace", trace_input.session_id)
-            background_tasks.add_task(_process_trace_task, job_id, trace_input.session_id, trace_data)
+            background_tasks.add_task(_process_trace_task, job_id, trace_input.session_id, trace_data, effective_project_id)
 
             queued.append(trace_input.session_id)
             job_ids[trace_input.session_id] = job_id
