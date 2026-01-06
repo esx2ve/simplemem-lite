@@ -970,3 +970,93 @@ class MemoryStore:
             formatted.append(f"[MEMORY {i}] ({meta_str})\n{content}\n")
 
         return "\n".join(formatted)
+
+    def reindex_memories(
+        self,
+        project_id: str,
+        batch_size: int = 50,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Re-generate embeddings for all memories in a project.
+
+        Fetches memories from the graph database, generates new embeddings
+        using the current embedding model, and writes them to LanceDB.
+        This fixes embedding model mismatches where memories were embedded
+        with one model but searches use a different model.
+
+        Args:
+            project_id: Project to reindex
+            batch_size: Number of memories to embed per batch (default: 50)
+            progress_callback: Optional callback(processed, total) for progress
+
+        Returns:
+            dict with:
+            - reindexed: Number of memories successfully reindexed
+            - errors: Number of embedding failures
+            - project_id: The project that was reindexed
+            - total: Total memories found in graph
+        """
+        log.info(f"Starting reindex for project: {project_id}, batch_size={batch_size}")
+
+        # Step 1: Get total count for progress tracking
+        total_count = self.db.get_memory_count(project_id)
+        if total_count == 0:
+            log.info(f"No memories found for project {project_id}")
+            return {
+                "reindexed": 0,
+                "errors": 0,
+                "project_id": project_id,
+                "total": 0,
+            }
+
+        log.info(f"Found {total_count} memories to reindex")
+
+        # Step 2: Fetch memories in batches from graph
+        batches = self.db.get_memories_for_reindex(project_id, batch_size=batch_size)
+
+        reindexed = 0
+        errors = 0
+        processed = 0
+
+        # Step 3: Process each batch
+        for batch_idx, batch in enumerate(batches):
+            try:
+                # Extract content for embedding
+                contents = [mem["content"] for mem in batch]
+
+                # Generate embeddings via batch API
+                log.debug(f"Batch {batch_idx + 1}/{len(batches)}: embedding {len(contents)} memories")
+                embeddings = embed_batch(contents, self.config)
+
+                if len(embeddings) != len(batch):
+                    log.warning(f"Batch {batch_idx + 1}: embedding count mismatch ({len(embeddings)} vs {len(batch)})")
+                    errors += len(batch) - len(embeddings)
+                    # Truncate to match
+                    batch = batch[:len(embeddings)]
+
+                # Write to LanceDB via upsert
+                written = self.db.upsert_memory_vectors(batch, embeddings)
+                reindexed += written
+
+                processed += len(batch)
+                log.debug(f"Batch {batch_idx + 1}/{len(batches)}: wrote {written} vectors")
+
+                # Progress callback
+                if progress_callback:
+                    try:
+                        progress_callback(processed, total_count)
+                    except Exception as e:
+                        log.warning(f"Progress callback failed: {e}")
+
+            except Exception as e:
+                log.error(f"Batch {batch_idx + 1} failed: {e}")
+                errors += len(batch)
+                processed += len(batch)
+
+        log.info(f"Reindex complete: {reindexed} reindexed, {errors} errors, {total_count} total")
+        return {
+            "reindexed": reindexed,
+            "errors": errors,
+            "project_id": project_id,
+            "total": total_count,
+        }

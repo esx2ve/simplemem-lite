@@ -1556,6 +1556,142 @@ class DatabaseManager:
         return results
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # MEMORY REINDEXING METHODS
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    def get_memories_for_reindex(
+        self,
+        project_id: str,
+        batch_size: int = 100,
+    ) -> list[list[dict[str, Any]]]:
+        """Fetch memories from graph for re-indexing.
+
+        Retrieves all memories for a project from the graph database
+        to enable re-generation of their embeddings.
+
+        Args:
+            project_id: Project to fetch memories for
+            batch_size: Number of memories per batch
+
+        Returns:
+            List of batches, each containing dicts with uuid, content, type, session_id
+        """
+        log.info(f"Fetching memories for reindex: project={project_id}, batch_size={batch_size}")
+
+        # Get all memories for this project
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)
+            WHERE m.project_id = $project_id
+            RETURN m.uuid, m.content, m.type, m.session_id
+            """,
+            {"project_id": project_id},
+        )
+
+        if not result.result_set:
+            log.info(f"No memories found for project {project_id}")
+            return []
+
+        # Convert to list of dicts
+        all_memories = [
+            {
+                "uuid": row[0],
+                "content": row[1],
+                "type": row[2],
+                "session_id": row[3] if row[3] else None,
+            }
+            for row in result.result_set
+            if row[0] and row[1]  # Ensure uuid and content exist
+        ]
+
+        log.info(f"Found {len(all_memories)} memories to reindex")
+
+        # Split into batches
+        batches = []
+        for i in range(0, len(all_memories), batch_size):
+            batches.append(all_memories[i : i + batch_size])
+
+        log.debug(f"Split into {len(batches)} batches")
+        return batches
+
+    def upsert_memory_vectors(
+        self,
+        memories: list[dict[str, Any]],
+        vectors: list[list[float]],
+    ) -> int:
+        """Write/update vectors in LanceDB for given memory UUIDs.
+
+        Strategy: Delete existing by UUID, then add new.
+        LanceDB lacks native upsert, so we implement it manually.
+
+        Args:
+            memories: List of memory dicts with uuid, content, type, session_id
+            vectors: Corresponding embedding vectors
+
+        Returns:
+            Number of vectors written
+        """
+        import json
+
+        if not memories or not vectors:
+            return 0
+
+        if len(memories) != len(vectors):
+            raise ValueError(f"Mismatched counts: {len(memories)} memories, {len(vectors)} vectors")
+
+        log.debug(f"Upserting {len(memories)} memory vectors")
+
+        with self._write_lock:
+            # Step 1: Delete existing vectors for these UUIDs
+            uuids = [m["uuid"] for m in memories]
+            escaped_uuids = [uid.replace('"', '\\"') for uid in uuids]
+            uuid_list = ", ".join(f'"{uid}"' for uid in escaped_uuids)
+            try:
+                self.lance_table.delete(f"uuid IN ({uuid_list})")
+                log.trace(f"Deleted existing vectors for {len(uuids)} UUIDs")
+            except Exception as e:
+                log.warning(f"Delete step failed (may be empty): {e}")
+
+            # Step 2: Add new vectors
+            records = []
+            for mem, vec in zip(memories, vectors):
+                records.append({
+                    "uuid": mem["uuid"],
+                    "vector": vec,
+                    "content": mem["content"],
+                    "type": mem.get("type", "fact"),
+                    "session_id": mem.get("session_id") or "",
+                    "metadata": json.dumps({"reindexed": True}),
+                })
+
+            self.lance_table.add(records)
+            log.debug(f"Added {len(records)} vectors to LanceDB")
+
+        return len(records)
+
+    def get_memory_count(self, project_id: str) -> int:
+        """Get count of memories for a project in the graph.
+
+        Args:
+            project_id: Project to count memories for
+
+        Returns:
+            Number of memories in the graph
+        """
+        result = self.graph.query(
+            """
+            MATCH (m:Memory)
+            WHERE m.project_id = $project_id
+            RETURN count(m) AS cnt
+            """,
+            {"project_id": project_id},
+        )
+
+        if result.result_set and result.result_set[0]:
+            return result.result_set[0][0] or 0
+        return 0
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # CODE SEARCH METHODS
     # ═══════════════════════════════════════════════════════════════════════════════
 

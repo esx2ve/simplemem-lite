@@ -101,3 +101,69 @@ async def admin_status() -> dict:
         "require_auth": config.require_auth,
         "require_project_id": config.require_project_id,
     }
+
+
+class ReindexRequest(BaseModel):
+    """Request body for reindex endpoint."""
+
+    background: bool = True
+
+
+class ReindexResponse(BaseModel):
+    """Response from reindex endpoint."""
+
+    status: str
+    project_id: str
+    reindexed: int | None = None
+    errors: int | None = None
+    total: int | None = None
+    job_id: str | None = None
+    message: str | None = None
+
+
+@router.post("/reindex/{project_id}", response_model=ReindexResponse)
+async def reindex_project(
+    project_id: str,
+    request: ReindexRequest | None = None,
+) -> ReindexResponse:
+    """Re-generate embeddings for all memories in a project.
+
+    This fixes embedding model mismatches where memories were embedded
+    with one model but searches use a different model.
+
+    Args:
+        project_id: Project to reindex (URL path parameter)
+        request.background: Run in background job (default: True)
+
+    Returns:
+        If background=True: {"job_id": "...", "status": "submitted"}
+        If background=False: {"reindexed": N, "errors": 0, "project_id": "..."}
+    """
+    from simplemem_lite.backend.services import get_memory_store
+
+    background = request.background if request else True
+
+    log.info(f"ADMIN: reindex_project called for {project_id}, background={background}")
+
+    store = get_memory_store()
+
+    if background:
+        # For background, we would need to submit to a job manager
+        # For now, just run synchronously with a warning for large projects
+        log.warning("Background reindex via REST API not yet implemented, running synchronously")
+
+    try:
+        result = store.reindex_memories(project_id)
+        return ReindexResponse(
+            status="completed",
+            project_id=project_id,
+            reindexed=result.get("reindexed", 0),
+            errors=result.get("errors", 0),
+            total=result.get("total", 0),
+        )
+    except Exception as e:
+        log.error(f"Reindex failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )

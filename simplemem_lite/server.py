@@ -2763,6 +2763,85 @@ async def reject_review_item(
         return {"error": str(e), "candidate_id": candidate_id}
 
 
+@mcp.tool()
+async def reindex_memories(
+    project_id: str | None = None,
+    background: bool = True,
+) -> dict[str, Any]:
+    """Re-generate embeddings for memories in a project.
+
+    PURPOSE: Fix embedding model mismatches or regenerate missing embeddings.
+    Use when vector search returns empty despite memories existing in graph.
+
+    This is necessary when:
+    - Memories were embedded with one model (e.g., MiniLM) but searches use another (e.g., Gemini)
+    - Embeddings were deleted from LanceDB but memories still exist in Memgraph
+    - Switching embedding models and need to re-embed all content
+
+    WHEN TO USE:
+    - search_memories returns empty for a project you know has data
+    - After changing SIMPLEMEM_EMBEDDING_MODEL config
+    - After manually deleting vectors from LanceDB
+
+    Args:
+        project_id: Project to reindex. Uses current project if not specified.
+                    MUST be provided for cloud/remote operations.
+        background: Run in background job (default: True). Large projects
+                    may take minutes; background prevents timeout.
+
+    Returns:
+        If background=True: {"job_id": "...", "status": "submitted"}
+        If background=False: {"reindexed": N, "errors": 0, "project_id": "..."}
+
+    Examples:
+        # Reindex 3dtex project synchronously
+        reindex_memories(project_id="config:3dtex", background=False)
+
+        # Reindex in background (for large projects)
+        reindex_memories(project_id="config:3dtex", background=True)
+        # Check progress with: job_status(job_id="...")
+    """
+    log.info(f"Tool: reindex_memories called with project_id={project_id}, background={background}")
+
+    # Resolve project_id if not provided
+    resolved_project_id = project_id
+    if not resolved_project_id:
+        resolved_project_id = await _resolve_project_id(None)
+        if not resolved_project_id:
+            return {
+                "error": "PROJECT_ID_REQUIRED",
+                "message": "project_id is required. Provide explicitly or ensure you're in a bootstrapped project.",
+            }
+
+    log.info(f"Tool: reindex_memories resolved project_id={resolved_project_id}")
+
+    if background:
+        # Submit to background job manager
+        async def _reindex_task(pid: str) -> dict:
+            """Background job wrapper for reindex_memories."""
+            log.info(f"Background job: reindex_memories starting for project {pid}")
+            result = _deps.store.reindex_memories(pid)
+            log.info(f"Background job: reindex_memories complete: {result.get('reindexed', 0)} reindexed")
+            return result
+
+        job_id = await _deps.job_manager.submit("reindex_memories", _reindex_task, resolved_project_id)
+        log.info(f"Tool: reindex_memories submitted as background job {job_id}")
+        return {
+            "job_id": job_id,
+            "status": "submitted",
+            "project_id": resolved_project_id,
+            "message": f"Reindex submitted. Check progress with job_status('{job_id}')",
+        }
+
+    # Synchronous execution
+    try:
+        result = _deps.store.reindex_memories(resolved_project_id)
+        return result
+    except Exception as e:
+        log.error(f"Tool: reindex_memories failed: {e}", exc_info=True)
+        return {"error": str(e), "project_id": resolved_project_id}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESOURCES (4 Browsable Data Sources)
 # ═══════════════════════════════════════════════════════════════════════════════
