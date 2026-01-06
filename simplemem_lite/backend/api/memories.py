@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
+from simplemem_lite.backend.scoring import ScoringWeights, apply_temporal_scoring
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem
@@ -63,6 +64,33 @@ class SearchMemoriesRequest(BaseModel):
     use_graph: bool = Field(default=True)
     type_filter: str | None = Field(default=None)
     project_id: str | None = Field(default=None)
+    # Temporal scoring options
+    use_temporal_scoring: bool = Field(
+        default=True,
+        description="Apply temporal decay and importance scoring to re-rank results",
+    )
+    scoring_details: bool = Field(
+        default=False,
+        description="Include detailed scoring breakdown in results",
+    )
+    vector_weight: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Weight for vector similarity (default: 0.6)",
+    )
+    temporal_weight: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Weight for temporal decay (default: 0.25)",
+    )
+    importance_weight: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Weight for type importance (default: 0.15)",
+    )
 
 
 class AskMemoriesRequest(BaseModel):
@@ -120,7 +148,16 @@ async def store_memory(request: StoreMemoryRequest) -> StoreMemoryResponse:
 
 @router.post("/search")
 async def search_memories(request: SearchMemoriesRequest) -> dict:
-    """Search memories with hybrid vector + graph search."""
+    """Search memories with hybrid vector + graph search.
+
+    When use_temporal_scoring=True (default), results are re-ranked using
+    multi-factor scoring that combines:
+    - Vector similarity (normalized per-request)
+    - Temporal decay (newer memories ranked higher)
+    - Type importance (decisions > lessons > facts > summaries)
+
+    Set use_temporal_scoring=False for pure vector similarity ranking.
+    """
     require_project_id(request.project_id, "search_memories")
     try:
         store = get_memory_store()
@@ -132,21 +169,55 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
             project_id=request.project_id,
         )
 
+        # Convert Memory objects to dicts for scoring
+        result_dicts = [
+            {
+                "uuid": m.uuid,
+                "content": m.content,
+                "type": m.type,
+                "score": m.score,
+                "session_id": m.session_id,
+                "created_at": m.created_at,
+            }
+            for m in results
+        ]
+
+        # Apply temporal scoring if enabled
+        if request.use_temporal_scoring and result_dicts:
+            # Validate weights sum to ~1.0
+            total_weight = request.vector_weight + request.temporal_weight + request.importance_weight
+            if abs(total_weight - 1.0) > 0.01:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Scoring weights must sum to 1.0, got {total_weight:.2f}",
+                )
+
+            weights = ScoringWeights(
+                vector=request.vector_weight,
+                temporal=request.temporal_weight,
+                importance=request.importance_weight,
+            )
+            result_dicts = apply_temporal_scoring(
+                result_dicts,
+                weights=weights,
+                return_details=request.scoring_details,
+            )
+
         return {
-            "results": [
-                {
-                    "uuid": m.uuid,
-                    "content": m.content,
-                    "type": m.type,
-                    "score": m.score,
-                    "session_id": m.session_id,
-                    "created_at": m.created_at,
-                }
-                for m in results
-            ],
-            "count": len(results),
+            "results": result_dicts,
+            "count": len(result_dicts),
+            "scoring": {
+                "temporal_enabled": request.use_temporal_scoring,
+                "weights": {
+                    "vector": request.vector_weight,
+                    "temporal": request.temporal_weight,
+                    "importance": request.importance_weight,
+                } if request.use_temporal_scoring else None,
+            },
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.error(f"Search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
