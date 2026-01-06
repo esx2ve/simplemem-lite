@@ -2091,6 +2091,134 @@ class DatabaseManager:
             "relations_deleted": relations_count,
         }
 
+    def wipe_all_data(self, include_logs: bool = False) -> dict[str, Any]:
+        """Wipe ALL data including databases, vectors, and metadata files.
+
+        DEV MODE ONLY. This is a complete factory reset.
+
+        Unlike reset_all() which only clears memories and vectors, this method
+        also clears:
+        - Code chunks table
+        - Metadata files (projects.json, session_state.db, etc.)
+        - Jobs directory
+        - Optionally logs
+
+        Args:
+            include_logs: If True, also wipe the logs directory (default: False)
+
+        Returns:
+            Dictionary with detailed stats of what was deleted
+        """
+        import shutil
+
+        log.warning("=" * 70)
+        log.warning("  WIPE_ALL_DATA: Starting COMPLETE data wipe")
+        log.warning("=" * 70)
+
+        stats: dict[str, Any] = {
+            "tables_dropped": [],
+            "files_deleted": [],
+            "directories_deleted": [],
+            "graph_cleared": False,
+            "memories_deleted": 0,
+            "relations_deleted": 0,
+            "code_chunks_deleted": 0,
+        }
+
+        with self._write_lock:
+            # 1. Count and clear graph
+            try:
+                result = self.graph.query("MATCH (m:Memory) RETURN count(m)")
+                stats["memories_deleted"] = result.result_set[0][0] if result.result_set else 0
+
+                result = self.graph.query("MATCH ()-[r]->() RETURN count(r)")
+                stats["relations_deleted"] = result.result_set[0][0] if result.result_set else 0
+
+                log.debug("WIPE: Deleting all graph data")
+                self.graph.query("MATCH (n) DETACH DELETE n")
+                self._graph_backend.init_schema()
+                stats["graph_cleared"] = True
+                log.info(f"WIPE: Graph cleared ({stats['memories_deleted']} memories, {stats['relations_deleted']} relations)")
+            except Exception as e:
+                log.error(f"WIPE: Failed to clear graph: {e}")
+                stats["graph_error"] = str(e)
+
+            # 2. Drop and recreate LanceDB memories table
+            try:
+                if self.VECTOR_TABLE_NAME in self.lance_db.table_names():
+                    self.lance_db.drop_table(self.VECTOR_TABLE_NAME)
+                    stats["tables_dropped"].append(self.VECTOR_TABLE_NAME)
+                    log.info(f"WIPE: Dropped table '{self.VECTOR_TABLE_NAME}'")
+                self._init_lance_table()
+            except Exception as e:
+                log.error(f"WIPE: Failed to reset memories table: {e}")
+                stats["memories_table_error"] = str(e)
+
+            # 3. Drop and recreate code_chunks table
+            try:
+                if self.CODE_TABLE_NAME in self.lance_db.table_names():
+                    # Count before dropping
+                    code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
+                    stats["code_chunks_deleted"] = code_table.count_rows()
+                    self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                    stats["tables_dropped"].append(self.CODE_TABLE_NAME)
+                    log.info(f"WIPE: Dropped table '{self.CODE_TABLE_NAME}' ({stats['code_chunks_deleted']} chunks)")
+                # Recreate if code search is enabled
+                if self.config.code_index_enabled:
+                    self._init_code_table()
+            except Exception as e:
+                log.error(f"WIPE: Failed to reset code_chunks table: {e}")
+                stats["code_table_error"] = str(e)
+
+            # 4. Delete metadata files
+            metadata_files = [
+                "projects.json",
+                "session_state.db",
+                "pending_session.json",
+                "status.json",
+            ]
+            for filename in metadata_files:
+                filepath = self.config.data_dir / filename
+                if filepath.exists():
+                    try:
+                        filepath.unlink()
+                        stats["files_deleted"].append(filename)
+                        log.info(f"WIPE: Deleted {filename}")
+                    except Exception as e:
+                        log.error(f"WIPE: Failed to delete {filename}: {e}")
+
+            # 5. Clear jobs directory
+            jobs_dir = self.config.data_dir / "jobs"
+            if jobs_dir.exists():
+                try:
+                    shutil.rmtree(jobs_dir)
+                    jobs_dir.mkdir(exist_ok=True)
+                    stats["directories_deleted"].append("jobs/")
+                    log.info("WIPE: Cleared jobs directory")
+                except Exception as e:
+                    log.error(f"WIPE: Failed to clear jobs directory: {e}")
+
+            # 6. Optionally clear logs
+            if include_logs:
+                logs_dir = self.config.data_dir / "logs"
+                if logs_dir.exists():
+                    try:
+                        shutil.rmtree(logs_dir)
+                        logs_dir.mkdir(exist_ok=True)
+                        stats["directories_deleted"].append("logs/")
+                        log.info("WIPE: Cleared logs directory")
+                    except Exception as e:
+                        log.error(f"WIPE: Failed to clear logs directory: {e}")
+
+        log.warning("=" * 70)
+        log.warning("  WIPE_ALL_DATA: Complete")
+        log.warning(f"  Tables dropped: {stats['tables_dropped']}")
+        log.warning(f"  Files deleted: {stats['files_deleted']}")
+        log.warning(f"  Directories cleared: {stats['directories_deleted']}")
+        log.warning("=" * 70)
+
+        return stats
+
     def get_stats(self) -> dict[str, Any]:
         """Get graph statistics including entity and verb edge counts.
 
