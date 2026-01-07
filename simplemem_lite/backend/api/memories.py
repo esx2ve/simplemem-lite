@@ -67,7 +67,7 @@ class SearchMemoriesRequest(BaseModel):
     project_id: str | None = Field(default=None)
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
     # Temporal scoring options
     use_temporal_scoring: bool = Field(
@@ -105,6 +105,10 @@ class AskMemoriesRequest(BaseModel):
     max_memories: int = Field(default=8, ge=1, le=20)
     max_hops: int = Field(default=2, ge=1, le=3)
     project_id: str | None = Field(default=None, description="Project identifier")
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'toon' (sources only) or 'json' (full response with answer). Env var: SIMPLEMEM_OUTPUT_FORMAT.",
+    )
 
 
 class ReasonMemoriesRequest(BaseModel):
@@ -116,7 +120,7 @@ class ReasonMemoriesRequest(BaseModel):
     project_id: str | None = Field(default=None, description="Project identifier")
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 
@@ -226,8 +230,13 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
 
 
 @router.post("/ask")
+@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources")
 async def ask_memories(request: AskMemoriesRequest) -> dict:
-    """Ask a question and get LLM-synthesized answer from memories."""
+    """Ask a question and get LLM-synthesized answer from memories.
+
+    Returns full structured response with answer + sources when output_format='json' (default).
+    Returns only source memories as TOON when output_format='toon' (for token efficiency).
+    """
     require_project_id(request.project_id, "ask_memories")
     try:
         store = get_memory_store()
@@ -370,7 +379,7 @@ class SearchDeepRequest(BaseModel):
     project_id: str | None = Field(default=None, description="Project identifier")
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 
@@ -453,7 +462,7 @@ class CheckContradictionsRequest(BaseModel):
     project_id: str | None = Field(default=None, description="Project identifier")
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 
