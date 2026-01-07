@@ -1259,6 +1259,192 @@ class MemoryStore:
 
         return score
 
+    async def reason_with_synthesis(
+        self,
+        query: str,
+        max_memories: int = 10,
+        max_hops: int = 2,
+        min_score: float = 0.1,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """LLM-synthesized reasoning over memory graph.
+
+        Performs multi-hop graph traversal, then uses an LLM to synthesize
+        a condensed explanation of evidence chains and connection patterns.
+        Returns reasoning summary + UUID references (not full content).
+
+        Args:
+            query: Natural language query to reason about
+            max_memories: Maximum memories to analyze (default: 10)
+            max_hops: Maximum graph traversal depth (default: 2)
+            min_score: Minimum score threshold (default: 0.1)
+            project_id: Optional filter by project
+
+        Returns:
+            Dictionary with:
+            - reasoning: LLM-synthesized explanation of evidence chains
+            - patterns: List of detected cross-session patterns
+            - confidence: high/medium/low based on evidence quality
+            - sources: List of source refs (uuid, type, score, hops, proof_chain)
+        """
+        from litellm import acompletion
+
+        log.info(f"reason_with_synthesis: query='{query[:50]}...', max_memories={max_memories}, project={project_id}")
+
+        # Step 1: Get graph-traversed memories via existing reason()
+        memories = self.reason(
+            query,
+            seed_limit=max_memories,
+            max_hops=max_hops,
+            min_score=min_score,
+            project_id=project_id,
+        )[:max_memories]
+
+        if not memories:
+            log.info("reason_with_synthesis: No relevant memories found")
+            return {
+                "reasoning": "No relevant memories found for this query.",
+                "patterns": [],
+                "confidence": "none",
+                "cross_session_count": 0,
+                "sources": [],
+            }
+
+        # Step 2: Format memories for LLM (truncated content)
+        formatted = self._format_memories_for_reasoning(memories)
+        cross_session_count = sum(1 for m in memories if m.get("cross_session"))
+
+        # Step 3: Calculate confidence
+        avg_score = sum(m["score"] for m in memories) / len(memories)
+        if avg_score >= 0.5:
+            confidence = "high"
+        elif avg_score >= 0.2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Step 4: LLM prompt focused on REASONING structure, not answering
+        prompt = f'''You are analyzing evidence chains from a memory graph. Your task is to explain HOW memories are connected, not to answer the query directly.
+
+## Query Being Analyzed
+{query}
+
+## Retrieved Evidence (via graph traversal with PageRank)
+{formatted}
+
+## Your Task
+Provide a concise reasoning summary (2-4 sentences) that:
+1. Explains the CONNECTION STRUCTURE - how memories relate via proof chains
+2. Highlights CROSS-SESSION PATTERNS if any (memories from different sessions linked by shared entities)
+3. Identifies the STRONGEST evidence paths (highest scores, shortest hops)
+4. References memories as [1], [2], etc.
+
+Also extract any notable patterns as a bullet list.
+
+## Format
+REASONING: <your 2-4 sentence synthesis explaining the evidence structure>
+
+PATTERNS:
+- <pattern 1>
+- <pattern 2>
+(or "None detected" if no clear patterns)'''
+
+        # Step 5: Call LLM
+        try:
+            response = await acompletion(
+                model=self.config.summary_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=400,
+                temperature=0.2,
+            )
+            raw_response = response.choices[0].message.content or ""
+
+            # Parse response
+            reasoning = raw_response
+            patterns = []
+
+            if raw_response and "REASONING:" in raw_response:
+                parts = raw_response.split("PATTERNS:")
+                reasoning_part = parts[0].replace("REASONING:", "").strip()
+                reasoning = reasoning_part
+
+                if len(parts) > 1:
+                    patterns_part = parts[1].strip()
+                    if patterns_part.lower() != "none detected":
+                        # Extract bullet points
+                        for line in patterns_part.split("\n"):
+                            line = line.strip()
+                            if line.startswith("-"):
+                                patterns.append(line[1:].strip())
+
+        except Exception as e:
+            log.error(f"reason_with_synthesis LLM call failed: {e}")
+            reasoning = f"Error synthesizing reasoning: {e}"
+            patterns = []
+            confidence = "error"
+
+        log.info(f"reason_with_synthesis complete: {len(memories)} memories, {len(patterns)} patterns, confidence={confidence}")
+
+        return {
+            "reasoning": reasoning,
+            "patterns": patterns,
+            "confidence": confidence,
+            "cross_session_count": cross_session_count,
+            "sources": [
+                {
+                    "uuid": m["uuid"],
+                    "type": m["type"],
+                    "score": round(m["score"], 3),
+                    "hops": m["hops"],
+                    "proof_chain": m.get("proof_chain", []),
+                    "cross_session": m.get("cross_session", False),
+                }
+                for m in memories
+            ],
+        }
+
+    def _format_memories_for_reasoning(self, memories: list[dict[str, Any]]) -> str:
+        """Format memories for reasoning LLM prompt.
+
+        Focuses on structure (proof chains, hops) over content.
+        Content is heavily truncated since we want reasoning about structure.
+
+        Args:
+            memories: List of memory dicts from reason()
+
+        Returns:
+            Formatted string with numbered memories
+        """
+        formatted = []
+        for i, m in enumerate(memories, 1):
+            parts = [f"[{i}] type={m['type']}, score={m['score']:.2f}"]
+
+            if m["hops"] > 0:
+                parts.append(f"hops={m['hops']}")
+                if m.get("proof_chain"):
+                    chain = m["proof_chain"]
+                    if len(chain) > 3:
+                        path_str = f"{chain[0]} -> ... -> {chain[-1]}"
+                    else:
+                        path_str = " -> ".join(chain)
+                    parts.append(f"path=[{path_str}]")
+
+            if m.get("cross_session"):
+                parts.append("[CROSS-SESSION]")
+                bridge = m.get("bridge_entity", {})
+                if bridge:
+                    parts.append(f"via {bridge.get('type', 'entity')}:{bridge.get('name', '?')}")
+
+            # Truncate content heavily - we care about structure
+            content = m.get("content", "")[:200]
+            if len(m.get("content", "")) > 200:
+                content += "..."
+
+            meta = ", ".join(parts)
+            formatted.append(f"{meta}\n   Content: {content}")
+
+        return "\n\n".join(formatted)
+
     async def ask_memories(
         self,
         query: str,

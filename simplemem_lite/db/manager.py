@@ -1827,6 +1827,37 @@ class DatabaseManager:
         log.debug(f"Code search returned {len(results)} results")
         return results
 
+    def get_code_chunk_by_uuid(self, uuid: str) -> dict | None:
+        """Retrieve a specific code chunk by UUID.
+
+        Args:
+            uuid: Code chunk UUID
+
+        Returns:
+            Code chunk dict if found, None otherwise
+        """
+        if not self.config.code_index_enabled:
+            return None
+
+        log.trace(f"Getting code chunk: uuid={uuid[:8]}...")
+
+        with self._write_lock:  # LanceDB not thread-safe for concurrent ops
+            try:
+                safe_uuid = uuid.replace("'", "''")
+                results = self.code_table.search([0.0] * self.config.embedding_dim).where(
+                    f"uuid = '{safe_uuid}'"
+                ).limit(1).to_list()
+
+                if results:
+                    log.trace(f"Found code chunk: filepath={results[0].get('filepath', '')[:50]}")
+                    return results[0]
+
+            except Exception as e:
+                log.warning(f"Failed to get code chunk by UUID: {e}")
+
+        log.trace(f"Code chunk not found: uuid={uuid[:8]}...")
+        return None
+
     def clear_code_index(self, project_id: str | None = None) -> int:
         """Clear code index for a project or all projects.
 

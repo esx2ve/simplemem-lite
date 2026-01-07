@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.services import get_memory_store
+from simplemem_lite.backend.toon import toonify
 from simplemem_lite.log_config import get_logger
 
 router = APIRouter()
@@ -60,6 +61,10 @@ class CypherQueryRequest(BaseModel):
 
     params: dict | None = Field(default=None, description="Query parameters")
     max_results: int = Field(default=100, ge=1, le=1000)
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 @router.get("/schema")
@@ -88,6 +93,7 @@ async def get_query_templates() -> dict:
 
 
 @router.post("/query")
+@toonify(headers=["uuid", "type", "content", "created_at"])
 async def run_cypher_query(request: CypherQueryRequest) -> dict:
     """Execute a validated Cypher query against the graph.
 

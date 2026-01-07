@@ -1188,6 +1188,32 @@ class CodeIndexer:
         log.info(f"Code search returned {len(formatted)} results")
         return formatted
 
+    def get_chunk(self, uuid: str) -> dict | None:
+        """Retrieve a specific code chunk by UUID.
+
+        Use this to fetch full content for a chunk found via search().
+
+        Args:
+            uuid: Code chunk UUID
+
+        Returns:
+            Code chunk dict if found, None otherwise
+        """
+        log.info(f"Code get_chunk: uuid={uuid[:8]}...")
+        result = self.db.get_code_chunk_by_uuid(uuid)
+
+        if result:
+            return {
+                "uuid": result.get("uuid", ""),
+                "filepath": result.get("filepath", ""),
+                "content": result.get("content", ""),
+                "start_line": result.get("start_line", 0),
+                "end_line": result.get("end_line", 0),
+                "project_id": result.get("project_id", ""),
+            }
+
+        return None
+
     # ═══════════════════════════════════════════════════════════════════════════════
     # P2: GIT-BASED STALENESS DETECTION
     # ═══════════════════════════════════════════════════════════════════════════════

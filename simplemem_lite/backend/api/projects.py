@@ -6,9 +6,10 @@ Provides endpoints for project status, bootstrap tracking, and metadata.
 from pathlib import Path
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.services import get_project_manager
+from simplemem_lite.backend.toon import toonify
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("backend.api.projects")
@@ -120,9 +121,38 @@ async def set_bootstrap_status(request: SetBootstrapRequest) -> dict:
         return {"success": False, "error": str(e)}
 
 
+class ListProjectsRequest(BaseModel):
+    """Request model for listing projects."""
+
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
+
+
+@router.post("/list")
+@toonify(headers=["project_root", "project_name", "is_bootstrapped", "never_ask"], result_key="projects")
+async def list_projects_post(request: ListProjectsRequest) -> dict:
+    """List all tracked projects (POST version with TOON support).
+
+    Returns:
+        List of project summaries with bootstrap status
+    """
+    log.debug("list_projects_post called")
+
+    try:
+        manager = get_project_manager()
+        projects = manager.list_projects()
+        return {"projects": projects, "count": len(projects)}
+
+    except Exception as e:
+        log.error(f"list_projects failed: {e}")
+        return {"projects": [], "count": 0, "error": str(e)}
+
+
 @router.get("/list")
 async def list_projects() -> dict:
-    """List all tracked projects.
+    """List all tracked projects (GET version, backwards compatible).
 
     Returns:
         List of project summaries with bootstrap status

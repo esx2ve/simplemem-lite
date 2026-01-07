@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.services import get_hierarchical_indexer, get_job_manager
+from simplemem_lite.backend.toon import toonify
 from simplemem_lite.compression import decompress_payload
 from simplemem_lite.log_config import get_logger
 
@@ -305,9 +306,50 @@ async def get_job_status(job_id: str) -> dict:
     raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
 
+class ListJobsRequest(BaseModel):
+    """Request model for listing jobs."""
+
+    include_completed: bool = Field(default=True, description="Include completed/failed jobs")
+    limit: int = Field(default=20, ge=1, le=100)
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
+
+
+@router.post("/jobs/list")
+@toonify(headers=["id", "type", "status", "progress", "message"], result_key="jobs")
+async def list_jobs_post(request: ListJobsRequest) -> dict:
+    """List all background jobs (POST version with TOON support).
+
+    Includes both trace jobs (in-memory) and code indexing jobs (JobManager).
+    """
+    # Get trace jobs
+    jobs = list(_jobs.values())
+
+    # Get code indexing jobs from services JobManager
+    try:
+        job_manager = get_job_manager()
+        code_jobs = job_manager.list_jobs(include_completed=request.include_completed, limit=request.limit)
+        jobs.extend(code_jobs)
+    except Exception as e:
+        log.debug(f"JobManager list failed: {e}")
+
+    if not request.include_completed:
+        jobs = [j for j in jobs if j.get("status") in ("pending", "running")]
+
+    # Sort by created timestamp (newest first)
+    jobs.sort(key=lambda j: j.get("timestamps", {}).get("created", "") or j.get("created_at", ""), reverse=True)
+
+    # Apply limit
+    jobs = jobs[:request.limit]
+
+    return {"jobs": jobs}
+
+
 @router.get("/jobs")
 async def list_jobs(include_completed: bool = True, limit: int = 20) -> dict:
-    """List all background jobs.
+    """List all background jobs (GET version, backwards compatible).
 
     Includes both trace jobs (in-memory) and code indexing jobs (JobManager).
     """

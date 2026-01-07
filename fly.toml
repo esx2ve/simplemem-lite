@@ -24,6 +24,8 @@ primary_region = "sjc"
   SIMPLEMEM_MEMGRAPH_PORT = "7687"
   # Cloud deployment requires auth
   SIMPLEMEM_REQUIRE_AUTH = "true"
+  # Use TOON format for 30-60% token reduction in responses
+  SIMPLEMEM_OUTPUT_FORMAT = "toon"
 
 [http_service]
   internal_port = 8420

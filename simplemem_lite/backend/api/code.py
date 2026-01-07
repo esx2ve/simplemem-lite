@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
+from simplemem_lite.backend.toon import toonify
 from simplemem_lite.compression import decompress_payload
 from simplemem_lite.log_config import get_logger
 
@@ -79,6 +80,10 @@ class SearchCodeRequest(BaseModel):
     query: str = Field(..., description="Natural language search query")
     limit: int = Field(default=10, ge=1, le=100)
     project_id: str | None = Field(default=None, description="Filter to specific project")
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 class CodeRelatedMemoriesRequest(BaseModel):
@@ -86,6 +91,10 @@ class CodeRelatedMemoriesRequest(BaseModel):
 
     chunk_uuid: str = Field(..., description="Code chunk UUID from search results")
     limit: int = Field(default=10, ge=1, le=50)
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 class MemoryRelatedCodeRequest(BaseModel):
@@ -93,6 +102,10 @@ class MemoryRelatedCodeRequest(BaseModel):
 
     memory_uuid: str = Field(..., description="Memory UUID")
     limit: int = Field(default=10, ge=1, le=50)
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 class CodeIndexStatusRequest(BaseModel):
@@ -240,8 +253,12 @@ async def update_code(request: UpdateCodeRequest) -> dict:
 
 
 @router.post("/search")
+@toonify(headers=["filepath", "start_line", "end_line", "score", "content"])
 async def search_code(request: SearchCodeRequest) -> dict:
-    """Semantic search over indexed code."""
+    """Semantic search over indexed code.
+
+    When output_format="toon", returns tab-separated format for token efficiency.
+    """
     require_project_id(request.project_id, "search_code")
     try:
         indexer = get_code_indexer()
@@ -250,10 +267,7 @@ async def search_code(request: SearchCodeRequest) -> dict:
             limit=request.limit,
             project_id=request.project_id,
         )
-        return {
-            "results": results,
-            "count": len(results),
-        }
+        return {"results": results}
 
     except Exception as e:
         log.error(f"Code search failed: {e}")
@@ -275,6 +289,7 @@ async def code_stats(project_id: str | None = None) -> dict:
 
 
 @router.post("/related-memories")
+@toonify(headers=["uuid", "type", "score", "content"], result_key="related_memories")
 async def code_related_memories(request: CodeRelatedMemoriesRequest) -> dict:
     """Find memories related to a code chunk via shared entities."""
     try:
@@ -296,6 +311,7 @@ async def code_related_memories(request: CodeRelatedMemoriesRequest) -> dict:
 
 
 @router.post("/related-code")
+@toonify(headers=["filepath", "start_line", "end_line", "score", "content"], result_key="related_code")
 async def memory_related_code(request: MemoryRelatedCodeRequest) -> dict:
     """Find code chunks related to a memory via shared entities."""
     try:

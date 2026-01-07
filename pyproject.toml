@@ -36,6 +36,9 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     "httpx>=0.28.0",
+    # Token reduction dependencies
+    "orjson>=3.10.0",
+    "tiktoken>=0.8.0",
 ]
 
 [project.urls]

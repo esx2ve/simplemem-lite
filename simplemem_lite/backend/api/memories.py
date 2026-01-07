@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.scoring import ScoringWeights, apply_temporal_scoring, rerank_results
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
+from simplemem_lite.backend.toon import toonify
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem, detect_contradictions
 
@@ -64,6 +65,10 @@ class SearchMemoriesRequest(BaseModel):
     use_graph: bool = Field(default=True)
     type_filter: str | None = Field(default=None)
     project_id: str | None = Field(default=None)
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
     # Temporal scoring options
     use_temporal_scoring: bool = Field(
         default=True,
@@ -109,6 +114,10 @@ class ReasonMemoriesRequest(BaseModel):
     max_hops: int = Field(default=2, ge=1, le=3)
     min_score: float = Field(default=0.1, ge=0.0, le=1.0)
     project_id: str | None = Field(default=None, description="Project identifier")
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 @router.post("/store", response_model=StoreMemoryResponse)
@@ -147,6 +156,7 @@ async def store_memory(request: StoreMemoryRequest) -> StoreMemoryResponse:
 
 
 @router.post("/search")
+@toonify(headers=["uuid", "type", "score", "content"])
 async def search_memories(request: SearchMemoriesRequest) -> dict:
     """Search memories with hybrid vector + graph search.
 
@@ -157,6 +167,8 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
     - Type importance (decisions > lessons > facts > summaries)
 
     Set use_temporal_scoring=False for pure vector similarity ranking.
+
+    When output_format="toon", returns tab-separated format for token efficiency.
     """
     require_project_id(request.project_id, "search_memories")
     try:
@@ -203,18 +215,8 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
                 return_details=request.scoring_details,
             )
 
-        return {
-            "results": result_dicts,
-            "count": len(result_dicts),
-            "scoring": {
-                "temporal_enabled": request.use_temporal_scoring,
-                "weights": {
-                    "vector": request.vector_weight,
-                    "temporal": request.temporal_weight,
-                    "importance": request.importance_weight,
-                } if request.use_temporal_scoring else None,
-            },
-        }
+        # Return results - decorator handles TOON conversion if requested
+        return {"results": result_dicts}
 
     except HTTPException:
         raise
@@ -244,20 +246,21 @@ async def ask_memories(request: AskMemoriesRequest) -> dict:
 
 @router.post("/reason")
 async def reason_memories(request: ReasonMemoriesRequest) -> dict:
-    """Multi-hop reasoning over memory graph."""
+    """LLM-synthesized reasoning over memory graph.
+
+    Returns condensed reasoning summary explaining evidence chains,
+    with UUID references (not full content).
+    """
     require_project_id(request.project_id, "reason_memories")
     try:
         store = get_memory_store()
-        results = store.reason(
+        result = await store.reason_with_synthesis(
             query=request.query,
             max_hops=request.max_hops,
             min_score=request.min_score,
             project_id=request.project_id,
         )
-        return {
-            "conclusions": results,
-            "count": len(results),
-        }
+        return result
 
     except Exception as e:
         log.error(f"Reasoning failed: {e}")
@@ -365,9 +368,14 @@ class SearchDeepRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50, description="Number of results to return")
     rerank_pool: int = Field(default=20, ge=1, le=50, description="Pool size for reranking")
     project_id: str | None = Field(default=None, description="Project identifier")
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 @router.post("/search-deep")
+@toonify(headers=["uuid", "type", "score", "content"])
 async def search_memories_deep(request: SearchDeepRequest) -> dict:
     """LLM-reranked semantic search with conflict detection.
 
@@ -443,9 +451,14 @@ class CheckContradictionsRequest(BaseModel):
         description="Create SUPERSEDES edges from new memory to contradicted ones",
     )
     project_id: str | None = Field(default=None, description="Project identifier")
+    output_format: str | None = Field(
+        default=None,
+        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+    )
 
 
 @router.post("/check-contradictions")
+@toonify(headers=["uuid", "content", "reason", "confidence"], result_key="contradictions")
 async def check_contradictions(request: CheckContradictionsRequest) -> dict:
     """Check if content contradicts existing memories.
 

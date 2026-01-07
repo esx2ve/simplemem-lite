@@ -32,6 +32,17 @@ from simplemem_lite.memory import Memory, MemoryItem, MemoryStore
 from simplemem_lite.projects import ProjectManager
 from simplemem_lite.session_indexer import SessionAutoIndexer
 from simplemem_lite.session_state import SessionStateDB
+from simplemem_lite.token_reduction import (
+    OUTPUT_FORMAT,
+    batch_summarize,
+    compact_json,
+    format_response,
+    log_token_savings,
+    prune_dict,
+    summarize_code,
+    summarize_content,
+    to_toon,
+)
 from simplemem_lite.traces import HierarchicalIndexer, TraceParser
 from simplemem_lite.watcher import ProjectWatcherManager
 
@@ -948,11 +959,16 @@ async def search_memories(
     type_filter: str | None = None,
     project_id: str | None = None,
     expand_query: bool = False,
-) -> list[dict]:
+    brief: bool = False,
+    output_format: str | None = None,
+) -> list[dict] | dict:
     """Hybrid search combining vector similarity and graph traversal.
 
     Searches summaries first for efficiency, then expands via graph
     to find related memories.
+
+    By default, returns LLM-summarized content for token efficiency (~90% reduction).
+    Use brief=True for metadata-only results, or get_memory(uuid) for full content.
 
     Args:
         query: Search query text
@@ -962,13 +978,19 @@ async def search_memories(
         project_id: Optional filter by project (for cross-project isolation)
         expand_query: Whether to use LLM to expand query into semantic variations
                       for improved recall. Adds latency but improves results.
+        brief: If True, return only metadata + preview (no summarization).
+               Use get_memory(uuid) to fetch full content for specific items.
+        output_format: Response format: "json" (default), "toon" (30-60% fewer tokens).
+                       TOON returns results as a tab-separated table for maximum
+                       token efficiency. Use when you want ultra-compact results.
 
     Returns:
-        List of matching memories with scores
+        List of matching memories with scores (content is LLM-summarized by default).
+        If output_format="toon", returns {"toon": "<tab-separated-table>", "count": N}.
     """
     from simplemem_lite.memory import expand_query as _expand_query
 
-    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id}, expand={expand_query})")
+    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id}, expand={expand_query}, brief={brief}, format={output_format})")
 
     if expand_query:
         # Expand query into semantic variations
@@ -992,7 +1014,27 @@ async def search_memories(
         )
 
     log.info(f"Tool: search_memories complete: {len(results)} results")
-    return [_memory_to_dict(m) for m in results]
+
+    if brief:
+        # Brief mode: metadata + preview only (fastest)
+        formatted = [_memory_to_dict(m, brief=True) for m in results]
+    else:
+        # Default: LLM-summarized content for token efficiency
+        summarized = await asyncio.gather(
+            *[_memory_to_dict_summarized(m, query=query) for m in results]
+        )
+        formatted = list(summarized)
+
+    # Apply output format (use env var default if not specified)
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt == "toon":
+        # TOON format: 30-60% fewer tokens than JSON
+        # Return raw TOON string directly - don't wrap in dict
+        toon_result = to_toon(formatted, headers=["uuid", "type", "score", "content"])
+        log.info(f"Tool: search_memories returning TOON format ({len(toon_result)} chars)")
+        return toon_result
+
+    return formatted
 
 
 @mcp.tool()
@@ -1856,55 +1898,81 @@ async def reason_memories(
     query: str,
     max_hops: int = 2,
     min_score: float = 0.1,
+    project_id: str | None = None,
 ) -> dict:
-    """Multi-hop reasoning over memory graph.
+    """Multi-hop reasoning over memory graph for complex questions.
 
-    Combines vector search with graph traversal and semantic path scoring
-    to answer complex questions that require following chains of evidence.
+    PURPOSE: Perform deep reasoning that requires following chains of evidence
+    through the memory graph. Use this for questions that need connecting
+    multiple memories to form conclusions.
 
-    Example queries:
-    - "What debugging patterns work for database issues?"
-    - "How did the authentication feature evolve?"
-    - "Find solutions related to connection timeouts"
+    WHEN TO USE:
+    - Questions requiring connecting multiple pieces of evidence
+    - Finding evolution/history of features or decisions
+    - Discovering patterns across different debugging sessions
+    - Tracing cause-effect chains through memory graph
+    - When ask_memories gives incomplete answers needing more depth
+
+    WHEN NOT TO USE:
+    - Simple fact lookup (use search_memories)
+    - Direct questions with obvious answers (use ask_memories)
+    - Code search (use search_code)
+
+    HOW IT WORKS:
+    1. Vector search finds entry points into the graph
+    2. Graph traversal follows relationships to related memories
+    3. Semantic path scoring evaluates evidence chains
+    4. Returns conclusions with proof chains showing reasoning path
+
+    EXAMPLES:
+        # Trace the evolution of a feature
+        reason_memories(
+            query="How did the authentication feature evolve?",
+            max_hops=3  # Allow deeper traversal for history
+        )
+
+        # Find debugging patterns
+        reason_memories(query="What debugging patterns work for database issues?")
+
+        # Trace cause-effect
+        reason_memories(
+            query="What led to the decision to migrate to PostgreSQL?",
+            project_id="config:mycompany/myproject"
+        )
+
+        # Connect related solutions
+        reason_memories(query="Find solutions related to connection timeouts")
 
     Args:
-        query: Natural language query
-        max_hops: Maximum path length for traversal (1-3)
-        min_score: Minimum score threshold for results
+        query: Complex question requiring multi-hop reasoning. Be specific
+               about what connections you're looking for.
+        max_hops: Maximum graph traversal depth (1-3). Higher = more connections
+                  but slower. Use 3 for historical/evolutionary questions.
+        min_score: Minimum relevance score threshold (0.0-1.0). Lower values
+                   include more distant but potentially relevant memories.
+        project_id: Project isolation. Auto-inferred from cwd if not specified.
 
     Returns:
-        {conclusions: [{uuid, content, type, score, proof_chain, hops}]}
+        {
+            "reasoning": "Synthesized explanation of evidence chains with [1][2] citations...",
+            "patterns": ["Pattern found across sessions..."],
+            "confidence": "high|medium|low",
+            "cross_session_count": N,
+            "sources": [{uuid, type, score, hops, proof_chain, cross_session}, ...]
+        }
     """
     log.info(f"Tool: reason_memories called (query='{query[:50]}...', max_hops={max_hops})")
 
-    results = _deps.store.reason(
+    result = await _deps.store.reason_with_synthesis(
         query=query,
         max_hops=max_hops,
         min_score=min_score,
+        project_id=project_id,
     )
 
-    log.info(f"Tool: reason_memories complete: {len(results)} conclusions")
+    log.info(f"Tool: reason_memories complete: {len(result.get('sources', []))} sources, confidence={result.get('confidence')}")
 
-    # Count cross-session results
-    cross_session_count = sum(1 for r in results if r.get("cross_session"))
-
-    return {
-        "conclusions": [
-            {
-                "uuid": r["uuid"],
-                "content": r["content"][:500],  # Truncate for response size
-                "type": r["type"],
-                "score": round(r["score"], 3),
-                "pagerank": r.get("pagerank", 0.0),
-                "proof_chain": r["proof_chain"],
-                "hops": r["hops"],
-                "cross_session": r.get("cross_session", False),
-                "bridge_entity": r.get("bridge_entity"),
-            }
-            for r in results[:10]  # Limit to top 10
-        ],
-        "cross_session_count": cross_session_count,
-    }
+    return result
 
 
 @mcp.tool()
@@ -1960,12 +2028,18 @@ async def search_code(
     query: str,
     limit: int = 10,
     project_id: str | None = None,
+    brief: bool = False,
+    output_format: str | None = None,
 ) -> dict:
     """Search indexed code for implementations, patterns, and functionality.
 
     PURPOSE: Find relevant code snippets using semantic search. Unlike grep/ripgrep
     which match exact text, this finds code by MEANING - "authentication handler"
     will find login functions even if they don't contain those exact words.
+
+    By default, returns LLM-summarized code snippets for token efficiency.
+    Use get_code_chunk(uuid) to fetch full content for specific chunks.
+    Set brief=True for truncated previews without LLM summarization.
 
     WHEN TO USE:
     - Finding implementations: "user authentication", "database connection pool"
@@ -1983,7 +2057,7 @@ async def search_code(
     If no results found, the codebase may not be indexed.
 
     EXAMPLES:
-        # Find authentication code
+        # Find authentication code (default: LLM-summarized)
         search_code(query="user login authentication handler")
 
         # Find database patterns
@@ -1998,8 +2072,11 @@ async def search_code(
             project_id="git:github.com/user/myproject"
         )
 
-        # Find error handling
-        search_code(query="exception handling retry logic")
+        # Brief mode (truncated preview, no LLM call)
+        search_code(query="exception handling", brief=True)
+
+        # TOON format for maximum token efficiency
+        search_code(query="API handlers", output_format="toon")
 
     Args:
         query: Natural language description of code you're looking for.
@@ -2008,26 +2085,222 @@ async def search_code(
         limit: Maximum results (default: 10). Increase for broader search.
         project_id: Filter to specific project (preferred). Auto-inferred
                     from cwd if not specified.
+        brief: Return truncated preview instead of LLM summary (default: False).
+               Use when you need fast results without LLM latency.
+        output_format: Response format: "json" (default), "toon" (30-60% fewer tokens).
+                       TOON returns results as a tab-separated table for maximum
+                       token efficiency.
 
     Returns:
         On success: {
             "results": [
                 {
-                    "file_path": "/path/to/file.py",
-                    "line_start": 45,
-                    "line_end": 78,
-                    "content": "def authenticate_user(...)...",
+                    "uuid": "chunk-uuid",
+                    "filepath": "/path/to/file.py",
+                    "start_line": 45,
+                    "end_line": 78,
+                    "content": "<summarized or previewed code>",
                     "score": 0.89
                 },
                 ...
             ]
         }
+        If output_format="toon": {"toon": "<tab-separated-table>", "count": N}
         On error: {"error": "...", "results": []}
     """
-    log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit}, project_id={project_id})")
+    log.info(f"Tool: search_code called (query={query[:50]}..., limit={limit}, project_id={project_id}, brief={brief}, format={output_format})")
     results = _deps.code_indexer.search(query, limit, project_id)
-    log.info(f"Tool: search_code complete: {len(results)} results")
-    return {"results": results, "count": len(results)}
+
+    if brief:
+        # Brief mode: truncate content to preview
+        formatted = []
+        for r in results:
+            content = r.get("content", "")
+            lines = content.split("\n")
+            preview_lines = 10
+            if len(lines) > preview_lines:
+                preview = "\n".join(lines[:preview_lines]) + f"\n... ({len(lines) - preview_lines} more lines)"
+            else:
+                preview = content
+            formatted.append(prune_dict({
+                "uuid": r.get("uuid", ""),
+                "filepath": r.get("filepath", ""),
+                "start_line": r.get("start_line", 0),
+                "end_line": r.get("end_line", 0),
+                "content_preview": preview,
+                "score": round(r.get("score", 0), 3),
+            }))
+        log.info(f"Tool: search_code complete (brief): {len(formatted)} results")
+    else:
+        # Default: LLM summarization for intelligent code compression
+        summarized = await asyncio.gather(
+            *[_code_chunk_to_dict_summarized(r, query=query) for r in results]
+        )
+        formatted = list(summarized)
+        log.info(f"Tool: search_code complete (summarized): {len(formatted)} results")
+
+    # Apply output format (use env var default if not specified)
+    fmt = output_format or OUTPUT_FORMAT
+    if fmt == "toon":
+        # TOON format: 30-60% fewer tokens than JSON
+        # Return raw TOON string directly - don't wrap in dict
+        toon_result = to_toon(formatted, headers=["uuid", "filepath", "start_line", "end_line", "score", "content"])
+        log.info(f"Tool: search_code returning TOON format ({len(toon_result)} chars)")
+        return toon_result
+
+    return {"results": formatted, "count": len(formatted)}
+
+
+@mcp.tool()
+async def get_memory(uuid: str) -> dict:
+    """Fetch full content of a specific memory by UUID.
+
+    Use this after search_memories() to get complete content for
+    memories you want to examine in detail. This enables a staged
+    retrieval pattern: search returns summaries, then fetch full
+    content only for relevant memories.
+
+    EXAMPLES:
+        # After search
+        results = search_memories(query="database connection fix")
+        # Get full content for the most relevant result
+        full = get_memory(uuid=results["results"][0]["uuid"])
+
+    Args:
+        uuid: Memory UUID from search_memories results
+
+    Returns:
+        On success: {
+            "uuid": "abc-123",
+            "content": "<full memory content>",
+            "type": "lesson_learned",
+            "created_at": 1704067200,
+            "session_id": "sess-456"  # if available
+        }
+        On error: {"error": "Memory not found"}
+    """
+    log.info(f"Tool: get_memory called (uuid={uuid[:12]}...)")
+
+    memory = _deps.store.get(uuid)
+    if memory is None:
+        log.warning(f"Tool: get_memory not found (uuid={uuid[:12]}...)")
+        return {"error": "Memory not found", "uuid": uuid}
+
+    result = {
+        "uuid": memory.uuid,
+        "content": memory.content,
+        "type": memory.type,
+        "created_at": memory.created_at,
+    }
+    if memory.session_id:
+        result["session_id"] = memory.session_id
+
+    log.info(f"Tool: get_memory complete (uuid={uuid[:12]}..., content_len={len(memory.content)})")
+    return prune_dict(result)
+
+
+@mcp.tool()
+async def get_code_chunk(uuid: str) -> dict:
+    """Fetch full content of a specific code chunk by UUID.
+
+    Use this after search_code() to get complete source code for
+    chunks you want to examine in detail. This enables a staged
+    retrieval pattern: search returns summaries, then fetch full
+    code only for relevant chunks.
+
+    EXAMPLES:
+        # After search
+        results = search_code(query="authentication handler")
+        # Get full code for the most relevant result
+        full = get_code_chunk(uuid=results["results"][0]["uuid"])
+
+    Args:
+        uuid: Code chunk UUID from search_code results
+
+    Returns:
+        On success: {
+            "uuid": "chunk-abc-123",
+            "filepath": "/path/to/file.py",
+            "content": "<full code content>",
+            "start_line": 45,
+            "end_line": 120
+        }
+        On error: {"error": "Code chunk not found"}
+    """
+    log.info(f"Tool: get_code_chunk called (uuid={uuid[:12]}...)")
+
+    chunk = _deps.code_indexer.get_chunk(uuid)
+    if chunk is None:
+        log.warning(f"Tool: get_code_chunk not found (uuid={uuid[:12]}...)")
+        return {"error": "Code chunk not found", "uuid": uuid}
+
+    log.info(f"Tool: get_code_chunk complete (uuid={uuid[:12]}..., content_lines={len(chunk.get('content', '').split(chr(10)))})")
+    return prune_dict(chunk)
+
+
+@mcp.tool()
+async def get_batch(uuids: list[str], item_type: str = "memory") -> dict:
+    """Batch fetch multiple memories or code chunks by UUID.
+
+    More efficient than multiple get_memory/get_code_chunk calls.
+    Use after search to fetch full content for multiple items at once.
+
+    EXAMPLES:
+        # Fetch multiple memories
+        results = search_memories(query="database issues")
+        uuids = [r["uuid"] for r in results["results"][:3]]
+        full_items = get_batch(uuids=uuids, item_type="memory")
+
+        # Fetch multiple code chunks
+        results = search_code(query="API handlers")
+        uuids = [r["uuid"] for r in results["results"][:3]]
+        full_items = get_batch(uuids=uuids, item_type="code")
+
+    Args:
+        uuids: List of UUIDs to fetch
+        item_type: "memory" or "code" (default: "memory")
+
+    Returns:
+        {
+            "items": [{...}, {...}],
+            "found": 3,
+            "not_found": ["uuid-that-wasnt-found"]
+        }
+    """
+    log.info(f"Tool: get_batch called (count={len(uuids)}, type={item_type})")
+
+    items = []
+    not_found = []
+
+    if item_type == "memory":
+        for uuid in uuids:
+            memory = _deps.store.get(uuid)
+            if memory:
+                items.append(prune_dict({
+                    "uuid": memory.uuid,
+                    "content": memory.content,
+                    "type": memory.type,
+                    "created_at": memory.created_at,
+                    "session_id": memory.session_id,
+                }))
+            else:
+                not_found.append(uuid)
+    elif item_type == "code":
+        for uuid in uuids:
+            chunk = _deps.code_indexer.get_chunk(uuid)
+            if chunk:
+                items.append(prune_dict(chunk))
+            else:
+                not_found.append(uuid)
+    else:
+        return {"error": f"Unknown item_type: {item_type}. Use 'memory' or 'code'."}
+
+    log.info(f"Tool: get_batch complete (found={len(items)}, not_found={len(not_found)})")
+    return {
+        "items": items,
+        "found": len(items),
+        "not_found": not_found if not_found else None,
+    }
 
 
 @mcp.tool()
@@ -3475,16 +3748,111 @@ Focus on actionable insights that help when working on this project.'''
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _memory_to_dict(memory: Memory) -> dict:
-    """Convert Memory to JSON-serializable dict."""
-    return {
+def _memory_to_dict(memory: Memory, brief: bool = False) -> dict:
+    """Convert Memory to JSON-serializable dict.
+
+    Args:
+        memory: Memory object to convert
+        brief: If True, omit full content (will be summarized separately)
+
+    Returns:
+        Dict representation of memory
+    """
+    result = {
         "uuid": memory.uuid,
-        "content": memory.content,
         "type": memory.type,
-        "created_at": memory.created_at,
-        "score": memory.score,
-        "session_id": memory.session_id,
+        "score": round(memory.score, 3) if memory.score else 0,
     }
+
+    if brief:
+        # Brief mode: include preview only, content will be summarized
+        result["content_preview"] = memory.content[:200] + "..." if len(memory.content) > 200 else memory.content
+    else:
+        # Full mode: include all fields
+        result["content"] = memory.content
+        result["created_at"] = memory.created_at
+        if memory.session_id:
+            result["session_id"] = memory.session_id
+
+    return prune_dict(result)
+
+
+async def _memory_to_dict_summarized(
+    memory: Memory,
+    query: str = "",
+    max_chars: int = 500,
+) -> dict:
+    """Convert Memory to dict with LLM-summarized content.
+
+    Uses lightweight LLM (gemini-2.5-flash-lite) to generate intelligent
+    summaries instead of simple truncation. Always enabled for token efficiency.
+
+    Args:
+        memory: Memory object to convert
+        query: Search query for context-aware summarization
+        max_chars: Target summary length (not a hard limit)
+
+    Returns:
+        Dict with summarized content
+    """
+    result = {
+        "uuid": memory.uuid,
+        "type": memory.type,
+        "score": round(memory.score, 3) if memory.score else 0,
+    }
+
+    # Use LLM summarization for intelligent compression
+    summarized = await summarize_content(memory.content, context=query, max_chars=max_chars)
+    result["content"] = summarized
+
+    # Mark if content was summarized (for transparency)
+    if len(summarized) < len(memory.content):
+        result["_summarized"] = True
+        result["_original_length"] = len(memory.content)
+
+    return prune_dict(result)
+
+
+async def _code_chunk_to_dict_summarized(
+    chunk: dict,
+    query: str = "",
+    max_lines: int = 15,
+) -> dict:
+    """Convert code chunk to dict with LLM-summarized content.
+
+    Uses lightweight LLM (gemini-2.5-flash-lite) to generate intelligent
+    code summaries that focus on relevance to the search query.
+
+    Args:
+        chunk: Code chunk dict with uuid, filepath, content, etc.
+        query: Search query for context-aware summarization
+        max_lines: Target max lines for summary (not a hard limit)
+
+    Returns:
+        Dict with summarized code content
+    """
+    result = {
+        "uuid": chunk.get("uuid", ""),
+        "filepath": chunk.get("filepath", ""),
+        "start_line": chunk.get("start_line", 0),
+        "end_line": chunk.get("end_line", 0),
+        "score": round(chunk.get("score", 0), 3),
+    }
+
+    content = chunk.get("content", "")
+    original_lines = len(content.split("\n"))
+
+    # Use LLM summarization for intelligent code compression
+    summarized = await summarize_code(content, query=query, max_lines=max_lines)
+    result["content"] = summarized
+
+    # Mark if content was summarized (for transparency)
+    summarized_lines = len(summarized.split("\n"))
+    if summarized_lines < original_lines:
+        result["_summarized"] = True
+        result["_original_lines"] = original_lines
+
+    return prune_dict(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
