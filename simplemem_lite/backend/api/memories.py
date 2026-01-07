@@ -4,10 +4,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
-from simplemem_lite.backend.scoring import ScoringWeights, apply_temporal_scoring
+from simplemem_lite.backend.scoring import ScoringWeights, apply_temporal_scoring, rerank_results
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.log_config import get_logger
-from simplemem_lite.memory import MemoryItem
+from simplemem_lite.memory import MemoryItem, detect_contradictions
 
 router = APIRouter()
 log = get_logger("backend.api.memories")
@@ -350,4 +350,214 @@ async def reset_all(confirm: bool = False) -> dict:
         return result
     except Exception as e:
         log.error(f"Failed to reset: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# LLM-Enhanced Reasoning Endpoints (Phase 1-3)
+# ============================================================================
+
+
+class SearchDeepRequest(BaseModel):
+    """Request model for LLM-reranked deep search."""
+
+    query: str = Field(..., description="Search query")
+    limit: int = Field(default=10, ge=1, le=50, description="Number of results to return")
+    rerank_pool: int = Field(default=20, ge=1, le=50, description="Pool size for reranking")
+    project_id: str | None = Field(default=None, description="Project identifier")
+
+
+@router.post("/search-deep")
+async def search_memories_deep(request: SearchDeepRequest) -> dict:
+    """LLM-reranked semantic search with conflict detection.
+
+    Performs vector search, then uses an LLM to rerank results by
+    semantic relevance and detect potential conflicts between memories.
+    Use this for higher precision when quality matters more than speed.
+    """
+    require_project_id(request.project_id, "search_memories_deep")
+    try:
+        store = get_memory_store()
+
+        # Get expanded pool for reranking
+        results = store.search(
+            query=request.query,
+            limit=request.rerank_pool,
+            use_graph=True,
+            project_id=request.project_id,
+        )
+
+        # Convert to dicts for reranking
+        result_dicts = [
+            {
+                "uuid": m.uuid,
+                "content": m.content,
+                "type": m.type,
+                "score": m.score,
+                "created_at": m.created_at,
+            }
+            for m in results
+        ]
+
+        # Apply LLM reranking
+        reranked = await rerank_results(
+            query=request.query,
+            results=result_dicts,
+            top_k=request.limit,
+            rerank_pool=request.rerank_pool,
+        )
+
+        # Map conflict indices to UUIDs
+        conflicts_with_uuids = []
+        for conflict in reranked.get("conflicts", []):
+            if len(conflict) >= 3:
+                idx1, idx2, reason = conflict[0], conflict[1], conflict[2]
+                if idx1 < len(result_dicts) and idx2 < len(result_dicts):
+                    conflicts_with_uuids.append([
+                        result_dicts[idx1]["uuid"],
+                        result_dicts[idx2]["uuid"],
+                        reason,
+                    ])
+
+        return {
+            "results": reranked["results"],
+            "conflicts": conflicts_with_uuids,
+            "rerank_applied": reranked.get("rerank_applied", False),
+        }
+
+    except Exception as e:
+        log.error(f"Deep search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CheckContradictionsRequest(BaseModel):
+    """Request model for contradiction detection."""
+
+    content: str = Field(..., description="Content to check for contradictions")
+    memory_uuid: str | None = Field(
+        default=None,
+        description="UUID of the new memory (required for apply_supersession)",
+    )
+    apply_supersession: bool = Field(
+        default=False,
+        description="Create SUPERSEDES edges from new memory to contradicted ones",
+    )
+    project_id: str | None = Field(default=None, description="Project identifier")
+
+
+@router.post("/check-contradictions")
+async def check_contradictions(request: CheckContradictionsRequest) -> dict:
+    """Check if content contradicts existing memories.
+
+    Searches for similar memories and uses LLM to detect contradictions.
+    Optionally creates SUPERSEDES relationships to mark old memories
+    as superseded by the new one.
+    """
+    require_project_id(request.project_id, "check_contradictions")
+    try:
+        store = get_memory_store()
+        config = get_config()
+
+        # Find similar memories
+        similar = store.search(
+            query=request.content,
+            limit=10,
+            use_graph=False,  # Pure vector for contradiction check
+            project_id=request.project_id,
+        )
+
+        # Convert to dicts
+        similar_dicts = [
+            {
+                "uuid": m.uuid,
+                "content": m.content,
+                "type": m.type,
+                "score": m.score,
+            }
+            for m in similar
+        ]
+
+        # Detect contradictions via LLM
+        contradictions = await detect_contradictions(
+            new_content=request.content,
+            similar_memories=similar_dicts,
+            config=config,
+        )
+
+        supersessions_created = 0
+
+        # Apply supersession if requested and we have a memory_uuid
+        if request.apply_supersession and request.memory_uuid and contradictions:
+            for c in contradictions:
+                try:
+                    # Map confidence to numeric value
+                    confidence_map = {"high": 0.9, "medium": 0.7, "low": 0.5}
+                    confidence = confidence_map.get(c.get("confidence", "medium"), 0.7)
+
+                    success = store.db.add_supersession(
+                        newer_uuid=request.memory_uuid,
+                        older_uuid=c["uuid"],
+                        confidence=confidence,
+                        supersession_type="contradiction",
+                        reason=c.get("reason", ""),
+                    )
+                    if success:
+                        supersessions_created += 1
+                except Exception as e:
+                    log.warning(f"Failed to create supersession: {e}")
+
+        return {
+            "contradictions": contradictions,
+            "supersessions_created": supersessions_created,
+        }
+
+    except Exception as e:
+        log.error(f"Contradiction check failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sync-health")
+async def get_sync_health(project_id: str | None = None) -> dict:
+    """Check synchronization health between graph and vector stores.
+
+    Detects memories that exist in the graph but are missing from LanceDB.
+    Use this to diagnose sync issues before running repair_sync.
+    """
+    try:
+        store = get_memory_store()
+        result = store.db.get_sync_health(project_id=project_id)
+        return result
+
+    except Exception as e:
+        log.error(f"Sync health check failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RepairSyncRequest(BaseModel):
+    """Request model for sync repair."""
+
+    project_id: str | None = Field(default=None, description="Project identifier")
+    dry_run: bool = Field(
+        default=True,
+        description="Preview changes without applying (default: True)",
+    )
+
+
+@router.post("/repair-sync")
+async def repair_sync(request: RepairSyncRequest) -> dict:
+    """Repair synchronization issues between graph and vector stores.
+
+    Finds memories missing from LanceDB and regenerates their embeddings.
+    Always run with dry_run=True first to preview changes.
+    """
+    try:
+        store = get_memory_store()
+        result = store.db.repair_sync(
+            project_id=request.project_id,
+            dry_run=request.dry_run,
+        )
+        return result
+
+    except Exception as e:
+        log.error(f"Sync repair failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
