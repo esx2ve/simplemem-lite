@@ -933,25 +933,90 @@ class DatabaseManager:
             },
         )
 
+    def would_create_supersession_cycle(
+        self,
+        newer_uuid: str,
+        older_uuid: str,
+        max_depth: int = 10,
+    ) -> bool:
+        """Check if creating a SUPERSEDES edge would create a cycle.
+
+        DAG enforcement for supersession graph: prevents situations like
+        A supersedes B supersedes C supersedes A (cycle).
+
+        Args:
+            newer_uuid: UUID of the newer/superseding memory
+            older_uuid: UUID of the older/superseded memory
+            max_depth: Maximum traversal depth to check (default: 10)
+
+        Returns:
+            True if creating the edge would create a cycle, False otherwise
+        """
+        # Check if older_uuid can reach newer_uuid via SUPERSEDES edges
+        # If so, creating newer->older would complete a cycle
+        # Note: Cypher doesn't support parameters for path length bounds,
+        # so we inject max_depth directly (safe: typed as int)
+        result = self.graph.query(
+            f"""
+            MATCH path = (older:Memory {{uuid: $older_uuid}})-[:SUPERSEDES*1..{max_depth}]->(newer:Memory {{uuid: $newer_uuid}})
+            RETURN count(path) > 0 AS would_cycle
+            """,
+            {
+                "newer_uuid": newer_uuid,
+                "older_uuid": older_uuid,
+            },
+        )
+
+        if result.result_set:
+            would_cycle = result.result_set[0][0]
+            if would_cycle:
+                log.warning(
+                    f"Supersession would create cycle: {newer_uuid[:8]}... -> {older_uuid[:8]}..."
+                )
+            return bool(would_cycle)
+        return False
+
     def add_supersession(
         self,
         newer_uuid: str,
         older_uuid: str,
         confidence: float,
         supersession_type: str = "full_replace",
-    ) -> None:
+        reason: str | None = None,
+    ) -> bool:
         """Mark that a newer memory supersedes an older one.
 
         Used during consolidation when a newer memory provides updated
         information that replaces an older memory.
+
+        Enforces DAG constraint: will not create the edge if it would
+        result in a cycle in the supersession graph.
 
         Args:
             newer_uuid: UUID of the newer/superseding memory
             older_uuid: UUID of the older/superseded memory
             confidence: Confidence score (0.0-1.0) from LLM classifier
             supersession_type: "full_replace" or "partial_update"
+            reason: Optional explanation of why this supersession occurred
+
+        Returns:
+            True if edge was created, False if blocked (cycle or same node)
         """
         import time
+
+        # Self-supersession is not allowed
+        if newer_uuid == older_uuid:
+            log.warning(f"Cannot supersede self: {newer_uuid[:8]}...")
+            return False
+
+        # DAG enforcement: check for cycles
+        if self.would_create_supersession_cycle(newer_uuid, older_uuid):
+            log.warning(
+                f"Supersession blocked (would create cycle): "
+                f"{newer_uuid[:8]}... -> {older_uuid[:8]}..."
+            )
+            return False
+
         self.graph.query(
             """
             MATCH (newer:Memory {uuid: $newer_uuid})
@@ -959,18 +1024,27 @@ class DatabaseManager:
             MERGE (newer)-[r:SUPERSEDES]->(older)
             ON CREATE SET r.confidence = $confidence,
                           r.supersession_type = $type,
+                          r.reason = $reason,
                           r.created_at = $now
             ON MATCH SET r.confidence = $confidence,
-                         r.supersession_type = $type
+                         r.supersession_type = $type,
+                         r.reason = $reason
             """,
             {
                 "newer_uuid": newer_uuid,
                 "older_uuid": older_uuid,
                 "confidence": confidence,
                 "type": supersession_type,
+                "reason": reason or "",
                 "now": int(time.time()),
             },
         )
+
+        log.info(
+            f"Supersession created: {newer_uuid[:8]}... -> {older_uuid[:8]}... "
+            f"(confidence={confidence:.2f})"
+        )
+        return True
 
     def mark_merged(
         self,
@@ -2661,6 +2735,236 @@ class DatabaseManager:
             "relations": relation_count,
             "entity_types": entity_breakdown,
             "verb_edges": verb_edges,
+        }
+
+    def get_sync_health(self, project_id: str | None = None) -> dict[str, Any]:
+        """Check synchronization health between graph and vector stores.
+
+        Detects memories that exist in the graph but are missing from LanceDB
+        (the "desync" problem caused by non-atomic writes).
+
+        Args:
+            project_id: Optional project filter. If provided, only checks
+                        memories belonging to that project.
+
+        Returns:
+            Dictionary with:
+            - graph_count: Number of memories in graph
+            - vector_count: Number of memories in LanceDB
+            - missing_count: Number of memories in graph but not in vectors
+            - missing_uuids: List of UUIDs missing from vectors (max 100)
+            - sync_ratio: Ratio of synced memories (0.0 to 1.0)
+            - healthy: True if sync_ratio >= 0.99
+        """
+        log.info(f"Checking sync health (project={project_id})")
+
+        # Count and get UUIDs from graph
+        if project_id:
+            result = self.graph.query(
+                "MATCH (m:Memory {project_id: $project_id}) RETURN m.uuid",
+                {"project_id": project_id},
+            )
+        else:
+            result = self.graph.query("MATCH (m:Memory) RETURN m.uuid")
+
+        graph_uuids = set()
+        if result.result_set:
+            for row in result.result_set:
+                if row[0]:  # Skip null UUIDs
+                    graph_uuids.add(row[0])
+
+        graph_count = len(graph_uuids)
+        log.debug(f"Graph has {graph_count} memories")
+
+        # Get UUIDs from LanceDB
+        with self._write_lock:
+            try:
+                # Use to_pandas for efficient bulk read
+                df = self.lance_table.to_pandas(columns=["uuid"])
+                vector_uuids = set(df["uuid"].tolist())
+            except Exception as e:
+                log.warning(f"Failed to read LanceDB: {e}")
+                vector_uuids = set()
+
+        vector_count = len(vector_uuids)
+        log.debug(f"LanceDB has {vector_count} vectors")
+
+        # Find missing (in graph but not in vectors)
+        missing_uuids = list(graph_uuids - vector_uuids)
+        missing_count = len(missing_uuids)
+
+        # Calculate sync ratio
+        if graph_count == 0:
+            sync_ratio = 1.0  # Empty is considered healthy
+        else:
+            sync_ratio = (graph_count - missing_count) / graph_count
+
+        healthy = sync_ratio >= 0.99
+
+        log.info(
+            f"Sync health: graph={graph_count}, vectors={vector_count}, "
+            f"missing={missing_count}, ratio={sync_ratio:.3f}, healthy={healthy}"
+        )
+
+        return {
+            "graph_count": graph_count,
+            "vector_count": vector_count,
+            "missing_count": missing_count,
+            "missing_uuids": missing_uuids[:100],  # Cap at 100 to avoid huge responses
+            "sync_ratio": round(sync_ratio, 4),
+            "healthy": healthy,
+        }
+
+    def repair_sync(
+        self,
+        project_id: str | None = None,
+        dry_run: bool = True,
+        batch_size: int = 50,
+    ) -> dict[str, Any]:
+        """Repair graph/vector desync by regenerating missing embeddings.
+
+        Finds memories that exist in graph but are missing from LanceDB,
+        generates embeddings, and writes them to the vector store.
+
+        Args:
+            project_id: Optional project filter
+            dry_run: If True, only report what would be repaired (default: True)
+            batch_size: Number of memories to embed per batch
+
+        Returns:
+            Dictionary with:
+            - dry_run: Whether this was a dry run
+            - missing_count: Number of memories needing repair
+            - repaired_count: Number of memories repaired (0 if dry_run)
+            - errors: List of UUIDs that failed to repair
+            - missing_uuids: UUIDs that need repair (if dry_run)
+        """
+        from simplemem_lite.embeddings import embed_batch
+
+        log.info(f"Starting repair_sync (project={project_id}, dry_run={dry_run})")
+
+        # Get sync health to find missing UUIDs
+        health = self.get_sync_health(project_id)
+        missing_uuids = health["missing_uuids"]
+
+        if not missing_uuids:
+            log.info("No desync detected, nothing to repair")
+            return {
+                "dry_run": dry_run,
+                "missing_count": 0,
+                "repaired_count": 0,
+                "errors": [],
+            }
+
+        # If sync_health capped at 100, get full list for repair
+        if health["missing_count"] > len(missing_uuids):
+            log.debug("Fetching full list of missing UUIDs for repair")
+            if project_id:
+                result = self.graph.query(
+                    "MATCH (m:Memory {project_id: $project_id}) RETURN m.uuid",
+                    {"project_id": project_id},
+                )
+            else:
+                result = self.graph.query("MATCH (m:Memory) RETURN m.uuid")
+
+            graph_uuids = {row[0] for row in result.result_set if row[0]}
+
+            with self._write_lock:
+                df = self.lance_table.to_pandas(columns=["uuid"])
+                vector_uuids = set(df["uuid"].tolist())
+
+            missing_uuids = list(graph_uuids - vector_uuids)
+
+        missing_count = len(missing_uuids)
+        log.info(f"Found {missing_count} memories needing repair")
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "missing_count": missing_count,
+                "repaired_count": 0,
+                "errors": [],
+                "missing_uuids": missing_uuids[:100],  # Cap preview
+            }
+
+        # Actually repair: fetch content, generate embeddings, write vectors
+        repaired_count = 0
+        errors = []
+
+        # Process in batches
+        for i in range(0, missing_count, batch_size):
+            batch_uuids = missing_uuids[i:i + batch_size]
+            log.debug(f"Repairing batch {i // batch_size + 1}: {len(batch_uuids)} memories")
+
+            try:
+                # Fetch memory content from graph
+                uuid_list = list(batch_uuids)
+                result = self.graph.query(
+                    """
+                    MATCH (m:Memory)
+                    WHERE m.uuid IN $uuids
+                    RETURN m.uuid, m.content, m.type, m.session_id
+                    """,
+                    {"uuids": uuid_list},
+                )
+
+                if not result.result_set:
+                    log.warning(f"No results for UUIDs: {uuid_list[:3]}...")
+                    errors.extend(uuid_list)
+                    continue
+
+                # Prepare for batch embedding
+                memories = []
+                for row in result.result_set:
+                    memories.append({
+                        "uuid": row[0],
+                        "content": row[1],
+                        "type": row[2] or "fact",
+                        "session_id": row[3] or "",
+                    })
+
+                if not memories:
+                    continue
+
+                # Generate embeddings in batch
+                contents = [m["content"] for m in memories]
+                embeddings = embed_batch(contents, self.config)
+
+                if len(embeddings) != len(memories):
+                    log.warning(f"Embedding count mismatch: {len(embeddings)} vs {len(memories)}")
+                    # Process what we got
+                    memories = memories[:len(embeddings)]
+
+                # Write to LanceDB
+                import json
+                with self._write_lock:
+                    records = [
+                        {
+                            "uuid": m["uuid"],
+                            "vector": embeddings[i],
+                            "content": m["content"],
+                            "type": m["type"],
+                            "session_id": m["session_id"],
+                            "metadata": json.dumps({}),
+                        }
+                        for i, m in enumerate(memories)
+                    ]
+                    self.lance_table.add(records)
+
+                repaired_count += len(memories)
+                log.debug(f"Repaired {len(memories)} memories in batch")
+
+            except Exception as e:
+                log.error(f"Batch repair failed: {e}")
+                errors.extend(batch_uuids)
+
+        log.info(f"Repair complete: {repaired_count} repaired, {len(errors)} errors")
+
+        return {
+            "dry_run": False,
+            "missing_count": missing_count,
+            "repaired_count": repaired_count,
+            "errors": errors[:100],  # Cap error list
         }
 
     def get_pagerank_scores(

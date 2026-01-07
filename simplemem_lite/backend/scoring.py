@@ -321,6 +321,24 @@ def apply_temporal_scoring(
 
 SUPERSESSION_PENALTY: float = 0.2
 
+# LLM Reranking constants
+RERANK_CONTENT_PREVIEW_LEN: int = 200  # Max chars of content to show LLM for reranking
+
+
+def _escape_xml_chars(text: str) -> str:
+    """Escape XML special characters to prevent prompt injection.
+
+    Memory content could contain XML-like tags that might confuse the LLM
+    or attempt prompt injection. This escapes them to literal text.
+
+    Args:
+        text: Raw text that may contain XML characters
+
+    Returns:
+        Text with <, >, & escaped
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def apply_supersession_penalty(
     memories: list[dict[str, Any]],
@@ -346,3 +364,167 @@ def apply_supersession_penalty(
         results.append(result)
 
     return sorted(results, key=lambda x: -x.get("final_score", 0.0))
+
+
+# LLM Reranking (Phase 2)
+
+async def rerank_results(
+    query: str,
+    results: list[dict[str, Any]],
+    top_k: int = 10,
+    rerank_pool: int = 20,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Rerank search results using LLM for improved precision.
+
+    Takes the top results from vector search and uses an LLM to reorder
+    them by semantic relevance to the query. Also detects potential
+    conflicts between memories.
+
+    Args:
+        query: Original search query
+        results: List of memory dicts from search (with uuid, type, content)
+        top_k: Number of top results to return after reranking
+        rerank_pool: Number of results to consider for reranking (default: 20)
+        model: LLM model to use (defaults to gemini-2.0-flash for speed)
+
+    Returns:
+        Dict with:
+            - results: Reranked top-k results
+            - conflicts: List of detected conflicts [[idx1, idx2, reason], ...]
+            - rerank_applied: True if reranking was applied
+    """
+    from json_repair import loads as json_repair_loads
+    from litellm import acompletion
+
+    # Use fast model for reranking by default
+    if model is None:
+        model = "gemini/gemini-2.0-flash"
+
+    # If not enough results to rerank, return as-is
+    if len(results) <= top_k:
+        return {
+            "results": results,
+            "conflicts": [],
+            "rerank_applied": False,
+        }
+
+    # Take top rerank_pool for LLM consideration
+    pool = results[:rerank_pool]
+
+    # Format memories for LLM - escape content to prevent injection
+    formatted_memories = []
+    for i, r in enumerate(pool):
+        raw_content = r.get("content", "")[:RERANK_CONTENT_PREVIEW_LEN]
+        content_preview = _escape_xml_chars(raw_content)
+        mem_type = r.get("type", "unknown")
+        formatted_memories.append(f"[{i}] ({mem_type}): {content_preview}")
+
+    memories_text = "\n".join(formatted_memories)
+
+    try:
+        response = await acompletion(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Rerank these memories by relevance to the query. Also identify any conflicting information.
+
+<query>{query}</query>
+
+<memories>
+{memories_text}
+</memories>
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "indices": [most_relevant_index, second_most_relevant, ...],
+  "conflicts": [[index1, index2, "brief reason"], ...]
+}}
+
+Rules:
+- "indices" must contain integers from 0 to {len(pool) - 1} ordered by relevance
+- Include at least {min(top_k, len(pool))} indices
+- "conflicts" lists pairs of memory indices that contain contradictory information
+- If no conflicts found, use empty array: []""",
+                }
+            ],
+            max_tokens=300,
+            temperature=0.0,  # Deterministic for consistent ranking
+        )
+
+        # Safety check for LLM response
+        if not response.choices or not response.choices[0].message.content:
+            return {
+                "results": results[:top_k],
+                "conflicts": [],
+                "rerank_applied": False,
+                "error": "Empty LLM response",
+            }
+
+        content = response.choices[0].message.content
+        parsed = json_repair_loads(content)
+
+        if not isinstance(parsed, dict):
+            return {
+                "results": results[:top_k],
+                "conflicts": [],
+                "rerank_applied": False,
+                "error": "Invalid JSON structure",
+            }
+
+        # Extract and validate indices
+        indices = parsed.get("indices", [])
+        if not isinstance(indices, list):
+            indices = []
+
+        # Filter valid indices and remove duplicates while preserving order
+        seen = set()
+        valid_indices = []
+        for idx in indices:
+            if isinstance(idx, int) and 0 <= idx < len(pool) and idx not in seen:
+                valid_indices.append(idx)
+                seen.add(idx)
+
+        # If LLM didn't return enough indices, fill with remaining
+        if len(valid_indices) < top_k:
+            for i in range(len(pool)):
+                if i not in seen:
+                    valid_indices.append(i)
+                    seen.add(i)
+                if len(valid_indices) >= top_k:
+                    break
+
+        # Build reranked results
+        reranked = [pool[i] for i in valid_indices[:top_k]]
+
+        # Extract conflicts (validate format)
+        conflicts_raw = parsed.get("conflicts", [])
+        conflicts = []
+        if isinstance(conflicts_raw, list):
+            for c in conflicts_raw:
+                if isinstance(c, list) and len(c) >= 2:
+                    idx1, idx2 = c[0], c[1]
+                    reason = c[2] if len(c) > 2 else "Conflicting information"
+                    if (
+                        isinstance(idx1, int)
+                        and isinstance(idx2, int)
+                        and 0 <= idx1 < len(pool)
+                        and 0 <= idx2 < len(pool)
+                    ):
+                        conflicts.append([idx1, idx2, str(reason)])
+
+        return {
+            "results": reranked,
+            "conflicts": conflicts,
+            "rerank_applied": True,
+        }
+
+    except Exception as e:
+        # On any error, return original results without reranking
+        return {
+            "results": results[:top_k],
+            "conflicts": [],
+            "rerank_applied": False,
+            "error": str(e),
+        }

@@ -3,6 +3,7 @@
 Unified memory storage with hybrid search (vector + graph).
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,228 @@ from simplemem_lite.log_config import get_logger
 
 log = get_logger("memory")
 
+
+async def expand_query(query: str, config: Config) -> list[str]:
+    """Expand a search query into semantic variations using LLM.
+
+    Uses the configured summary model to generate 3-4 semantic variations
+    of the original query to improve recall during search.
+
+    Args:
+        query: Original search query
+        config: Config with LLM model settings
+
+    Returns:
+        List of query variations (always includes original query first)
+    """
+    from json_repair import loads as json_repair_loads
+    from litellm import acompletion
+
+    log.debug(f"Expanding query: '{query[:50]}...'")
+
+    try:
+        response = await acompletion(
+            model=config.summary_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Expand the search query inside <query></query> tags into 3-4 semantic variations that would help find relevant memories.
+Include synonyms, related concepts, and different phrasings.
+
+<query>{query}</query>
+
+Return ONLY a JSON array of strings. Include the original query as the first element.
+Example output: ["original query", "variation 1", "variation 2", "variation 3"]""",
+                }
+            ],
+            max_tokens=200,
+            temperature=0.3,
+        )
+
+        # Safety check for LLM response
+        if not response.choices or not response.choices[0].message.content:
+            log.warning("Empty LLM response for query expansion")
+            return [query]
+
+        content = response.choices[0].message.content
+        variations = json_repair_loads(content)
+
+        if not isinstance(variations, list) or len(variations) == 0:
+            log.warning(f"Invalid expansion result, using original query only")
+            return [query]
+
+        # Build unique list with original query first
+        seen = {query}
+        result = [query]
+        for v in variations:
+            v_str = str(v).strip() if v else ""
+            if v_str and v_str not in seen:
+                result.append(v_str)
+                seen.add(v_str)
+
+        log.info(f"Query expanded: '{query[:30]}...' -> {len(result)} variations")
+        log.debug(f"Expanded queries: {result}")
+        return result[:5]  # Cap at 5 variations to limit API calls
+
+    except Exception as e:
+        log.warning(f"Query expansion failed: {e}, using original query only")
+        return [query]
+
+
+def _escape_xml_chars(text: str) -> str:
+    """Escape XML special characters to prevent prompt injection.
+
+    Args:
+        text: Raw text that may contain XML characters
+
+    Returns:
+        Text with <, >, & escaped
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def detect_contradictions(
+    new_content: str,
+    similar_memories: list[dict],
+    config: Config,
+) -> list[dict]:
+    """Detect memories that new content might contradict or supersede.
+
+    Uses LLM to analyze whether the new memory contradicts, updates, or
+    supersedes any existing similar memories. This enables automatic
+    deprecation of outdated information.
+
+    Args:
+        new_content: Content of the new memory being stored
+        similar_memories: List of similar memory dicts (from vector search)
+                         Each should have 'uuid', 'content', 'type' keys
+        config: Config with LLM model settings
+
+    Returns:
+        List of contradictions found, each with:
+        - uuid: UUID of the contradicted memory
+        - reason: Brief explanation of the contradiction
+        - confidence: high/medium/low
+
+    Note:
+        - Returns empty list on LLM errors (graceful degradation)
+        - Only processes memories with score > 0.3 to avoid false positives
+        - Filters out memories of different types to reduce noise
+    """
+    from json_repair import loads as json_repair_loads
+    from litellm import acompletion
+
+    if not similar_memories:
+        return []
+
+    # Filter to memories with reasonable similarity
+    relevant = [m for m in similar_memories if m.get("score", 0) > 0.3]
+    if not relevant:
+        log.debug("No sufficiently similar memories for contradiction detection")
+        return []
+
+    log.debug(f"Checking {len(relevant)} memories for contradictions")
+
+    # Format memories for LLM - escape content to prevent injection
+    formatted_memories = []
+    for i, m in enumerate(relevant):
+        content_preview = _escape_xml_chars(
+            m.get("content", "")[:CONTRADICTION_CONTENT_PREVIEW_LEN]
+        )
+        mem_type = m.get("type", "unknown")
+        formatted_memories.append(f"[{i}] ({mem_type}): {content_preview}")
+
+    memories_text = "\n".join(formatted_memories)
+    new_content_escaped = _escape_xml_chars(new_content[:500])
+
+    try:
+        response = await acompletion(
+            model=config.summary_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Analyze whether the new memory contradicts, updates, or supersedes any existing memories.
+
+<new_memory>
+{new_content_escaped}
+</new_memory>
+
+<existing_memories>
+{memories_text}
+</existing_memories>
+
+A memory is SUPERSEDED when:
+- The new memory provides updated/corrected information on the same topic
+- The new memory contains a decision that reverses a previous decision
+- The new memory fixes a bug that was documented in the old memory
+- The new memory provides more accurate facts than the old memory
+
+Return ONLY valid JSON with this structure:
+{{
+  "contradictions": [
+    {{"index": 0, "reason": "brief explanation", "confidence": "high"}},
+    ...
+  ]
+}}
+
+Rules:
+- "index" must be a valid integer from 0 to {len(relevant) - 1}
+- "reason" should be a brief (1-2 sentence) explanation
+- "confidence" must be "high", "medium", or "low"
+- Only include memories that are clearly contradicted/superseded
+- If no contradictions found, return {{"contradictions": []}}
+- Be conservative - only flag clear contradictions, not minor updates""",
+                }
+            ],
+            max_tokens=400,
+            temperature=0.0,  # Deterministic for consistent results
+        )
+
+        # Safety check for LLM response
+        if not response.choices or not response.choices[0].message.content:
+            log.warning("Empty LLM response for contradiction detection")
+            return []
+
+        content = response.choices[0].message.content
+        parsed = json_repair_loads(content)
+
+        if not isinstance(parsed, dict):
+            log.warning("Invalid JSON structure from contradiction detection")
+            return []
+
+        contradictions_raw = parsed.get("contradictions", [])
+        if not isinstance(contradictions_raw, list):
+            return []
+
+        # Validate and map to UUIDs
+        result = []
+        for c in contradictions_raw:
+            if not isinstance(c, dict):
+                continue
+
+            idx = c.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(relevant):
+                continue
+
+            reason = str(c.get("reason", "Contradicting information"))[:200]
+            confidence = c.get("confidence", "medium")
+            if confidence not in ("high", "medium", "low"):
+                confidence = "medium"
+
+            result.append({
+                "uuid": relevant[idx]["uuid"],
+                "reason": reason,
+                "confidence": confidence,
+            })
+
+        log.info(f"Contradiction detection found {len(result)} superseded memories")
+        return result
+
+    except Exception as e:
+        log.warning(f"Contradiction detection failed: {e}")
+        return []
+
+
 # Semantic weights for relation types (applied in Python for flexibility)
 RELATION_WEIGHTS = {
     "contains": 1.0,    # Hierarchical drill-down
@@ -24,7 +247,11 @@ RELATION_WEIGHTS = {
     "follows": 0.6,     # Temporal sequence
     "mentions": 0.4,    # Reference
     "relates": 0.3,     # Generic/weak
+    "supersedes": 0.1,  # New memory supersedes old (for contradiction handling)
 }
+
+# Content preview length for contradiction detection
+CONTRADICTION_CONTENT_PREVIEW_LEN: int = 300
 
 
 @dataclass
@@ -96,12 +323,23 @@ class MemoryStore:
         init_embeddings(self.config)
         log.debug("Initializing database manager")
         self.db = DatabaseManager(self.config)
+
+        # Retry queue for failed vector writes
+        # Format: [{"uuid": str, "embedding": list, "content": str, "type": str, "session_id": str, "metadata": dict}]
+        self._vector_retry_queue: list[dict] = []
+        self._max_retry_queue_size = 100  # Cap to prevent unbounded growth
+        self._retry_queue_lock = threading.Lock()  # Thread safety for queue operations
+        self._retry_backoff_seconds = 30  # Delay between retry attempts
+        self._last_retry_attempt = 0.0  # Timestamp of last retry
+
         log.info("MemoryStore initialized successfully")
 
     def store(self, item: MemoryItem) -> str:
         """Store a memory with embedding and optional relationships.
 
         Uses two-phase commit: graph first (source of truth), then vectors.
+        If vector write fails, the memory is queued for retry rather than
+        rolled back (preventing data loss).
 
         Args:
             item: Memory item to store
@@ -110,7 +348,7 @@ class MemoryStore:
             UUID of stored memory
 
         Raises:
-            Exception: If storage fails (with automatic rollback)
+            Exception: If graph storage fails (with automatic rollback)
         """
         memory_uuid = str(uuid4())
         mem_type = item.metadata.get("type", "fact")
@@ -127,9 +365,9 @@ class MemoryStore:
         log.trace(f"Embedding generated: dim={len(embedding)}")
 
         with self.db.write_lock:
+            # Phase 1: Write to graph (primary - source of truth)
+            log.trace("Phase 1: Writing to graph")
             try:
-                # Phase 1: Write to graph (primary)
-                log.trace("Phase 1: Writing to graph")
                 self.db.add_memory_node(
                     uuid=memory_uuid,
                     content=item.content,
@@ -139,9 +377,14 @@ class MemoryStore:
                     created_at=created_at,
                     project_id=project_id,
                 )
+            except Exception as e:
+                log.error(f"Graph storage failed: {e}")
+                raise e  # Graph failure is fatal
 
-                # Phase 2: Write to vectors
-                log.trace("Phase 2: Writing to vectors")
+            # Phase 2: Write to vectors (non-fatal - queue for retry if fails)
+            log.trace("Phase 2: Writing to vectors")
+            vector_write_success = False
+            try:
                 self.db.add_memory_vector(
                     uuid=memory_uuid,
                     vector=embedding,
@@ -150,30 +393,169 @@ class MemoryStore:
                     session_id=session_id,
                     metadata=item.metadata,
                 )
-
-                # Phase 3: Create relationships
-                if item.relations:
-                    log.trace(f"Phase 3: Creating {len(item.relations)} relationships")
-                for rel in item.relations:
-                    self.db.add_relationship(
-                        from_uuid=memory_uuid,
-                        to_uuid=rel["target_id"],
-                        relation_type=rel.get("type", "relates"),
-                    )
-
+                vector_write_success = True
             except Exception as e:
-                log.error(f"Storage failed: {e}, rolling back")
-                # Rollback: delete from graph and vectors
-                try:
-                    self.db.delete_memory_node(memory_uuid)
-                    self.db.delete_memory_vector(memory_uuid)
-                    log.debug("Rollback successful")
-                except Exception as rollback_e:
-                    log.warning(f"Rollback failed: {rollback_e}")
-                raise e
+                log.warning(f"Vector write failed, queuing for retry: {e}")
+                self._queue_vector_retry(
+                    uuid=memory_uuid,
+                    embedding=embedding,
+                    content=item.content,
+                    mem_type=mem_type,
+                    session_id=session_id,
+                    metadata=item.metadata,
+                )
 
-        log.info(f"Memory stored: {memory_uuid[:8]}... ({mem_type})")
+            # Phase 3: Create relationships
+            if item.relations:
+                log.trace(f"Phase 3: Creating {len(item.relations)} relationships")
+                for rel in item.relations:
+                    try:
+                        self.db.add_relationship(
+                            from_uuid=memory_uuid,
+                            to_uuid=rel["target_id"],
+                            relation_type=rel.get("type", "relates"),
+                        )
+                    except Exception as e:
+                        log.warning(f"Failed to create relationship: {e}")
+
+        status = "stored" if vector_write_success else "stored (vector pending)"
+        log.info(f"Memory {status}: {memory_uuid[:8]}... ({mem_type})")
+
+        # Opportunistically process retry queue (respects backoff)
+        self.maybe_process_retry_queue()
+
         return memory_uuid
+
+    def _queue_vector_retry(
+        self,
+        uuid: str,
+        embedding: list[float],
+        content: str,
+        mem_type: str,
+        session_id: str | None,
+        metadata: dict,
+    ) -> None:
+        """Queue a failed vector write for later retry.
+
+        Thread-safe: uses _retry_queue_lock.
+
+        Args:
+            uuid: Memory UUID
+            embedding: Pre-computed embedding vector
+            content: Memory content
+            mem_type: Memory type
+            session_id: Session ID
+            metadata: Additional metadata
+        """
+        with self._retry_queue_lock:
+            # Avoid duplicates
+            if any(item["uuid"] == uuid for item in self._vector_retry_queue):
+                log.debug(f"UUID {uuid[:8]}... already in retry queue")
+                return
+
+            # Enforce max queue size
+            if len(self._vector_retry_queue) >= self._max_retry_queue_size:
+                log.warning(f"Retry queue full ({self._max_retry_queue_size}), dropping oldest")
+                self._vector_retry_queue.pop(0)
+
+            self._vector_retry_queue.append({
+                "uuid": uuid,
+                "embedding": embedding,
+                "content": content,
+                "type": mem_type,
+                "session_id": session_id or "",
+                "metadata": metadata,
+            })
+            log.debug(f"Queued for retry: {uuid[:8]}... (queue size: {len(self._vector_retry_queue)})")
+
+    def process_retry_queue(self, force: bool = False) -> dict:
+        """Process pending vector write retries.
+
+        Thread-safe: uses _retry_queue_lock.
+        Respects backoff unless force=True.
+
+        Args:
+            force: Skip backoff check (default: False)
+
+        Returns:
+            Dictionary with:
+            - processed: Number of items processed
+            - succeeded: Number of successful writes
+            - failed: Number of failed writes
+            - remaining: Number of items still in queue
+            - skipped: True if skipped due to backoff
+        """
+        import json
+
+        # Check backoff (without lock to avoid blocking)
+        now = time.time()
+        if not force and (now - self._last_retry_attempt) < self._retry_backoff_seconds:
+            return {"processed": 0, "succeeded": 0, "failed": 0, "remaining": self.get_retry_queue_size(), "skipped": True}
+
+        with self._retry_queue_lock:
+            if not self._vector_retry_queue:
+                return {"processed": 0, "succeeded": 0, "failed": 0, "remaining": 0, "skipped": False}
+
+            self._last_retry_attempt = now
+            log.info(f"Processing vector retry queue: {len(self._vector_retry_queue)} items")
+
+            succeeded = 0
+            failed = 0
+            still_failed = []
+
+            for item in self._vector_retry_queue:
+                try:
+                    with self.db.write_lock:
+                        self.db.lance_table.add([{
+                            "uuid": item["uuid"],
+                            "vector": item["embedding"],
+                            "content": item["content"],
+                            "type": item["type"],
+                            "session_id": item["session_id"],
+                            "metadata": json.dumps(item["metadata"]),
+                        }])
+                    succeeded += 1
+                    log.debug(f"Retry succeeded: {item['uuid'][:8]}...")
+                except Exception as e:
+                    log.warning(f"Retry failed for {item['uuid'][:8]}...: {e}")
+                    still_failed.append(item)
+                    failed += 1
+
+            self._vector_retry_queue = still_failed
+            processed = succeeded + failed
+
+            log.info(f"Retry queue processed: {succeeded} succeeded, {failed} failed, {len(still_failed)} remaining")
+            return {
+                "processed": processed,
+                "succeeded": succeeded,
+                "failed": failed,
+                "remaining": len(still_failed),
+                "skipped": False,
+            }
+
+    def maybe_process_retry_queue(self) -> dict:
+        """Attempt to process retry queue if backoff has elapsed.
+
+        This is the method that should be called periodically (e.g., after each store).
+        It will only actually process if enough time has passed since the last attempt.
+
+        Returns:
+            Result dict from process_retry_queue
+        """
+        if self.get_retry_queue_size() == 0:
+            return {"processed": 0, "succeeded": 0, "failed": 0, "remaining": 0, "skipped": False}
+        return self.process_retry_queue(force=False)
+
+    def get_retry_queue_size(self) -> int:
+        """Get the number of items in the vector retry queue.
+
+        Thread-safe: uses _retry_queue_lock.
+
+        Returns:
+            Number of pending vector writes
+        """
+        with self._retry_queue_lock:
+            return len(self._vector_retry_queue)
 
     def store_batch(self, items: list[MemoryItem]) -> list[str]:
         """Store multiple memories with batch embedding for efficiency.
@@ -374,6 +756,64 @@ class MemoryStore:
         log.info(f"Search complete: returning {min(len(ranked), limit)} results")
         return self._format_combined_results(ranked[:limit])
 
+    def search_multi_query(
+        self,
+        queries: list[str],
+        limit: int = 10,
+        use_graph: bool = True,
+        type_filter: str | None = None,
+        project_id: str | None = None,
+    ) -> list[Memory]:
+        """Search with multiple query variations and deduplicate results.
+
+        Performs search for each query variation, then combines and deduplicates
+        results by UUID, keeping the highest score for each memory.
+
+        Args:
+            queries: List of query variations (typically from expand_query)
+            limit: Maximum results to return
+            use_graph: Whether to expand results via graph
+            type_filter: Optional filter by memory type
+            project_id: Optional filter by project
+
+        Returns:
+            Deduplicated list of memories sorted by best score
+        """
+        if not queries:
+            return []
+
+        log.info(f"Multi-query search with {len(queries)} variations")
+
+        # Collect results from all queries, keyed by UUID
+        all_results: dict[str, Memory] = {}
+
+        for i, query in enumerate(queries):
+            log.debug(f"Searching variation {i+1}/{len(queries)}: '{query[:40]}...'")
+            results = self.search(
+                query=query,
+                limit=limit * 2,  # Get more per query, then dedupe
+                use_graph=use_graph,
+                type_filter=type_filter,
+                project_id=project_id,
+            )
+
+            for memory in results:
+                if memory.uuid not in all_results:
+                    all_results[memory.uuid] = memory
+                elif memory.score > all_results[memory.uuid].score:
+                    # Keep the higher score
+                    all_results[memory.uuid] = memory
+
+        # Sort by score and return top limit
+        sorted_results = sorted(
+            all_results.values(),
+            key=lambda m: m.score,
+            reverse=True,
+        )
+
+        log.info(f"Multi-query search complete: {len(sorted_results)} unique results, returning top {limit}")
+        return sorted_results[:limit]
+
     def relate(
         self,
         from_id: str,
@@ -543,7 +983,10 @@ class MemoryStore:
         """Get memory store statistics.
 
         Returns:
-            Dictionary with stats
+            Dictionary with stats (lightweight, O(1) operations only)
+
+        Note: For sync health metrics, use get_sync_health() directly.
+              It's not included here due to O(N) performance cost.
         """
         log.debug("Getting memory store stats")
 
@@ -556,6 +999,7 @@ class MemoryStore:
             "total_relations": db_stats["relations"],
             "types_breakdown": db_stats.get("entity_types", {}),
             "entities": db_stats.get("entities", 0),
+            "retry_queue_size": self.get_retry_queue_size(),
         }
 
     def _parse_metadata(self, metadata_str: str | None) -> dict[str, Any]:

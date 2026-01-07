@@ -128,6 +128,8 @@ class SimplememDaemon:
         self._handlers["ask_memories"] = self._handle_ask_memories
         self._handlers["get_stats"] = self._handle_get_stats
         self._handlers["reset_all"] = self._handle_reset_all
+        self._handlers["get_sync_health"] = self._handle_get_sync_health
+        self._handlers["repair_sync"] = self._handle_repair_sync
 
         # Code indexing
         self._handlers["search_code"] = self._handle_search_code
@@ -312,6 +314,63 @@ class SimplememDaemon:
         result = self._memory_store.reset_all()
         log.warning(f"RESET_ALL complete: {result}")
         return result
+
+    async def _handle_get_sync_health(self, params: dict) -> dict:
+        """Check graph/vector sync health."""
+        project_id = params.get("project_id")
+        log.info(f"get_sync_health: project={project_id}")
+        return self._memory_store.db.get_sync_health(project_id)
+
+    async def _handle_repair_sync(self, params: dict) -> dict:
+        """Repair graph/vector desync.
+
+        Runs in background by default for large repairs.
+        Use job_status to check progress.
+        """
+        project_id = params.get("project_id")
+        dry_run = params.get("dry_run", True)
+        background = params.get("background", True)
+        batch_size = params.get("batch_size", 50)
+
+        log.info(f"repair_sync: project={project_id}, dry_run={dry_run}, background={background}")
+
+        # For dry runs, execute synchronously (fast)
+        if dry_run:
+            return self._memory_store.db.repair_sync(
+                project_id=project_id,
+                dry_run=True,
+                batch_size=batch_size,
+            )
+
+        # For actual repairs, run in background (may be slow)
+        if background:
+            async def _repair_job(proj_id: str | None, batch: int) -> dict:
+                """Background job for sync repair."""
+                log.info(f"Background job: repair_sync starting for project={proj_id}")
+                result = self._memory_store.db.repair_sync(
+                    project_id=proj_id,
+                    dry_run=False,
+                    batch_size=batch,
+                )
+                log.info(f"Background job: repair_sync complete: {result.get('repaired_count', 0)} repaired")
+                return result
+
+            job_id = await self._job_manager.submit(
+                "repair_sync", _repair_job, project_id, batch_size
+            )
+            log.info(f"repair_sync submitted as background job {job_id}")
+            return {
+                "job_id": job_id,
+                "status": "submitted",
+                "message": f"Use job_status('{job_id}') to check progress",
+            }
+
+        # Synchronous execution (not recommended for large repairs)
+        return self._memory_store.db.repair_sync(
+            project_id=project_id,
+            dry_run=False,
+            batch_size=batch_size,
+        )
 
     async def _handle_search_code(self, params: dict) -> dict:
         """Search code index."""

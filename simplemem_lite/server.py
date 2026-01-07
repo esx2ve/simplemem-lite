@@ -947,6 +947,7 @@ async def search_memories(
     use_graph: bool = True,
     type_filter: str | None = None,
     project_id: str | None = None,
+    expand_query: bool = False,
 ) -> list[dict]:
     """Hybrid search combining vector similarity and graph traversal.
 
@@ -959,20 +960,134 @@ async def search_memories(
         use_graph: Whether to expand results via graph relationships
         type_filter: Optional filter by memory type
         project_id: Optional filter by project (for cross-project isolation)
+        expand_query: Whether to use LLM to expand query into semantic variations
+                      for improved recall. Adds latency but improves results.
 
     Returns:
         List of matching memories with scores
     """
-    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id})")
-    results = _deps.store.search(
-        query=query,
-        limit=limit,
-        use_graph=use_graph,
-        type_filter=type_filter,
-        project_id=project_id,
-    )
+    from simplemem_lite.memory import expand_query as _expand_query
+
+    log.info(f"Tool: search_memories called (query='{query[:50]}...', limit={limit}, project={project_id}, expand={expand_query})")
+
+    if expand_query:
+        # Expand query into semantic variations
+        queries = await _expand_query(query, _deps.config)
+        log.info(f"Tool: search_memories expanded query into {len(queries)} variations")
+
+        results = _deps.store.search_multi_query(
+            queries=queries,
+            limit=limit,
+            use_graph=use_graph,
+            type_filter=type_filter,
+            project_id=project_id,
+        )
+    else:
+        results = _deps.store.search(
+            query=query,
+            limit=limit,
+            use_graph=use_graph,
+            type_filter=type_filter,
+            project_id=project_id,
+        )
+
     log.info(f"Tool: search_memories complete: {len(results)} results")
     return [_memory_to_dict(m) for m in results]
+
+
+@mcp.tool()
+async def search_memories_deep(
+    query: str,
+    limit: int = 10,
+    type_filter: str | None = None,
+    project_id: str | None = None,
+    expand_query: bool = True,
+) -> dict:
+    """Deep search with query expansion and LLM reranking for maximum precision.
+
+    A tiered search approach that:
+    1. Expands the query into semantic variations (if enabled)
+    2. Performs hybrid vector + graph search
+    3. Reranks results using LLM for improved precision
+    4. Detects potential conflicts between memories
+
+    Use this for important queries where precision matters more than speed.
+    Adds ~500ms latency but significantly improves result quality.
+
+    Args:
+        query: Search query text
+        limit: Maximum results to return (default: 10)
+        type_filter: Optional filter by memory type
+        project_id: Optional filter by project (for cross-project isolation)
+        expand_query: Whether to expand query into semantic variations (default: True)
+
+    Returns:
+        Dict with:
+            - results: Reranked list of memories
+            - conflicts: Detected conflicts between memories [[uuid1, uuid2, reason], ...]
+            - query_expanded: Whether query expansion was applied
+            - rerank_applied: Whether LLM reranking was applied
+    """
+    from simplemem_lite.memory import expand_query as _expand_query
+    from simplemem_lite.backend.scoring import rerank_results
+
+    log.info(f"Tool: search_memories_deep called (query='{query[:50]}...', limit={limit}, project={project_id})")
+
+    # Step 1: Optionally expand query
+    query_expanded = False
+    if expand_query:
+        queries = await _expand_query(query, _deps.config)
+        query_expanded = len(queries) > 1
+        log.info(f"Tool: search_memories_deep expanded to {len(queries)} variations")
+
+        # Search with all variations
+        results = _deps.store.search_multi_query(
+            queries=queries,
+            limit=limit * 2,  # Get more for reranking pool
+            use_graph=True,
+            type_filter=type_filter,
+            project_id=project_id,
+        )
+    else:
+        results = _deps.store.search(
+            query=query,
+            limit=limit * 2,  # Get more for reranking pool
+            use_graph=True,
+            type_filter=type_filter,
+            project_id=project_id,
+        )
+
+    # Convert Memory objects to dicts for reranking
+    results_dicts = [_memory_to_dict(m) for m in results]
+
+    # Step 2: LLM reranking
+    rerank_result = await rerank_results(
+        query=query,
+        results=results_dicts,
+        top_k=limit,
+        rerank_pool=min(20, len(results_dicts)),
+    )
+
+    # Map conflict indices to UUIDs for easier use
+    conflicts_with_uuids = []
+    for conflict in rerank_result.get("conflicts", []):
+        if len(conflict) >= 3:
+            idx1, idx2, reason = conflict[0], conflict[1], conflict[2]
+            if idx1 < len(results_dicts) and idx2 < len(results_dicts):
+                conflicts_with_uuids.append([
+                    results_dicts[idx1].get("uuid"),
+                    results_dicts[idx2].get("uuid"),
+                    reason,
+                ])
+
+    log.info(f"Tool: search_memories_deep complete: {len(rerank_result['results'])} results, {len(conflicts_with_uuids)} conflicts")
+
+    return {
+        "results": rerank_result["results"],
+        "conflicts": conflicts_with_uuids,
+        "query_expanded": query_expanded,
+        "rerank_applied": rerank_result.get("rerank_applied", False),
+    }
 
 
 @mcp.tool()
@@ -995,6 +1110,111 @@ async def relate_memories(
     result = _deps.store.relate(from_id, to_id, relation_type)
     log.info(f"Tool: relate_memories complete: {result}")
     return result
+
+
+@mcp.tool()
+async def check_contradictions(
+    content: str,
+    memory_uuid: str | None = None,
+    project_id: str | None = None,
+    apply_supersession: bool = False,
+) -> dict:
+    """Detect memories that might be contradicted by new content.
+
+    Uses LLM to analyze whether new content contradicts, updates, or supersedes
+    any existing similar memories. Useful for:
+    - Checking before storing a new memory
+    - Validating that old information is still current
+    - Identifying outdated memories that need updating
+
+    Args:
+        content: The new content to check against existing memories
+        memory_uuid: Optional UUID of a newly stored memory (for applying supersession)
+        project_id: Optional project filter for isolation
+        apply_supersession: If True and memory_uuid provided, create SUPERSEDES
+                           relationships for detected contradictions (default: False)
+
+    Returns:
+        Dict with:
+            - contradictions: List of detected contradictions, each with:
+                - uuid: UUID of the contradicted memory
+                - reason: Brief explanation
+                - confidence: high/medium/low
+            - supersessions_created: Number of SUPERSEDES edges created (if apply_supersession=True)
+            - similar_count: Number of similar memories checked
+
+    Example:
+        # Check if a new decision contradicts existing ones
+        result = check_contradictions(
+            content="Decision: Use PostgreSQL for the database",
+            project_id="myproject"
+        )
+        # Returns: {"contradictions": [{"uuid": "...", "reason": "Previous decision was MySQL", "confidence": "high"}], ...}
+    """
+    from simplemem_lite.memory import detect_contradictions
+
+    log.info(f"Tool: check_contradictions called (content='{content[:50]}...', project={project_id})")
+
+    # Step 1: Find similar memories via vector search
+    similar = _deps.store.search(
+        query=content,
+        limit=15,  # Get enough for LLM to analyze
+        use_graph=True,
+        project_id=project_id,
+    )
+
+    if not similar:
+        log.info("Tool: check_contradictions - no similar memories found")
+        return {
+            "contradictions": [],
+            "supersessions_created": 0,
+            "similar_count": 0,
+        }
+
+    # Convert to dicts for detect_contradictions
+    similar_dicts = [_memory_to_dict(m) for m in similar]
+
+    # Step 2: Run LLM contradiction detection
+    contradictions = await detect_contradictions(
+        new_content=content,
+        similar_memories=similar_dicts,
+        config=_deps.config,
+    )
+
+    # Step 3: Optionally apply supersession relationships
+    supersessions_created = 0
+    if apply_supersession and not memory_uuid:
+        log.warning(
+            "Tool: check_contradictions - apply_supersession=True but no memory_uuid provided. "
+            "Skipping supersession creation. Provide the memory_uuid of the new memory to create SUPERSEDES edges."
+        )
+    elif apply_supersession and memory_uuid and contradictions:
+        log.info(f"Tool: check_contradictions - applying {len(contradictions)} supersessions")
+        for c in contradictions:
+            # Map confidence to numeric value
+            confidence_map = {"high": 0.9, "medium": 0.7, "low": 0.5}
+            confidence = confidence_map.get(c.get("confidence", "medium"), 0.7)
+
+            success = _deps.store.db.add_supersession(
+                newer_uuid=memory_uuid,
+                older_uuid=c["uuid"],
+                confidence=confidence,
+                supersession_type="contradiction",
+                reason=c.get("reason", ""),
+            )
+            if success:
+                supersessions_created += 1
+
+    log.info(
+        f"Tool: check_contradictions complete: {len(contradictions)} contradictions, "
+        f"{supersessions_created} supersessions created"
+    )
+
+    return {
+        "contradictions": contradictions,
+        "supersessions_created": supersessions_created,
+        "similar_count": len(similar),
+    }
 
 
 @mcp.tool()
@@ -1171,6 +1391,105 @@ async def get_stats() -> dict:
     log.info("Tool: get_stats called")
     result = _deps.store.get_stats()
     log.info(f"Tool: get_stats complete: {result['total_memories']} memories")
+    return result
+
+
+@mcp.tool()
+async def get_sync_health(project_id: str | None = None) -> dict:
+    """Check synchronization health between graph and vector stores.
+
+    Detects memories that exist in the graph but are missing from LanceDB
+    (the "desync" problem caused by non-atomic writes).
+
+    NOTE: This is an O(N) operation that scans both stores. Do not call
+    frequently - use get_stats() for routine status checks.
+
+    Args:
+        project_id: Optional project filter. If provided, only checks
+                    memories belonging to that project.
+
+    Returns:
+        Dictionary with:
+        - graph_count: Number of memories in graph
+        - vector_count: Number of memories in LanceDB
+        - missing_count: Number of memories in graph but not in vectors
+        - missing_uuids: List of UUIDs missing from vectors (max 100)
+        - sync_ratio: Ratio of synced memories (0.0 to 1.0)
+        - healthy: True if sync_ratio >= 0.99
+    """
+    log.info(f"Tool: get_sync_health called (project={project_id})")
+    result = _deps.store.db.get_sync_health(project_id)
+    log.info(f"Tool: get_sync_health complete: ratio={result['sync_ratio']}, healthy={result['healthy']}")
+    return result
+
+
+@mcp.tool()
+async def repair_sync(
+    project_id: str | None = None,
+    dry_run: bool = True,
+    background: bool = True,
+    batch_size: int = 50,
+) -> dict:
+    """Repair graph/vector desync by regenerating missing embeddings.
+
+    Finds memories that exist in graph but are missing from LanceDB,
+    generates embeddings, and writes them to the vector store.
+
+    Args:
+        project_id: Optional project filter
+        dry_run: If True, only report what would be repaired (default: True)
+        background: If True, run in background job (default: True). Use
+                   job_status() to check progress.
+        batch_size: Number of memories to embed per batch (default: 50)
+
+    Returns:
+        If dry_run=True:
+            {dry_run: True, missing_count: N, repaired_count: 0, errors: [], missing_uuids: [...]}
+        If background=True:
+            {job_id: "...", status: "submitted", message: "..."}
+        Otherwise:
+            {dry_run: False, missing_count: N, repaired_count: M, errors: [...]}
+    """
+    log.info(f"Tool: repair_sync called (project={project_id}, dry_run={dry_run}, background={background})")
+
+    # For dry runs, execute synchronously (fast)
+    if dry_run:
+        result = _deps.store.db.repair_sync(
+            project_id=project_id,
+            dry_run=True,
+            batch_size=batch_size,
+        )
+        log.info(f"Tool: repair_sync dry run complete: {result['missing_count']} missing")
+        return result
+
+    # For actual repairs, run in background (may be slow)
+    if background:
+        async def _repair_job() -> dict:
+            """Background job for sync repair."""
+            log.info(f"Background job: repair_sync starting for project={project_id}")
+            result = _deps.store.db.repair_sync(
+                project_id=project_id,
+                dry_run=False,
+                batch_size=batch_size,
+            )
+            log.info(f"Background job: repair_sync complete: {result.get('repaired_count', 0)} repaired")
+            return result
+
+        job_id = await _deps.job_manager.submit("repair_sync", _repair_job)
+        log.info(f"Tool: repair_sync submitted as background job {job_id}")
+        return {
+            "job_id": job_id,
+            "status": "submitted",
+            "message": f"Use job_status('{job_id}') to check progress",
+        }
+
+    # Synchronous execution (not recommended for large repairs)
+    result = _deps.store.db.repair_sync(
+        project_id=project_id,
+        dry_run=False,
+        batch_size=batch_size,
+    )
+    log.info(f"Tool: repair_sync complete: {result['repaired_count']} repaired")
     return result
 
 
