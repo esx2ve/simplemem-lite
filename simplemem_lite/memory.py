@@ -199,6 +199,7 @@ Rules:
             return []
 
         content = response.choices[0].message.content
+        log.info(f"LLM contradiction response: {content[:500]}")  # Debug
         parsed = json_repair_loads(content)
 
         if not isinstance(parsed, dict):

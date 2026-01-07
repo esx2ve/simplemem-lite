@@ -151,6 +151,11 @@ class BackendConfig:
         """Get max decompression size in bytes."""
         return self.max_decompressed_size_mb * 1024 * 1024
 
+    @property
+    def summary_model(self) -> str:
+        """Alias for llm_model for compatibility with detect_contradictions."""
+        return self.llm_model
+
 
 # Global config instance
 _config: BackendConfig | None = None

@@ -509,6 +509,12 @@ async def check_contradictions(request: CheckContradictionsRequest) -> dict:
         return {
             "contradictions": contradictions,
             "supersessions_created": supersessions_created,
+            # Debug info
+            "_debug": {
+                "similar_memories_found": len(similar),
+                "similar_memories_scores": [m.score for m in similar[:5]],
+                "passed_to_llm": len([m for m in similar if m.score > 0.3]),
+            },
         }
 
     except Exception as e:
