@@ -80,6 +80,13 @@ def toonify(
                 log.warning(f"Cannot convert {type(result)} to TOON, returning as-is")
                 return result
 
+            # Auto-detect headers from first record if not provided
+            if headers is None:
+                if data:
+                    headers = list(data[0].keys())
+                else:
+                    headers = []
+
             if not data:
                 # Return empty TOON (just headers)
                 return PlainTextResponse(

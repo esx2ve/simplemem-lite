@@ -93,7 +93,7 @@ async def get_query_templates() -> dict:
 
 
 @router.post("/query")
-@toonify(headers=["uuid", "type", "content", "created_at"])
+@toonify(headers=None, result_key="results")
 async def run_cypher_query(request: CypherQueryRequest) -> dict:
     """Execute a validated Cypher query against the graph.
 
