@@ -11,6 +11,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
+import pathspec
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -112,6 +113,7 @@ class CodeWatchHandler(FileSystemEventHandler):
         queue: DebouncedQueue,
         patterns: list[str],
         project_root: Path,
+        code_indexer: "CodeIndexer",
     ):
         """Initialize the handler.
 
@@ -119,42 +121,28 @@ class CodeWatchHandler(FileSystemEventHandler):
             queue: DebouncedQueue to add events to
             patterns: Glob patterns for files to watch (e.g., ["*.py", "*.ts"])
             project_root: Project root for relative path matching
+            code_indexer: CodeIndexer for pattern exclusion checks
         """
         super().__init__()
         self.queue = queue
         self.patterns = patterns
         self.project_root = project_root
+        self.code_indexer = code_indexer
+        # Build include spec once using pathspec for proper ** glob support
+        self._include_spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
     def _matches_patterns(self, path: Path) -> bool:
-        """Check if path matches any of our patterns."""
-        for pattern in self.patterns:
-            if path.match(pattern):
-                return True
-        return False
+        """Check if path matches any include patterns using pathspec."""
+        try:
+            rel_path = path.relative_to(self.project_root)
+            return self._include_spec.match_file(str(rel_path))
+        except ValueError:
+            # Path is not relative to project_root
+            return False
 
     def _should_ignore(self, path: Path) -> bool:
-        """Check if path should be ignored."""
-        path_str = str(path)
-        # Ignore common non-code directories
-        ignore_dirs = {
-            "__pycache__",
-            ".git",
-            "node_modules",
-            ".venv",
-            "venv",
-            ".tox",
-            ".pytest_cache",
-            ".mypy_cache",
-            "dist",
-            "build",
-            ".eggs",
-            "*.egg-info",
-        }
-        parts = path.parts
-        for part in parts:
-            if part in ignore_dirs or part.endswith(".egg-info"):
-                return True
-        return False
+        """Check if path should be ignored using CodeIndexer's pathspec."""
+        return self.code_indexer._should_exclude(path, self.project_root)
 
     def on_created(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -359,7 +347,7 @@ class ProjectWatcherManager:
 
             # Create queue, handler, worker
             queue = DebouncedQueue(quiet_period=1.5)
-            handler = CodeWatchHandler(queue, self.patterns, root)
+            handler = CodeWatchHandler(queue, self.patterns, root, self.code_indexer)
             worker = WatcherWorker(queue, self.code_indexer, root)
 
             # Create and start observer
