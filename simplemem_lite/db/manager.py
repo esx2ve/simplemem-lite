@@ -2779,9 +2779,9 @@ class DatabaseManager:
         # Get UUIDs from LanceDB
         with self._write_lock:
             try:
-                # Use to_pandas for efficient bulk read (select column after)
-                df = self.lance_table.to_pandas()
-                vector_uuids = set(df["uuid"].tolist())
+                # Use to_arrow for efficient bulk read (no pandas dependency)
+                arrow_table = self.lance_table.to_arrow()
+                vector_uuids = set(arrow_table.column("uuid").to_pylist())
             except Exception as e:
                 log.warning(f"Failed to read LanceDB: {e}")
                 vector_uuids = set()
@@ -2870,8 +2870,8 @@ class DatabaseManager:
             graph_uuids = {row[0] for row in result.result_set if row[0]}
 
             with self._write_lock:
-                df = self.lance_table.to_pandas()
-                vector_uuids = set(df["uuid"].tolist())
+                arrow_table = self.lance_table.to_arrow()
+                vector_uuids = set(arrow_table.column("uuid").to_pylist())
 
             missing_uuids = list(graph_uuids - vector_uuids)
 
