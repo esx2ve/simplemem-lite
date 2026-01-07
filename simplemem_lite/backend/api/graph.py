@@ -63,7 +63,7 @@ class CypherQueryRequest(BaseModel):
     max_results: int = Field(default=100, ge=1, le=1000)
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 

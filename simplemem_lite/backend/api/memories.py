@@ -254,11 +254,12 @@ async def ask_memories(request: AskMemoriesRequest) -> dict:
 
 
 @router.post("/reason")
+@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="conclusions")
 async def reason_memories(request: ReasonMemoriesRequest) -> dict:
     """LLM-synthesized reasoning over memory graph.
 
-    Returns condensed reasoning summary explaining evidence chains,
-    with UUID references (not full content).
+    Returns full structured response with reasoning + conclusions when output_format='json' (default).
+    Returns only conclusion memories as TOON when output_format='toon' (for token efficiency).
     """
     require_project_id(request.project_id, "reason_memories")
     try:

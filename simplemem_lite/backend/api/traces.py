@@ -313,7 +313,7 @@ class ListJobsRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 

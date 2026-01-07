@@ -126,7 +126,7 @@ class ListProjectsRequest(BaseModel):
 
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 

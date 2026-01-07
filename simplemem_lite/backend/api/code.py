@@ -82,7 +82,7 @@ class SearchCodeRequest(BaseModel):
     project_id: str | None = Field(default=None, description="Filter to specific project")
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 
@@ -93,7 +93,7 @@ class CodeRelatedMemoriesRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 
@@ -104,7 +104,7 @@ class MemoryRelatedCodeRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
     output_format: str | None = Field(
         default=None,
-        description="Response format: 'json' or 'toon'. Defaults to SIMPLEMEM_OUTPUT_FORMAT env var.",
+        description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
 
 

@@ -980,7 +980,7 @@ async def search_memories(
                       for improved recall. Adds latency but improves results.
         brief: If True, return only metadata + preview (no summarization).
                Use get_memory(uuid) to fetch full content for specific items.
-        output_format: Response format: "json" (default), "toon" (30-60% fewer tokens).
+        output_format: Response format: "toon" (default, 30-60% fewer tokens), "json".
                        TOON returns results as a tab-separated table for maximum
                        token efficiency. Use when you want ultra-compact results.
 
@@ -2087,7 +2087,7 @@ async def search_code(
                     from cwd if not specified.
         brief: Return truncated preview instead of LLM summary (default: False).
                Use when you need fast results without LLM latency.
-        output_format: Response format: "json" (default), "toon" (30-60% fewer tokens).
+        output_format: Response format: "toon" (default, 30-60% fewer tokens), "json".
                        TOON returns results as a tab-separated table for maximum
                        token efficiency.
 

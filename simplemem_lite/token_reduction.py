@@ -30,15 +30,15 @@ log = get_logger("token_reduction")
 # Configuration from environment
 SUMMARY_MODEL = os.environ.get("SIMPLEMEM_SUMMARY_MODEL", "gemini/gemini-2.5-flash-lite")
 SUMMARY_MAX_CHARS = int(os.environ.get("SIMPLEMEM_SUMMARY_MAX_CHARS", "500"))
-OUTPUT_FORMAT = os.environ.get("SIMPLEMEM_OUTPUT_FORMAT", "compact")
+OUTPUT_FORMAT = os.environ.get("SIMPLEMEM_OUTPUT_FORMAT", "toon")
 
 
 class OutputFormat(Enum):
     """Output format options for MCP responses."""
 
     JSON = "json"  # Standard JSON (verbose)
-    COMPACT = "compact"  # Minified JSON via orjson (default)
-    TOON = "toon"  # Token-Optimized Object Notation
+    COMPACT = "compact"  # Minified JSON via orjson
+    TOON = "toon"  # Token-Optimized Object Notation (default)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
