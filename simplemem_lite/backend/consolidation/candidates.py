@@ -23,6 +23,30 @@ from simplemem_lite.log_config import get_logger
 
 log = get_logger("consolidation.candidates")
 
+# =============================================================================
+# Phase 1 Filtering Constants (prevent false positive candidates)
+# =============================================================================
+
+# Entity types too generic for supersession detection
+# File entities create too many false matches (every session touches common files)
+GENERIC_ENTITY_TYPES = {"file", "module", "directory", "path"}
+
+# Memory type pairs that should NEVER supersede each other
+# Summaries describe sessions; insights describe learnings - different purposes
+TYPE_INCOMPATIBLE = {
+    frozenset({"session_summary", "lesson_learned"}),
+    frozenset({"session_summary", "decision"}),
+    frozenset({"session_summary", "pattern"}),
+    frozenset({"session_summary", "fact"}),
+    frozenset({"chunk_summary", "lesson_learned"}),
+    frozenset({"chunk_summary", "decision"}),
+    frozenset({"chunk_summary", "pattern"}),
+    frozenset({"chunk_summary", "fact"}),
+    frozenset({"message", "lesson_learned"}),  # Session messages ≠ insights
+    frozenset({"message", "decision"}),
+    frozenset({"message", "pattern"}),
+}
+
 
 @dataclass
 class EntityPair:
@@ -168,14 +192,14 @@ async def get_memories_by_type(project_id: str) -> dict[str, list[dict[str, Any]
     return memories_by_type
 
 
-async def get_memories_by_entity(project_id: str) -> dict[str, list[dict[str, Any]]]:
+async def get_memories_by_entity(project_id: str) -> dict[str, dict[str, Any]]:
     """Get memories grouped by the entities they reference.
 
     Args:
         project_id: Project identifier
 
     Returns:
-        Dict mapping entity_name -> list of memories referencing it
+        Dict mapping entity_name -> {entity_type, memories: [...]}
     """
     store = get_memory_store()
 
@@ -184,6 +208,7 @@ async def get_memories_by_entity(project_id: str) -> dict[str, list[dict[str, An
         MATCH (m:Memory)-[r]->(e:Entity)
         WHERE m.project_id = $project_id
         RETURN e.name AS entity,
+               e.type AS entity_type,
                m.uuid AS uuid,
                m.content AS content,
                m.type AS type,
@@ -193,12 +218,15 @@ async def get_memories_by_entity(project_id: str) -> dict[str, list[dict[str, An
         {"project_id": project_id},
     )
 
-    memories_by_entity: dict[str, list[dict[str, Any]]] = {}
+    memories_by_entity: dict[str, dict[str, Any]] = {}
     for record in result.result_set or []:
-        entity, uuid, content, mem_type, created_at = record
+        entity, entity_type, uuid, content, mem_type, created_at = record
         if entity not in memories_by_entity:
-            memories_by_entity[entity] = []
-        memories_by_entity[entity].append({
+            memories_by_entity[entity] = {
+                "entity_type": entity_type or "unknown",
+                "memories": [],
+            }
+        memories_by_entity[entity]["memories"].append({
             "uuid": uuid,
             "content": content,
             "type": mem_type or "fact",
@@ -336,19 +364,20 @@ async def find_memory_candidates(
 async def find_supersession_candidates(
     project_id: str,
     min_days_apart: int = 1,
-    similarity_threshold: float = 0.6,
+    similarity_threshold: float = 0.75,  # Raised from 0.6 to reduce false positives
 ) -> list[SupersessionPair]:
     """Find memories that may supersede older ones.
 
     Strategy:
     1. Group memories by shared entity
-    2. For each entity, compare newer to older memories
-    3. Check content similarity (should be related but not duplicate)
+    2. Filter out generic entities (file paths create too many false matches)
+    3. Check memory type compatibility (summaries shouldn't supersede insights)
+    4. Compare newer to older memories by content similarity
 
     Args:
         project_id: Project to analyze
         min_days_apart: Minimum days between memories (default: 1)
-        similarity_threshold: Content similarity threshold (default: 0.6)
+        similarity_threshold: Content similarity threshold (default: 0.75, raised from 0.6)
 
     Returns:
         List of SupersessionPair candidates
@@ -357,8 +386,19 @@ async def find_supersession_candidates(
 
     memories_by_entity = await get_memories_by_entity(project_id)
     all_candidates: list[SupersessionPair] = []
+    skipped_generic = 0
+    skipped_type_incompatible = 0
 
-    for entity_name, memories in memories_by_entity.items():
+    for entity_name, entity_data in memories_by_entity.items():
+        entity_type = entity_data.get("entity_type", "unknown")
+        memories = entity_data.get("memories", [])
+
+        # FILTER 1: Skip generic entity types (file paths create false positives)
+        if entity_type in GENERIC_ENTITY_TYPES:
+            skipped_generic += len(memories)
+            log.debug(f"Skipping generic entity: {entity_name} (type: {entity_type})")
+            continue
+
         if len(memories) < 2:
             continue
 
@@ -377,9 +417,18 @@ async def find_supersession_candidates(
             log.warning(f"Failed to embed memories for entity {entity_name}: {e}")
             continue
 
-        # Compare newer to older (only check adjacent pairs in time)
+        # Compare newer to older
         for i, newer in enumerate(sorted_memories[:-1]):
             for j, older in enumerate(sorted_memories[i + 1:], start=i + 1):
+                # FILTER 2: Check memory type compatibility
+                newer_type = newer.get("type", "fact")
+                older_type = older.get("type", "fact")
+                type_pair = frozenset({newer_type, older_type})
+
+                if type_pair in TYPE_INCOMPATIBLE:
+                    skipped_type_incompatible += 1
+                    continue
+
                 newer_time = newer["created_at"] or 0
                 older_time = older["created_at"] or 0
 
@@ -397,7 +446,7 @@ async def find_supersession_candidates(
                 if days_apart < min_days_apart:
                     continue
 
-                # Check content similarity
+                # Check content similarity (raised threshold)
                 sim = cosine_similarity(embeddings[i], embeddings[j])
                 if sim < similarity_threshold:
                     continue  # Too different, not related
@@ -415,7 +464,10 @@ async def find_supersession_candidates(
                     )
                 )
 
-    log.info(f"Found {len(all_candidates)} supersession candidates")
+    log.info(
+        f"Found {len(all_candidates)} supersession candidates "
+        f"(skipped: {skipped_generic} generic entities, {skipped_type_incompatible} type-incompatible pairs)"
+    )
     return all_candidates
 
 

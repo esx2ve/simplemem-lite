@@ -433,3 +433,49 @@ async def reject_candidate(
         "type": candidate["type"],
         "reason": reason,
     }
+
+
+@router.delete("/review-queue/{project_id}")
+async def clear_review_queue(
+    project_id: str,
+    status_filter: str = "pending",
+) -> dict[str, Any]:
+    """Clear all review candidates for a project.
+
+    Use this to reset the queue after filter improvements or testing.
+
+    Args:
+        project_id: Project to clear queue for
+        status_filter: Only clear items with this status (default: pending)
+
+    Returns:
+        Count of deleted items
+    """
+    from simplemem_lite.backend.services import get_memory_store
+
+    log.info(f"Clearing review queue for project: {project_id} (status: {status_filter})")
+
+    store = get_memory_store()
+
+    # Delete matching review candidates
+    result = store.db.graph.query(
+        """
+        MATCH (c:ReviewCandidate)
+        WHERE c.project_id = $project_id AND c.status = $status
+        DELETE c
+        RETURN count(c) AS deleted
+        """,
+        {"project_id": project_id, "status": status_filter},
+    )
+
+    deleted = 0
+    if result.result_set:
+        deleted = result.result_set[0][0]
+
+    log.info(f"Deleted {deleted} review candidates")
+
+    return {
+        "project_id": project_id,
+        "status_filter": status_filter,
+        "deleted": deleted,
+    }

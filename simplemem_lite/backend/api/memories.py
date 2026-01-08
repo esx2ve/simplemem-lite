@@ -254,7 +254,7 @@ async def ask_memories(request: AskMemoriesRequest) -> dict:
 
 
 @router.post("/reason")
-@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="conclusions")
+@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources")
 async def reason_memories(request: ReasonMemoriesRequest) -> dict:
     """LLM-synthesized reasoning over memory graph.
 
