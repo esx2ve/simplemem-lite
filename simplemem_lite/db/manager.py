@@ -1605,28 +1605,55 @@ class DatabaseManager:
         query_vector: list[float],
         limit: int = 10,
         type_filter: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search for similar vectors.
 
         Args:
             query_vector: Query embedding
-            limit: Maximum results
+            limit: Maximum results (before project filtering)
             type_filter: Optional filter by memory type
+            project_id: Optional filter by project ID (Python-side filtering)
 
         Returns:
             List of matching memories with distance scores
         """
-        log.trace(f"Searching vectors: limit={limit}, type_filter={type_filter}")
+        log.trace(f"Searching vectors: limit={limit}, type_filter={type_filter}, project_id={project_id}")
+
+        # Fetch more results if we need to filter by project_id in Python
+        fetch_limit = limit * 3 if project_id else limit
 
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
-            search = self.lance_table.search(query_vector).limit(limit)
+            # LanceDB 0.1 pattern with explicit vector_column_name and query_type
+            search = self.lance_table.search(
+                query_vector,
+                vector_column_name="vector",
+                query_type="auto"
+            ).limit(fetch_limit)
 
             if type_filter:
                 search = search.where(f"type = '{type_filter}'")
 
             results = search.to_list()
 
-        log.debug(f"Vector search returned {len(results)} results")
+        log.debug(f"Vector search returned {len(results)} results before filtering")
+
+        # Python-side filtering for project_id (LanceDB 0.1 doesn't support JSON querying)
+        if project_id and results:
+            import json
+            filtered_results = []
+            for result in results:
+                try:
+                    metadata = json.loads(result.get("metadata", "{}"))
+                    if metadata.get("project_id") == project_id:
+                        filtered_results.append(result)
+                        if len(filtered_results) >= limit:
+                            break
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+            results = filtered_results
+            log.debug(f"After project_id filter: {len(results)} results")
+
         return results
 
     # ═══════════════════════════════════════════════════════════════════════════════

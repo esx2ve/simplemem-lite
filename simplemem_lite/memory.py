@@ -693,6 +693,7 @@ class MemoryStore:
             query_vector=query_embedding,
             limit=search_limit,
             type_filter=type_filter,
+            project_id=project_id,  # Filter in LanceDB for efficiency
         )
         log.debug(f"Vector search returned {len(vector_results)} results")
 
@@ -1109,7 +1110,7 @@ class MemoryStore:
         query_embedding = embed(query, self.config)
         # Fetch more seeds when filtering by project to ensure adequate results
         fetch_limit = seed_limit * 3 if project_id else seed_limit
-        seeds = self.db.search_vectors(query_embedding, limit=fetch_limit)
+        seeds = self.db.search_vectors(query_embedding, limit=fetch_limit, project_id=project_id)
         log.debug(f"Found {len(seeds)} seed nodes")
 
         # Optional: Filter by project_id (via graph lookup)

@@ -81,21 +81,22 @@ def toonify(
                 return result
 
             # Auto-detect headers from first record if not provided
-            if headers is None:
+            header_list = headers
+            if header_list is None:
                 if data:
-                    headers = list(data[0].keys())
+                    header_list = list(data[0].keys())
                 else:
-                    headers = []
+                    header_list = []
 
             if not data:
                 # Return empty TOON (just headers)
                 return PlainTextResponse(
-                    content="\t".join(headers),
+                    content="\t".join(header_list),
                     media_type="text/plain",
                 )
 
             # Convert to TOON
-            toon_content = to_toon(data, headers=headers)
+            toon_content = to_toon(data, headers=header_list)
             log.debug(f"Converted {len(data)} records to TOON ({len(toon_content)} chars)")
 
             return PlainTextResponse(content=toon_content, media_type="text/plain")
