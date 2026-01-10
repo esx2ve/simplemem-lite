@@ -27,6 +27,7 @@ from simplemem_lite.db.entity_repository import EntityRepository
 from simplemem_lite.db.graph_analytics import GraphAnalytics
 from simplemem_lite.db.graph_factory import create_graph_backend, get_backend_info
 from simplemem_lite.db.graph_protocol import GraphBackend
+from simplemem_lite.db.relationship_manager import RelationshipManager
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("db")
@@ -123,6 +124,10 @@ class DatabaseManager:
         self._entity_repository = EntityRepository(
             graph=self.graph,
             summary_max_size=config.summary_max_size,
+        )
+        self._relationship_manager = RelationshipManager(
+            graph=self.graph,
+            max_supersession_depth=10,
         )
 
     def close(self) -> None:
@@ -913,24 +918,15 @@ class DatabaseManager:
     ) -> None:
         """Add a relationship between two memories.
 
+        Delegates to RelationshipManager.
+
         Args:
             from_uuid: Source memory UUID
             to_uuid: Target memory UUID
             relation_type: Type of relationship
             weight: Relationship weight (default: 1.0)
         """
-        self.graph.query(
-            """
-            MATCH (from:Memory {uuid: $from_uuid}), (to:Memory {uuid: $to_uuid})
-            CREATE (from)-[:RELATES_TO {relation_type: $rel_type, weight: $weight}]->(to)
-            """,
-            {
-                "from_uuid": from_uuid,
-                "to_uuid": to_uuid,
-                "rel_type": relation_type,
-                "weight": weight,
-            },
-        )
+        self._relationship_manager.add_relationship(from_uuid, to_uuid, relation_type, weight)
 
     def would_create_supersession_cycle(
         self,
@@ -940,8 +936,7 @@ class DatabaseManager:
     ) -> bool:
         """Check if creating a SUPERSEDES edge would create a cycle.
 
-        DAG enforcement for supersession graph: prevents situations like
-        A supersedes B supersedes C supersedes A (cycle).
+        Delegates to RelationshipManager.
 
         Args:
             newer_uuid: UUID of the newer/superseding memory
@@ -951,29 +946,7 @@ class DatabaseManager:
         Returns:
             True if creating the edge would create a cycle, False otherwise
         """
-        # Check if older_uuid can reach newer_uuid via SUPERSEDES edges
-        # If so, creating newer->older would complete a cycle
-        # Note: Cypher doesn't support parameters for path length bounds,
-        # so we inject max_depth directly (safe: typed as int)
-        result = self.graph.query(
-            f"""
-            MATCH path = (older:Memory {{uuid: $older_uuid}})-[:SUPERSEDES*1..{max_depth}]->(newer:Memory {{uuid: $newer_uuid}})
-            RETURN count(path) > 0 AS would_cycle
-            """,
-            {
-                "newer_uuid": newer_uuid,
-                "older_uuid": older_uuid,
-            },
-        )
-
-        if result.result_set:
-            would_cycle = result.result_set[0][0]
-            if would_cycle:
-                log.warning(
-                    f"Supersession would create cycle: {newer_uuid[:8]}... -> {older_uuid[:8]}..."
-                )
-            return bool(would_cycle)
-        return False
+        return self._relationship_manager.would_create_supersession_cycle(newer_uuid, older_uuid, max_depth)
 
     def add_supersession(
         self,
@@ -985,11 +958,7 @@ class DatabaseManager:
     ) -> bool:
         """Mark that a newer memory supersedes an older one.
 
-        Used during consolidation when a newer memory provides updated
-        information that replaces an older memory.
-
-        Enforces DAG constraint: will not create the edge if it would
-        result in a cycle in the supersession graph.
+        Delegates to RelationshipManager.
 
         Args:
             newer_uuid: UUID of the newer/superseding memory
@@ -1001,49 +970,9 @@ class DatabaseManager:
         Returns:
             True if edge was created, False if blocked (cycle or same node)
         """
-        import time
-
-        # Self-supersession is not allowed
-        if newer_uuid == older_uuid:
-            log.warning(f"Cannot supersede self: {newer_uuid[:8]}...")
-            return False
-
-        # DAG enforcement: check for cycles
-        if self.would_create_supersession_cycle(newer_uuid, older_uuid):
-            log.warning(
-                f"Supersession blocked (would create cycle): "
-                f"{newer_uuid[:8]}... -> {older_uuid[:8]}..."
-            )
-            return False
-
-        self.graph.query(
-            """
-            MATCH (newer:Memory {uuid: $newer_uuid})
-            MATCH (older:Memory {uuid: $older_uuid})
-            MERGE (newer)-[r:SUPERSEDES]->(older)
-            ON CREATE SET r.confidence = $confidence,
-                          r.supersession_type = $type,
-                          r.reason = $reason,
-                          r.created_at = $now
-            ON MATCH SET r.confidence = $confidence,
-                         r.supersession_type = $type,
-                         r.reason = $reason
-            """,
-            {
-                "newer_uuid": newer_uuid,
-                "older_uuid": older_uuid,
-                "confidence": confidence,
-                "type": supersession_type,
-                "reason": reason or "",
-                "now": int(time.time()),
-            },
+        return self._relationship_manager.add_supersession(
+            newer_uuid, older_uuid, confidence, supersession_type, reason
         )
-
-        log.info(
-            f"Supersession created: {newer_uuid[:8]}... -> {older_uuid[:8]}... "
-            f"(confidence={confidence:.2f})"
-        )
-        return True
 
     def mark_merged(
         self,
@@ -1052,29 +981,13 @@ class DatabaseManager:
     ) -> None:
         """Mark a memory as merged into another (soft delete).
 
-        The source memory is kept but marked with MERGED_INTO relationship.
-        This preserves history while indicating the memory is superseded.
+        Delegates to RelationshipManager.
 
         Args:
             source_uuid: UUID of memory that was merged (will be marked)
             target_uuid: UUID of memory it was merged into
         """
-        import time
-        self.graph.query(
-            """
-            MATCH (source:Memory {uuid: $source_uuid})
-            MATCH (target:Memory {uuid: $target_uuid})
-            MERGE (source)-[r:MERGED_INTO]->(target)
-            ON CREATE SET r.merged_at = $now
-            SET source.merged_into = $target_uuid,
-                source.merged_at = $now
-            """,
-            {
-                "source_uuid": source_uuid,
-                "target_uuid": target_uuid,
-                "now": int(time.time()),
-            },
-        )
+        self._relationship_manager.mark_merged(source_uuid, target_uuid)
 
     def get_superseded_memories(
         self,
@@ -1082,41 +995,15 @@ class DatabaseManager:
     ) -> list[dict]:
         """Get all superseded memory UUIDs for exclusion from search.
 
+        Delegates to RelationshipManager.
+
         Args:
             project_id: Optional project filter
 
         Returns:
             List of dicts with older_uuid and superseding_uuid
         """
-        if project_id:
-            query = """
-            MATCH (newer:Memory)-[r:SUPERSEDES]->(older:Memory)
-            WHERE older.project_id = $project_id OR newer.project_id = $project_id
-            RETURN older.uuid AS superseded_uuid,
-                   newer.uuid AS superseding_uuid,
-                   r.confidence AS confidence,
-                   r.supersession_type AS type
-            """
-            result = self.graph.query(query, {"project_id": project_id})
-        else:
-            query = """
-            MATCH (newer:Memory)-[r:SUPERSEDES]->(older:Memory)
-            RETURN older.uuid AS superseded_uuid,
-                   newer.uuid AS superseding_uuid,
-                   r.confidence AS confidence,
-                   r.supersession_type AS type
-            """
-            result = self.graph.query(query)
-
-        return [
-            {
-                "superseded_uuid": row[0],
-                "superseding_uuid": row[1],
-                "confidence": row[2],
-                "type": row[3],
-            }
-            for row in (result.result_set or [])
-        ]
+        return self._relationship_manager.get_superseded_memories(project_id)
 
     def get_merged_memories(
         self,
@@ -1124,38 +1011,15 @@ class DatabaseManager:
     ) -> list[dict]:
         """Get all merged memory UUIDs for exclusion from search.
 
+        Delegates to RelationshipManager.
+
         Args:
             project_id: Optional project filter
 
         Returns:
             List of dicts with source_uuid and target_uuid
         """
-        if project_id:
-            query = """
-            MATCH (source:Memory)-[r:MERGED_INTO]->(target:Memory)
-            WHERE source.project_id = $project_id OR target.project_id = $project_id
-            RETURN source.uuid AS merged_uuid,
-                   target.uuid AS merged_into_uuid,
-                   r.merged_at AS merged_at
-            """
-            result = self.graph.query(query, {"project_id": project_id})
-        else:
-            query = """
-            MATCH (source:Memory)-[r:MERGED_INTO]->(target:Memory)
-            RETURN source.uuid AS merged_uuid,
-                   target.uuid AS merged_into_uuid,
-                   r.merged_at AS merged_at
-            """
-            result = self.graph.query(query)
-
-        return [
-            {
-                "merged_uuid": row[0],
-                "merged_into_uuid": row[1],
-                "merged_at": row[2],
-            }
-            for row in (result.result_set or [])
-        ]
+        return self._relationship_manager.get_merged_memories(project_id)
 
     def add_verb_edge(
         self,
