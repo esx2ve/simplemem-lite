@@ -184,26 +184,46 @@ async def recall(request: RecallRequest) -> dict:
     try:
         store = get_memory_store()
 
-        # Exact fetch by ID - do a search with the UUID
+        # Exact fetch by ID - direct graph lookup
         if request.id:
-            # Get memory from database
-            results = store.db.search_vectors(
-                query_vector=[0] * 1024,  # Dummy vector - we'll filter by UUID
-                limit=100,
-                project_id=request.project,
-            )
-            # Find matching memory
-            memory = next((r for r in results if r.get("uuid") == request.id), None)
+            # Direct lookup by UUID (efficient graph query)
+            memory = store.get(request.id)
             if not memory:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Memory {request.id} not found",
                 )
-            return {"results": [memory]}
+
+            # Validate project ownership if project specified
+            if request.project:
+                valid_uuids = store.db.get_memories_in_project(
+                    request.project, [request.id]
+                )
+                if request.id not in valid_uuids:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Memory {request.id} not found in project {request.project}",
+                    )
+
+            return {
+                "results": [
+                    {
+                        "uuid": memory.uuid,
+                        "content": memory.content,
+                        "type": memory.type,
+                        "session_id": memory.session_id,
+                        "created_at": memory.created_at,
+                    }
+                ]
+            }
 
         # Search by query based on mode
         # At this point, query is guaranteed to be non-None due to validation above
-        assert request.query is not None
+        if request.query is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Query is required for search operations",
+            )
         query: str = request.query
 
         if request.mode == "fast":
