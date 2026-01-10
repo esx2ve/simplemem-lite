@@ -340,12 +340,21 @@ class IndexRequest(BaseModel):
     wait: bool = Field(default=False, description="Wait for completion (default: background)")
 
 
+class IndexError(BaseModel):
+    """Model for indexing errors."""
+
+    id: str = Field(..., description="Session ID or file path that failed")
+    error: str = Field(..., description="Error message")
+
+
 class IndexResponse(BaseModel):
     """Response model for index operation."""
 
-    job_id: str | None = Field(default=None, description="Background job ID")
+    job_id: str | None = Field(default=None, description="Background job ID (single job)")
+    job_ids: dict[str, str] | None = Field(default=None, description="Map of session_id to job_id (multiple jobs)")
     status: str = Field(default="submitted", description="Operation status")
     message: str | None = Field(default=None, description="Status message")
+    errors: list[IndexError] | None = Field(default=None, description="Errors encountered during indexing")
     # Sync results (when wait=True)
     files_indexed: int | None = Field(default=None)
     chunks_created: int | None = Field(default=None)
@@ -480,7 +489,17 @@ async def _index_traces(request: IndexRequest) -> IndexResponse:
     job_manager = get_job_manager()
 
     traces_submitted = 0
-    job_ids = []
+    job_ids_map: dict[str, str] = {}  # session_id -> job_id
+    errors: list[IndexError] = []
+
+    # Define trace job function once outside the loop to avoid closure capture issues
+    async def _trace_job(session_id: str, trace_content: dict | list, project_id: str, progress_callback=None):
+        return await indexer.index_session_content(
+            session_id=session_id,
+            trace_content=trace_content,
+            project_id=project_id,
+            progress_callback=progress_callback,
+        )
 
     for trace_input in traces:
         # Decompress if needed
@@ -490,27 +509,24 @@ async def _index_traces(request: IndexRequest) -> IndexResponse:
                 content = decompress_payload(content)
             except Exception as e:
                 log.warning(f"Failed to decompress trace {trace_input.session_id}: {e}")
+                errors.append(IndexError(id=trace_input.session_id, error=f"Decompression failed: {e}"))
                 continue
 
         if request.wait:
             # Synchronous processing
-            result = await indexer.index_session_content(
-                session_id=trace_input.session_id,
-                trace_content=content,
-                project_id=request.project,
-            )
-            if result:
-                traces_submitted += 1
+            try:
+                result = await indexer.index_session_content(
+                    session_id=trace_input.session_id,
+                    trace_content=content,
+                    project_id=request.project,
+                )
+                if result:
+                    traces_submitted += 1
+            except Exception as e:
+                log.warning(f"Failed to index trace {trace_input.session_id}: {e}")
+                errors.append(IndexError(id=trace_input.session_id, error=str(e)))
         else:
             # Background processing
-            async def _trace_job(session_id, trace_content, project_id, progress_callback=None):
-                return await indexer.index_session_content(
-                    session_id=session_id,
-                    trace_content=trace_content,
-                    project_id=project_id,
-                    progress_callback=progress_callback,
-                )
-
             job_id = await job_manager.submit(
                 "index_trace",
                 _trace_job,
@@ -518,18 +534,20 @@ async def _index_traces(request: IndexRequest) -> IndexResponse:
                 content,
                 request.project,
             )
-            job_ids.append(job_id)
+            job_ids_map[trace_input.session_id] = job_id
             traces_submitted += 1
 
     if request.wait:
         return IndexResponse(
             status="completed",
             traces_processed=traces_submitted,
+            errors=errors if errors else None,
         )
 
     return IndexResponse(
-        job_id=job_ids[0] if len(job_ids) == 1 else None,
+        job_id=list(job_ids_map.values())[0] if len(job_ids_map) == 1 else None,
+        job_ids=job_ids_map if len(job_ids_map) > 1 else None,
         status="submitted",
-        message=f"Processing {traces_submitted} traces in background"
-        + (f" (job_ids: {job_ids})" if len(job_ids) > 1 else ""),
+        message=f"Processing {traces_submitted} traces in background",
+        errors=errors if errors else None,
     )
