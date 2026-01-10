@@ -17,6 +17,25 @@ import pytest
 
 
 # ============================================================================
+# ConsolidationManager fixture
+# ============================================================================
+
+
+@pytest.fixture
+def mock_graph():
+    """Create a mock graph backend."""
+    return MagicMock()
+
+
+@pytest.fixture
+def consolidation_manager(mock_graph):
+    """Create ConsolidationManager with mocked graph."""
+    from simplemem_lite.db.consolidation import ConsolidationManager
+
+    return ConsolidationManager(mock_graph)
+
+
+# ============================================================================
 # make_dedupe_key tests
 # ============================================================================
 
@@ -24,57 +43,37 @@ import pytest
 class TestMakeDedupeKey:
     """Tests for dedupe_key generation."""
 
-    def test_deterministic(self, mock_graph_store):
+    def test_deterministic(self, consolidation_manager):
         """Same inputs should always produce same key."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-
-        key1 = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
-        key2 = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
+        key1 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
+        key2 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
 
         assert key1 == key2
 
-    def test_order_independent(self, mock_graph_store):
+    def test_order_independent(self, consolidation_manager):
         """Order of involved_ids should not affect key."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-
-        key1 = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
-        key2 = db.make_dedupe_key("project-1", "entity_dedup", ["b", "a"])
+        key1 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
+        key2 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["b", "a"])
 
         assert key1 == key2
 
-    def test_different_project_different_key(self, mock_graph_store):
+    def test_different_project_different_key(self, consolidation_manager):
         """Different projects should produce different keys."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-
-        key1 = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
-        key2 = db.make_dedupe_key("project-2", "entity_dedup", ["a", "b"])
+        key1 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
+        key2 = consolidation_manager.make_dedupe_key("project-2", "entity_dedup", ["a", "b"])
 
         assert key1 != key2
 
-    def test_different_type_different_key(self, mock_graph_store):
+    def test_different_type_different_key(self, consolidation_manager):
         """Different candidate types should produce different keys."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-
-        key1 = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
-        key2 = db.make_dedupe_key("project-1", "memory_merge", ["a", "b"])
+        key1 = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b"])
+        key2 = consolidation_manager.make_dedupe_key("project-1", "memory_merge", ["a", "b"])
 
         assert key1 != key2
 
-    def test_key_length(self, mock_graph_store):
+    def test_key_length(self, consolidation_manager):
         """Key should be 16 characters (hex digest truncation)."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-
-        key = db.make_dedupe_key("project-1", "entity_dedup", ["a", "b", "c"])
+        key = consolidation_manager.make_dedupe_key("project-1", "entity_dedup", ["a", "b", "c"])
 
         assert len(key) == 16
         assert all(c in "0123456789abcdef" for c in key)
@@ -88,25 +87,14 @@ class TestMakeDedupeKey:
 class TestAddReviewCandidate:
     """Tests for adding review candidates with idempotency."""
 
-    @pytest.fixture
-    def db_with_mock_graph(self):
-        """Create DatabaseManager with mocked graph."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-        db.graph = MagicMock()
-        return db
-
-    def test_creates_new_candidate(self, db_with_mock_graph):
+    def test_creates_new_candidate(self, consolidation_manager, mock_graph):
         """Should create candidate when none exists."""
-        db = db_with_mock_graph
-
         # Mock no existing candidate
         empty_result = MagicMock()
         empty_result.result_set = []
-        db.graph.query = MagicMock(return_value=empty_result)
+        mock_graph.query = MagicMock(return_value=empty_result)
 
-        result = db.add_review_candidate(
+        result = consolidation_manager.add_review_candidate(
             project_id="config:test",
             candidate_type="entity_dedup",
             confidence=0.85,
@@ -120,18 +108,16 @@ class TestAddReviewCandidate:
 
         assert result["created"] is True
         assert "uuid" in result
-        assert db.graph.query.call_count == 2  # Check + Create
+        assert mock_graph.query.call_count == 2  # Check + Create
 
-    def test_returns_existing_pending(self, db_with_mock_graph):
+    def test_returns_existing_pending(self, consolidation_manager, mock_graph):
         """Should return existing pending candidate without creating."""
-        db = db_with_mock_graph
-
         # Mock existing pending candidate
         existing_result = MagicMock()
         existing_result.result_set = [["existing-uuid", "pending"]]
-        db.graph.query = MagicMock(return_value=existing_result)
+        mock_graph.query = MagicMock(return_value=existing_result)
 
-        result = db.add_review_candidate(
+        result = consolidation_manager.add_review_candidate(
             project_id="config:test",
             candidate_type="entity_dedup",
             confidence=0.85,
@@ -145,18 +131,16 @@ class TestAddReviewCandidate:
 
         assert result["created"] is False
         assert result["uuid"] == "existing-uuid"
-        assert db.graph.query.call_count == 1  # Only check, no create
+        assert mock_graph.query.call_count == 1  # Only check, no create
 
-    def test_skips_rejected_candidate(self, db_with_mock_graph):
+    def test_skips_rejected_candidate(self, consolidation_manager, mock_graph):
         """Should not recreate rejected candidates."""
-        db = db_with_mock_graph
-
         # Mock existing rejected candidate
         rejected_result = MagicMock()
         rejected_result.result_set = [["rejected-uuid", "rejected"]]
-        db.graph.query = MagicMock(return_value=rejected_result)
+        mock_graph.query = MagicMock(return_value=rejected_result)
 
-        result = db.add_review_candidate(
+        result = consolidation_manager.add_review_candidate(
             project_id="config:test",
             candidate_type="entity_dedup",
             confidence=0.85,
@@ -181,19 +165,8 @@ class TestAddReviewCandidate:
 class TestGetReviewCandidates:
     """Tests for fetching review candidates."""
 
-    @pytest.fixture
-    def db_with_mock_graph(self):
-        """Create DatabaseManager with mocked graph."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-        db.graph = MagicMock()
-        return db
-
-    def test_returns_candidates(self, db_with_mock_graph):
+    def test_returns_candidates(self, consolidation_manager, mock_graph):
         """Should return list of candidates."""
-        db = db_with_mock_graph
-
         now = int(time.time())
         result = MagicMock()
         result.result_set = [
@@ -214,9 +187,9 @@ class TestGetReviewCandidates:
                 None,
             ]
         ]
-        db.graph.query = MagicMock(return_value=result)
+        mock_graph.query = MagicMock(return_value=result)
 
-        candidates = db.get_review_candidates("config:test")
+        candidates = consolidation_manager.get_review_candidates("config:test")
 
         assert len(candidates) == 1
         assert candidates[0]["uuid"] == "uuid-1"
@@ -224,31 +197,27 @@ class TestGetReviewCandidates:
         assert candidates[0]["confidence"] == 0.85
         assert candidates[0]["decision_data"]["entity_a_name"] == "main.py"
 
-    def test_filters_by_status(self, db_with_mock_graph):
+    def test_filters_by_status(self, consolidation_manager, mock_graph):
         """Should filter by status in query."""
-        db = db_with_mock_graph
-
         empty_result = MagicMock()
         empty_result.result_set = []
-        db.graph.query = MagicMock(return_value=empty_result)
+        mock_graph.query = MagicMock(return_value=empty_result)
 
-        db.get_review_candidates("config:test", status="approved")
+        consolidation_manager.get_review_candidates("config:test", status="approved")
 
         # Check that status was passed in query params
-        call_args = db.graph.query.call_args
+        call_args = mock_graph.query.call_args
         assert call_args[0][1]["status"] == "approved"
 
-    def test_filters_by_type(self, db_with_mock_graph):
+    def test_filters_by_type(self, consolidation_manager, mock_graph):
         """Should filter by type when specified."""
-        db = db_with_mock_graph
-
         empty_result = MagicMock()
         empty_result.result_set = []
-        db.graph.query = MagicMock(return_value=empty_result)
+        mock_graph.query = MagicMock(return_value=empty_result)
 
-        db.get_review_candidates("config:test", type_filter="memory_merge")
+        consolidation_manager.get_review_candidates("config:test", type_filter="memory_merge")
 
-        call_args = db.graph.query.call_args
+        call_args = mock_graph.query.call_args
         assert call_args[0][1]["type_filter"] == "memory_merge"
 
 
@@ -260,36 +229,23 @@ class TestGetReviewCandidates:
 class TestUpdateCandidateStatus:
     """Tests for status updates."""
 
-    @pytest.fixture
-    def db_with_mock_graph(self):
-        """Create DatabaseManager with mocked graph."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-        db.graph = MagicMock()
-        return db
-
-    def test_updates_pending_to_approved(self, db_with_mock_graph):
+    def test_updates_pending_to_approved(self, consolidation_manager, mock_graph):
         """Should update pending candidate to approved."""
-        db = db_with_mock_graph
-
         result = MagicMock()
         result.result_set = [["uuid-1"]]  # Indicates update succeeded
-        db.graph.query = MagicMock(return_value=result)
+        mock_graph.query = MagicMock(return_value=result)
 
-        updated = db.update_candidate_status("uuid-1", "approved")
+        updated = consolidation_manager.update_candidate_status("uuid-1", "approved")
 
         assert updated is True
 
-    def test_returns_false_for_already_resolved(self, db_with_mock_graph):
+    def test_returns_false_for_already_resolved(self, consolidation_manager, mock_graph):
         """Should return False if candidate not pending."""
-        db = db_with_mock_graph
-
         result = MagicMock()
         result.result_set = []  # No rows updated
-        db.graph.query = MagicMock(return_value=result)
+        mock_graph.query = MagicMock(return_value=result)
 
-        updated = db.update_candidate_status("uuid-1", "approved")
+        updated = consolidation_manager.update_candidate_status("uuid-1", "approved")
 
         assert updated is False
 
@@ -302,60 +258,45 @@ class TestUpdateCandidateStatus:
 class TestRejectedPair:
     """Tests for rejected pair tracking."""
 
-    @pytest.fixture
-    def db_with_mock_graph(self):
-        """Create DatabaseManager with mocked graph."""
-        from simplemem_lite.db.manager import DatabaseManager
-
-        db = DatabaseManager.__new__(DatabaseManager)
-        db.graph = MagicMock()
-        return db
-
-    def test_add_rejected_pair_normalized(self, db_with_mock_graph):
+    def test_add_rejected_pair_normalized(self, consolidation_manager, mock_graph):
         """Should normalize pair order (min, max)."""
-        db = db_with_mock_graph
-
         empty_result = MagicMock()
         empty_result.result_set = []
-        db.graph.query = MagicMock(return_value=empty_result)
+        mock_graph.query = MagicMock(return_value=empty_result)
 
-        db.add_rejected_pair("z_second", "a_first", "candidate-uuid")
+        consolidation_manager.add_rejected_pair("z_second", "a_first", "candidate-uuid")
 
-        call_args = db.graph.query.call_args
+        call_args = mock_graph.query.call_args
         params = call_args[0][1]
         assert params["pair_a"] == "a_first"  # min
         assert params["pair_b"] == "z_second"  # max
 
-    def test_is_rejected_pair_normalized_lookup(self, db_with_mock_graph):
+    def test_is_rejected_pair_normalized_lookup(self, consolidation_manager, mock_graph):
         """Lookup should work regardless of argument order."""
-        db = db_with_mock_graph
-
         found_result = MagicMock()
         found_result.result_set = [["a_first"]]
-        db.graph.query = MagicMock(return_value=found_result)
+        mock_graph.query = MagicMock(return_value=found_result)
 
         # Test both orders
-        result1 = db.is_rejected_pair("a_first", "z_second")
-        result2 = db.is_rejected_pair("z_second", "a_first")
+        result1 = consolidation_manager.is_rejected_pair("a_first", "z_second")
+        result2 = consolidation_manager.is_rejected_pair("z_second", "a_first")
 
         assert result1 is True
         assert result2 is True
 
         # Both calls should use normalized order
-        for call in db.graph.query.call_args_list:
+        for call in mock_graph.query.call_args_list:
             params = call[0][1]
             assert params["pair_a"] == "a_first"
             assert params["pair_b"] == "z_second"
 
-    def test_is_rejected_pair_not_found(self, db_with_mock_graph):
+    def test_is_rejected_pair_not_found(self, consolidation_manager, mock_graph):
         """Should return False when pair not rejected."""
-        db = db_with_mock_graph
-
         empty_result = MagicMock()
         empty_result.result_set = []
-        db.graph.query = MagicMock(return_value=empty_result)
+        mock_graph.query = MagicMock(return_value=empty_result)
 
-        result = db.is_rejected_pair("a", "b")
+        result = consolidation_manager.is_rejected_pair("a", "b")
 
         assert result is False
 
@@ -399,29 +340,30 @@ class TestExecutorPersistence:
             reason="Same file",
         )
 
-        with patch(
-            "simplemem_lite.backend.consolidation.executor.get_memory_store",
-            return_value=mock_graph_store,
-        ):
-            result = await execute_entity_merges([decision], config, project_id="config:test")
+        # Mock the score_entity_pairs to return our decision
+        async def mock_score(pairs, llm_client):
+            return [decision]
 
-        assert result["queued"] == 1
-        assert result["executed"] == 0
+        with patch("simplemem_lite.backend.consolidation.executor.score_entity_pairs", mock_score):
+            result = await execute_entity_merges(
+                pairs=[pair],
+                store=mock_graph_store,
+                config=config,
+            )
+
+        # Should have queued for review
+        assert result.queued_for_review == 1
         mock_graph_store.db.add_review_candidate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_entity_executor_skips_rejected_pair(self, mock_graph_store):
         """Should skip pairs that were previously rejected."""
-        from unittest.mock import patch
-
         from simplemem_lite.backend.consolidation.executor import execute_entity_merges
         from simplemem_lite.backend.consolidation import ConsolidationConfig
-        from simplemem_lite.backend.consolidation.scorer import EntityDecision
         from simplemem_lite.backend.consolidation.candidates import EntityPair
 
-        # Mock pair as rejected
+        # Pair was previously rejected
         mock_graph_store.db.is_rejected_pair = MagicMock(return_value=True)
-        mock_graph_store.db.add_review_candidate = MagicMock()
 
         config = ConsolidationConfig(confidence_threshold=0.9)
 
@@ -431,19 +373,14 @@ class TestExecutorPersistence:
             entity_type="file",
             similarity=0.92,
         )
-        decision = EntityDecision(
-            pair=pair,
-            same_entity=True,
-            confidence=0.85,
-            canonical_name="main.py",
-            reason="Same file",
+
+        result = await execute_entity_merges(
+            pairs=[pair],
+            store=mock_graph_store,
+            config=config,
         )
 
-        with patch(
-            "simplemem_lite.backend.consolidation.executor.get_memory_store",
-            return_value=mock_graph_store,
-        ):
-            result = await execute_entity_merges([decision], config, project_id="config:test")
-
-        assert result["queued"] == 0  # Should be skipped
-        mock_graph_store.db.add_review_candidate.assert_not_called()
+        # Should have skipped due to rejection
+        assert result.skipped_rejected == 1
+        assert result.merged == 0
+        assert result.queued_for_review == 0
