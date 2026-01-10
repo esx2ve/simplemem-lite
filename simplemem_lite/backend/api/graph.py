@@ -156,3 +156,77 @@ async def run_cypher_query(request: CypherQueryRequest) -> dict:
     except Exception as e:
         log.error(f"Cypher query failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class ComputePageRankRequest(BaseModel):
+    """Request model for computing PageRank."""
+
+    project_id: str | None = Field(default=None, description="Project filter (optional)")
+    max_iterations: int = Field(default=100, ge=10, le=500, description="Max PageRank iterations")
+    damping_factor: float = Field(default=0.85, ge=0.5, le=0.99, description="PageRank damping factor")
+
+
+@router.post("/compute-pagerank")
+async def compute_pagerank(request: ComputePageRankRequest) -> dict:
+    """Compute and cache PageRank scores for all Memory nodes.
+
+    Uses Memgraph MAGE's pagerank.get() algorithm and caches
+    scores on Memory nodes for use in graph-enhanced search ranking.
+
+    Should be called periodically (e.g., every 5 minutes) or after
+    significant graph changes.
+    """
+    try:
+        store = get_memory_store()
+
+        # Try computing PageRank - this will raise if MAGE isn't available
+        try:
+            scores = store.db.compute_and_cache_pagerank(
+                project_id=request.project_id,
+                max_iterations=request.max_iterations,
+                damping_factor=request.damping_factor,
+            )
+        except Exception as e:
+            log.error(f"PageRank computation inner error: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "nodes_scored": 0,
+            }
+
+        # Get stats for response
+        if scores:
+            max_score = max(scores.values())
+            min_score = min(scores.values())
+            avg_score = sum(scores.values()) / len(scores)
+        else:
+            max_score = min_score = avg_score = 0.0
+
+        return {
+            "success": True,
+            "nodes_scored": len(scores),
+            "max_pagerank": max_score,
+            "min_pagerank": min_score,
+            "avg_pagerank": avg_score,
+        }
+
+    except Exception as e:
+        log.error(f"PageRank computation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stats")
+async def get_graph_stats() -> dict:
+    """Get graph statistics including normalization values for scoring."""
+    try:
+        store = get_memory_store()
+        stats = store.db.get_graph_normalization_stats()
+        return {
+            "max_degree": stats.get("max_degree", 0),
+            "avg_degree": stats.get("avg_degree", 0),
+            "max_pagerank": stats.get("max_pagerank", 0),
+            "node_count": stats.get("node_count", 0),
+        }
+    except Exception as e:
+        log.error(f"Failed to get graph stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

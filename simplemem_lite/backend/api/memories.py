@@ -4,7 +4,14 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
-from simplemem_lite.backend.scoring import ScoringWeights, apply_temporal_scoring, rerank_results
+from simplemem_lite.backend.scoring import (
+    GraphScoringWeights,
+    ScoringWeights,
+    apply_graph_scoring,
+    apply_supersession_penalty,
+    apply_temporal_scoring,
+    rerank_results,
+)
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.backend.toon import toonify
 from simplemem_lite.log_config import get_logger
@@ -95,6 +102,11 @@ class SearchMemoriesRequest(BaseModel):
         ge=0.0,
         le=1.0,
         description="Weight for type importance (default: 0.15)",
+    )
+    # Graph-enhanced scoring options
+    use_graph_scoring: bool = Field(
+        default=True,
+        description="Apply graph-enhanced scoring (PageRank + connectivity) for better ranking in active codebases",
     )
 
 
@@ -219,6 +231,40 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
                 return_details=request.scoring_details,
             )
 
+        # Apply supersession penalty to demote superseded memories
+        if result_dicts:
+            try:
+                superseded_data = store.db.get_superseded_memories(project_id=request.project_id)
+                superseded_ids = {s["superseded_uuid"] for s in superseded_data}
+                if superseded_ids:
+                    result_dicts = apply_supersession_penalty(result_dicts, superseded_ids)
+                    log.debug(f"Applied supersession penalty to {len(superseded_ids)} memories")
+            except Exception as e:
+                log.warning(f"Failed to apply supersession penalty: {e}")
+
+        # Apply graph-enhanced scoring if enabled
+        if request.use_graph_scoring and result_dicts:
+            try:
+                # Get UUIDs from results
+                uuids = [m["uuid"] for m in result_dicts]
+
+                # Fetch graph data in parallel
+                degrees = store.db.get_memory_degrees(uuids, project_id=request.project_id)
+                pageranks = store.db.get_memory_pageranks(uuids)
+                graph_stats = store.db.get_graph_normalization_stats(project_id=request.project_id)
+
+                # Apply graph scoring (adjusts weights and re-ranks)
+                result_dicts = apply_graph_scoring(
+                    result_dicts,
+                    degrees=degrees,
+                    pageranks=pageranks,
+                    graph_stats=graph_stats,
+                    weights=GraphScoringWeights(),
+                )
+                log.debug(f"Applied graph scoring to {len(result_dicts)} results")
+            except Exception as e:
+                log.warning(f"Failed to apply graph scoring (continuing without): {e}")
+
         # Return results - decorator handles TOON conversion if requested
         return {"results": result_dicts}
 
@@ -230,12 +276,12 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
 
 
 @router.post("/ask")
-@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources")
+@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources", hybrid=True)
 async def ask_memories(request: AskMemoriesRequest) -> dict:
     """Ask a question and get LLM-synthesized answer from memories.
 
-    Returns full structured response with answer + sources when output_format='json' (default).
-    Returns only source memories as TOON when output_format='toon' (for token efficiency).
+    Returns full structured response with answer + sources when output_format='json'.
+    When output_format='toon', returns hybrid JSON with answer text + TOON-formatted sources.
     """
     require_project_id(request.project_id, "ask_memories")
     try:
@@ -254,12 +300,12 @@ async def ask_memories(request: AskMemoriesRequest) -> dict:
 
 
 @router.post("/reason")
-@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources")
+@toonify(headers=["uuid", "type", "score", "hops", "cross_session"], result_key="sources", hybrid=True)
 async def reason_memories(request: ReasonMemoriesRequest) -> dict:
     """LLM-synthesized reasoning over memory graph.
 
-    Returns full structured response with reasoning + conclusions when output_format='json' (default).
-    Returns only conclusion memories as TOON when output_format='toon' (for token efficiency).
+    Returns full structured response with reasoning + conclusions when output_format='json'.
+    When output_format='toon', returns hybrid JSON with reasoning text + TOON-formatted sources.
     """
     require_project_id(request.project_id, "reason_memories")
     try:

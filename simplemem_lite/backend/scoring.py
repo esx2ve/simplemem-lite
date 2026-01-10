@@ -317,9 +317,159 @@ def apply_temporal_scoring(
     return results
 
 
-# Supersession handling (Phase 2 - placeholder for now)
-
+# Supersession handling
 SUPERSESSION_PENALTY: float = 0.2
+
+# Graph-enhanced scoring constants
+DEFAULT_GRAPH_WEIGHT: float = 0.0  # Disabled by default until PageRank is computed
+DEFAULT_CONNECTIVITY_WEIGHT: float = 0.10
+
+# Connectivity floor for new memories (prevents cold start penalty)
+CONNECTIVITY_FLOOR: float = 0.3  # New memories get 30% baseline connectivity score
+
+
+@dataclass
+class GraphScoringWeights:
+    """Configuration for graph-enhanced score combination weights.
+
+    For rapidly changing codebases, recommended weights:
+    - vector: 0.40 (down from 0.60)
+    - temporal: 0.25 (unchanged)
+    - importance: 0.10 (down from 0.15)
+    - graph: 0.15 (PageRank - requires async computation)
+    - connectivity: 0.10 (degree-based, fast to compute)
+    """
+
+    vector: float = 0.40
+    temporal: float = 0.25
+    importance: float = 0.10
+    graph: float = 0.15
+    connectivity: float = 0.10
+
+    def __post_init__(self) -> None:
+        """Validate weights sum to 1.0 (within tolerance)."""
+        total = self.vector + self.temporal + self.importance + self.graph + self.connectivity
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Weights must sum to 1.0, got {total}")
+
+
+def compute_connectivity_score(
+    degree: int,
+    max_degree: float,
+    avg_degree: float = 0.0,
+) -> float:
+    """Compute normalized connectivity score from node degree.
+
+    Uses max-normalization with a floor to prevent cold start penalty
+    for new memories with no connections.
+
+    Args:
+        degree: Total degree (in + out) of the memory node
+        max_degree: Maximum degree in the graph (for normalization)
+        avg_degree: Average degree (used for cold start mitigation)
+
+    Returns:
+        Normalized connectivity score in [CONNECTIVITY_FLOOR, 1.0]
+    """
+    if max_degree <= 0:
+        return CONNECTIVITY_FLOOR
+
+    # Normalize to [0, 1]
+    raw_score = degree / max_degree
+
+    # Apply floor to prevent orphan penalty being too harsh
+    # New memories (degree=0) get the floor score
+    return max(CONNECTIVITY_FLOOR, raw_score)
+
+
+def compute_pagerank_score(
+    pagerank: float,
+    max_pagerank: float,
+) -> float:
+    """Compute normalized PageRank score.
+
+    CRITICAL: Raw PageRank scores are tiny (e.g., 0.005 for 10k nodes).
+    Must normalize to [0, 1] relative to max in the graph.
+
+    Args:
+        pagerank: Raw PageRank score from MAGE
+        max_pagerank: Maximum PageRank in the graph
+
+    Returns:
+        Normalized PageRank score in [0, 1]
+    """
+    if max_pagerank <= 0:
+        return 0.0
+
+    return pagerank / max_pagerank
+
+
+def apply_graph_scoring(
+    memories: list[dict[str, Any]],
+    degrees: dict[str, dict[str, int]],
+    pageranks: dict[str, float],
+    graph_stats: dict[str, float],
+    weights: GraphScoringWeights | None = None,
+) -> list[dict[str, Any]]:
+    """Apply graph-enhanced scoring to memory results.
+
+    Adds connectivity and PageRank scores to the final ranking formula.
+    Must be called AFTER apply_temporal_scoring.
+
+    Args:
+        memories: List of memory dicts with 'final_score' from temporal scoring
+        degrees: Dict mapping uuid -> {"in_degree", "out_degree", "total"}
+        pageranks: Dict mapping uuid -> pagerank score
+        graph_stats: Dict with max_degree, max_pagerank for normalization
+        weights: Graph scoring weight configuration
+
+    Returns:
+        Re-ranked list of memory dicts with updated 'final_score'
+    """
+    if not memories:
+        return []
+
+    if weights is None:
+        weights = GraphScoringWeights()
+
+    max_degree = graph_stats.get("max_degree", 1.0)
+    max_pagerank = graph_stats.get("max_pagerank", 1.0)
+    avg_degree = graph_stats.get("avg_degree", 0.0)
+
+    results: list[dict[str, Any]] = []
+    for m in memories:
+        uuid = m.get("uuid", "")
+        current_score = m.get("final_score", m.get("score", 0.0))
+
+        # Get graph metrics for this memory
+        degree_info = degrees.get(uuid, {"total": 0})
+        degree = degree_info.get("total", 0)
+        pagerank = pageranks.get(uuid, 0.0)
+
+        # Compute normalized graph scores
+        connectivity = compute_connectivity_score(degree, max_degree, avg_degree)
+        graph_score = compute_pagerank_score(pagerank, max_pagerank)
+
+        # Recompute final score with graph weights
+        # Note: This assumes temporal scoring weights need to be rescaled
+        # to account for the new graph weights
+        total_legacy_weight = weights.vector + weights.temporal + weights.importance
+        scale_factor = total_legacy_weight  # How much of the original score to keep
+
+        new_score = (
+            scale_factor * current_score
+            + weights.graph * graph_score
+            + weights.connectivity * connectivity
+        )
+
+        result = dict(m)
+        result["final_score"] = new_score
+        result["graph_score"] = graph_score
+        result["connectivity_score"] = connectivity
+        results.append(result)
+
+    # Re-sort by final score
+    return sorted(results, key=lambda x: -x.get("final_score", 0.0))
 
 # LLM Reranking constants
 RERANK_CONTENT_PREVIEW_LEN: int = 200  # Max chars of content to show LLM for reranking
