@@ -22,8 +22,12 @@ import lancedb
 import pyarrow as pa
 
 from simplemem_lite.config import Config
+from simplemem_lite.db.consolidation import ConsolidationManager
+from simplemem_lite.db.entity_repository import EntityRepository
+from simplemem_lite.db.graph_analytics import GraphAnalytics
 from simplemem_lite.db.graph_factory import create_graph_backend, get_backend_info
 from simplemem_lite.db.graph_protocol import GraphBackend
+from simplemem_lite.db.relationship_manager import RelationshipManager
 from simplemem_lite.log_config import get_logger
 
 log = get_logger("db")
@@ -107,6 +111,24 @@ class DatabaseManager:
         # Track connection health
         self._graph_healthy = True
         self._last_health_check = 0
+
+        # Initialize extracted managers (god class decomposition)
+        self._consolidation = ConsolidationManager(self.graph)
+        self._graph_analytics = GraphAnalytics(
+            graph=self.graph,
+            pagerank_backend=self._graph_backend,
+            max_graph_hops=config.max_graph_hops,
+            graph_path_limit=config.graph_path_limit,
+            cross_session_limit=config.cross_session_limit,
+        )
+        self._entity_repository = EntityRepository(
+            graph=self.graph,
+            summary_max_size=config.summary_max_size,
+        )
+        self._relationship_manager = RelationshipManager(
+            graph=self.graph,
+            max_supersession_depth=10,
+        )
 
     def close(self) -> None:
         """Close database connections gracefully.
@@ -851,27 +873,9 @@ class DatabaseManager:
     ) -> str:
         """Add or get an Entity node (for cross-session linking).
 
-        Args:
-            name: Entity name (e.g., "src/main.py", "Read", "ImportError")
-            entity_type: Entity type (file, tool, error, concept)
-            metadata: Optional additional metadata
-
-        Returns:
-            Entity name (used as identifier)
+        Delegates to EntityRepository.
         """
-        log.trace(f"Adding/getting entity: {entity_type}:{name}")
-        # MERGE creates if not exists, returns existing if exists
-        self.graph.query(
-            """
-            MERGE (e:Entity {name: $name, type: $type})
-            ON CREATE SET e.created_at = timestamp()
-            """,
-            {
-                "name": name,
-                "type": entity_type,
-            },
-        )
-        return name
+        return self._entity_repository.add_entity_node(name, entity_type, metadata)
 
     def add_memory_vector(
         self,
@@ -914,24 +918,15 @@ class DatabaseManager:
     ) -> None:
         """Add a relationship between two memories.
 
+        Delegates to RelationshipManager.
+
         Args:
             from_uuid: Source memory UUID
             to_uuid: Target memory UUID
             relation_type: Type of relationship
             weight: Relationship weight (default: 1.0)
         """
-        self.graph.query(
-            """
-            MATCH (from:Memory {uuid: $from_uuid}), (to:Memory {uuid: $to_uuid})
-            CREATE (from)-[:RELATES_TO {relation_type: $rel_type, weight: $weight}]->(to)
-            """,
-            {
-                "from_uuid": from_uuid,
-                "to_uuid": to_uuid,
-                "rel_type": relation_type,
-                "weight": weight,
-            },
-        )
+        self._relationship_manager.add_relationship(from_uuid, to_uuid, relation_type, weight)
 
     def would_create_supersession_cycle(
         self,
@@ -941,8 +936,7 @@ class DatabaseManager:
     ) -> bool:
         """Check if creating a SUPERSEDES edge would create a cycle.
 
-        DAG enforcement for supersession graph: prevents situations like
-        A supersedes B supersedes C supersedes A (cycle).
+        Delegates to RelationshipManager.
 
         Args:
             newer_uuid: UUID of the newer/superseding memory
@@ -952,29 +946,7 @@ class DatabaseManager:
         Returns:
             True if creating the edge would create a cycle, False otherwise
         """
-        # Check if older_uuid can reach newer_uuid via SUPERSEDES edges
-        # If so, creating newer->older would complete a cycle
-        # Note: Cypher doesn't support parameters for path length bounds,
-        # so we inject max_depth directly (safe: typed as int)
-        result = self.graph.query(
-            f"""
-            MATCH path = (older:Memory {{uuid: $older_uuid}})-[:SUPERSEDES*1..{max_depth}]->(newer:Memory {{uuid: $newer_uuid}})
-            RETURN count(path) > 0 AS would_cycle
-            """,
-            {
-                "newer_uuid": newer_uuid,
-                "older_uuid": older_uuid,
-            },
-        )
-
-        if result.result_set:
-            would_cycle = result.result_set[0][0]
-            if would_cycle:
-                log.warning(
-                    f"Supersession would create cycle: {newer_uuid[:8]}... -> {older_uuid[:8]}..."
-                )
-            return bool(would_cycle)
-        return False
+        return self._relationship_manager.would_create_supersession_cycle(newer_uuid, older_uuid, max_depth)
 
     def add_supersession(
         self,
@@ -986,11 +958,7 @@ class DatabaseManager:
     ) -> bool:
         """Mark that a newer memory supersedes an older one.
 
-        Used during consolidation when a newer memory provides updated
-        information that replaces an older memory.
-
-        Enforces DAG constraint: will not create the edge if it would
-        result in a cycle in the supersession graph.
+        Delegates to RelationshipManager.
 
         Args:
             newer_uuid: UUID of the newer/superseding memory
@@ -1002,49 +970,9 @@ class DatabaseManager:
         Returns:
             True if edge was created, False if blocked (cycle or same node)
         """
-        import time
-
-        # Self-supersession is not allowed
-        if newer_uuid == older_uuid:
-            log.warning(f"Cannot supersede self: {newer_uuid[:8]}...")
-            return False
-
-        # DAG enforcement: check for cycles
-        if self.would_create_supersession_cycle(newer_uuid, older_uuid):
-            log.warning(
-                f"Supersession blocked (would create cycle): "
-                f"{newer_uuid[:8]}... -> {older_uuid[:8]}..."
-            )
-            return False
-
-        self.graph.query(
-            """
-            MATCH (newer:Memory {uuid: $newer_uuid})
-            MATCH (older:Memory {uuid: $older_uuid})
-            MERGE (newer)-[r:SUPERSEDES]->(older)
-            ON CREATE SET r.confidence = $confidence,
-                          r.supersession_type = $type,
-                          r.reason = $reason,
-                          r.created_at = $now
-            ON MATCH SET r.confidence = $confidence,
-                         r.supersession_type = $type,
-                         r.reason = $reason
-            """,
-            {
-                "newer_uuid": newer_uuid,
-                "older_uuid": older_uuid,
-                "confidence": confidence,
-                "type": supersession_type,
-                "reason": reason or "",
-                "now": int(time.time()),
-            },
+        return self._relationship_manager.add_supersession(
+            newer_uuid, older_uuid, confidence, supersession_type, reason
         )
-
-        log.info(
-            f"Supersession created: {newer_uuid[:8]}... -> {older_uuid[:8]}... "
-            f"(confidence={confidence:.2f})"
-        )
-        return True
 
     def mark_merged(
         self,
@@ -1053,29 +981,13 @@ class DatabaseManager:
     ) -> None:
         """Mark a memory as merged into another (soft delete).
 
-        The source memory is kept but marked with MERGED_INTO relationship.
-        This preserves history while indicating the memory is superseded.
+        Delegates to RelationshipManager.
 
         Args:
             source_uuid: UUID of memory that was merged (will be marked)
             target_uuid: UUID of memory it was merged into
         """
-        import time
-        self.graph.query(
-            """
-            MATCH (source:Memory {uuid: $source_uuid})
-            MATCH (target:Memory {uuid: $target_uuid})
-            MERGE (source)-[r:MERGED_INTO]->(target)
-            ON CREATE SET r.merged_at = $now
-            SET source.merged_into = $target_uuid,
-                source.merged_at = $now
-            """,
-            {
-                "source_uuid": source_uuid,
-                "target_uuid": target_uuid,
-                "now": int(time.time()),
-            },
-        )
+        self._relationship_manager.mark_merged(source_uuid, target_uuid)
 
     def get_superseded_memories(
         self,
@@ -1083,41 +995,15 @@ class DatabaseManager:
     ) -> list[dict]:
         """Get all superseded memory UUIDs for exclusion from search.
 
+        Delegates to RelationshipManager.
+
         Args:
             project_id: Optional project filter
 
         Returns:
             List of dicts with older_uuid and superseding_uuid
         """
-        if project_id:
-            query = """
-            MATCH (newer:Memory)-[r:SUPERSEDES]->(older:Memory)
-            WHERE older.project_id = $project_id OR newer.project_id = $project_id
-            RETURN older.uuid AS superseded_uuid,
-                   newer.uuid AS superseding_uuid,
-                   r.confidence AS confidence,
-                   r.supersession_type AS type
-            """
-            result = self.graph.query(query, {"project_id": project_id})
-        else:
-            query = """
-            MATCH (newer:Memory)-[r:SUPERSEDES]->(older:Memory)
-            RETURN older.uuid AS superseded_uuid,
-                   newer.uuid AS superseding_uuid,
-                   r.confidence AS confidence,
-                   r.supersession_type AS type
-            """
-            result = self.graph.query(query)
-
-        return [
-            {
-                "superseded_uuid": row[0],
-                "superseding_uuid": row[1],
-                "confidence": row[2],
-                "type": row[3],
-            }
-            for row in (result.result_set or [])
-        ]
+        return self._relationship_manager.get_superseded_memories(project_id)
 
     def get_merged_memories(
         self,
@@ -1125,89 +1011,15 @@ class DatabaseManager:
     ) -> list[dict]:
         """Get all merged memory UUIDs for exclusion from search.
 
+        Delegates to RelationshipManager.
+
         Args:
             project_id: Optional project filter
 
         Returns:
             List of dicts with source_uuid and target_uuid
         """
-        if project_id:
-            query = """
-            MATCH (source:Memory)-[r:MERGED_INTO]->(target:Memory)
-            WHERE source.project_id = $project_id OR target.project_id = $project_id
-            RETURN source.uuid AS merged_uuid,
-                   target.uuid AS merged_into_uuid,
-                   r.merged_at AS merged_at
-            """
-            result = self.graph.query(query, {"project_id": project_id})
-        else:
-            query = """
-            MATCH (source:Memory)-[r:MERGED_INTO]->(target:Memory)
-            RETURN source.uuid AS merged_uuid,
-                   target.uuid AS merged_into_uuid,
-                   r.merged_at AS merged_at
-            """
-            result = self.graph.query(query)
-
-        return [
-            {
-                "merged_uuid": row[0],
-                "merged_into_uuid": row[1],
-                "merged_at": row[2],
-            }
-            for row in (result.result_set or [])
-        ]
-
-    # Allowed verb edge types for security validation
-    ALLOWED_VERB_EDGES = {"READS", "MODIFIES", "EXECUTES", "TRIGGERED", "REFERENCES"}
-
-    # Pre-defined Cypher queries for each edge type (avoids f-string interpolation)
-    # Security: These are hardcoded to prevent any possibility of injection
-    _EDGE_QUERIES_WITH_SUMMARY = {
-        "READS": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:READS {timestamp: $ts, change_summary: $summary}]->(e)
-            """,
-        "MODIFIES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:MODIFIES {timestamp: $ts, change_summary: $summary}]->(e)
-            """,
-        "EXECUTES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:EXECUTES {timestamp: $ts, change_summary: $summary}]->(e)
-            """,
-        "TRIGGERED": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:TRIGGERED {timestamp: $ts, change_summary: $summary}]->(e)
-            """,
-        "REFERENCES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:REFERENCES {timestamp: $ts, change_summary: $summary}]->(e)
-            """,
-    }
-
-    _EDGE_QUERIES_NO_SUMMARY = {
-        "READS": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:READS {timestamp: $ts}]->(e)
-            """,
-        "MODIFIES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:MODIFIES {timestamp: $ts}]->(e)
-            """,
-        "EXECUTES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:EXECUTES {timestamp: $ts}]->(e)
-            """,
-        "TRIGGERED": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:TRIGGERED {timestamp: $ts}]->(e)
-            """,
-        "REFERENCES": """
-            MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-            CREATE (m)-[:REFERENCES {timestamp: $ts}]->(e)
-            """,
-    }
+        return self._relationship_manager.get_merged_memories(project_id)
 
     def add_verb_edge(
         self,
@@ -1220,168 +1032,18 @@ class DatabaseManager:
     ) -> None:
         """Add a verb-specific edge between memory and entity.
 
-        Supports semantic edge types: READS, MODIFIES, EXECUTES, TRIGGERED.
-        Automatically increments entity version on MODIFIES.
-
-        Args:
-            memory_uuid: Memory UUID
-            entity_name: Entity name (will be canonicalized)
-            entity_type: Entity type (file, tool, command, error)
-            action: Action type (reads, modifies, executes, triggered)
-            timestamp: Optional timestamp for the action
-            change_summary: Optional summary of changes (for modifies)
+        Delegates to EntityRepository.
         """
-        import time
-
-        # Canonicalize entity name
-        canonical_name = self._canonicalize_entity(entity_name, entity_type)
-
-        # Map action to edge type with security validation
-        action_to_edge = {
-            "reads": "READS",
-            "modifies": "MODIFIES",
-            "executes": "EXECUTES",
-            "triggered": "TRIGGERED",
-        }
-        edge_type = action_to_edge.get(action.lower(), "REFERENCES")
-
-        # Security: validate edge type to prevent Cypher injection
-        # Edge type is used in f-string but is validated against allow-list
-        if edge_type not in self.ALLOWED_VERB_EDGES:
-            log.error(f"Invalid edge type attempted: {edge_type}")
-            raise ValueError(f"Invalid edge type: {edge_type}")
-
-        # Ensure entity exists with version property
-        if action.lower() == "modifies":
-            # Increment version on MODIFIES
-            self.graph.query(
-                """
-                MERGE (e:Entity {name: $name, type: $type})
-                ON CREATE SET e.created_at = timestamp(), e.version = 1
-                ON MATCH SET e.version = COALESCE(e.version, 0) + 1, e.last_modified = timestamp()
-                """,
-                {"name": canonical_name, "type": entity_type},
-            )
-        else:
-            # Just ensure entity exists
-            self.graph.query(
-                """
-                MERGE (e:Entity {name: $name, type: $type})
-                ON CREATE SET e.created_at = timestamp(), e.version = 1
-                """,
-                {"name": canonical_name, "type": entity_type},
-            )
-
-        # Create the verb-specific edge using hardcoded queries (no f-string interpolation)
-        ts = timestamp or int(time.time())
-        if change_summary:
-            query = self._EDGE_QUERIES_WITH_SUMMARY[edge_type]
-            self.graph.query(
-                query,
-                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts, "summary": change_summary[:self.config.summary_max_size]},
-            )
-        else:
-            query = self._EDGE_QUERIES_NO_SUMMARY[edge_type]
-            self.graph.query(
-                query,
-                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts},
-            )
-
-        log.trace(f"Added {edge_type} edge: memory={memory_uuid[:8]}... -> {entity_type}:{canonical_name}")
-
-        # Infer READS from MODIFIES: you can't modify what you haven't read
-        # Only for files - tools/commands don't have this semantic
-        if edge_type == "MODIFIES" and entity_type == "file":
-            # Check if READS edge already exists for this memory->entity
-            check_result = self.graph.query(
-                """
-                MATCH (m:Memory {uuid: $uuid})-[r:READS]->(e:Entity {name: $name, type: $type})
-                RETURN count(r) as cnt
-                """,
-                {"uuid": memory_uuid, "name": canonical_name, "type": entity_type},
-            )
-            reads_exists = check_result.result_set and check_result.result_set[0][0] > 0
-
-            if not reads_exists:
-                # Create implicit READS edge (before the modify)
-                self.graph.query(
-                    """
-                    MATCH (m:Memory {uuid: $uuid}), (e:Entity {name: $name, type: $type})
-                    CREATE (m)-[:READS {timestamp: $ts, implicit: true}]->(e)
-                    """,
-                    {"uuid": memory_uuid, "name": canonical_name, "type": entity_type, "ts": ts - 1},
-                )
-                log.trace(f"Added implicit READS edge for MODIFIES: {entity_type}:{canonical_name}")
+        self._entity_repository.add_verb_edge(
+            memory_uuid, entity_name, entity_type, action, timestamp, change_summary
+        )
 
     def _canonicalize_entity(self, name: str, entity_type: str) -> str:
         """Canonicalize entity name for consistent deduplication.
 
-        Args:
-            name: Raw entity name
-            entity_type: Entity type
-
-        Returns:
-            Canonicalized entity name
+        Delegates to EntityRepository.
         """
-        import os
-        import hashlib
-
-        if entity_type == "file":
-            # Normalize file paths for consistent deduplication
-            try:
-                # Clean up the path
-                clean_name = name.strip().strip("'\"")
-                normalized = os.path.normpath(clean_name)
-
-                # Strip home directory prefix to make paths project-relative
-                # This helps deduplicate: /Users/foo/repo/myproj/main.py → myproj/main.py
-                home = os.path.expanduser("~")
-                if normalized.startswith(home):
-                    # Remove home prefix, keep from first meaningful directory
-                    relative = normalized[len(home):].lstrip(os.sep)
-                    # Skip only definitive container directories (not project dirs like "src")
-                    # Require at least 3 parts (container/project/file) to avoid over-stripping
-                    parts = relative.split(os.sep)
-                    if len(parts) > 2 and parts[0] in ("repo", "repos", "projects", "dev", "work"):
-                        return os.sep.join(parts[1:])  # Skip the container prefix
-                    return relative
-
-                return normalized
-            except Exception:
-                return name
-
-        elif entity_type == "tool":
-            # Normalize tool names - lowercase, strip common prefixes
-            normalized = name.lower()
-            normalized = normalized.replace("mcp__", "").replace("__", ":")
-            return normalized
-
-        elif entity_type == "command":
-            # Keep 2-word for common driver commands (git commit, npm install, etc.)
-            parts = name.strip().split()
-            if not parts:
-                return name
-            base = parts[0].lower()
-            # Common drivers where subcommand is semantically important
-            command_drivers = {"git", "npm", "pip", "docker", "kubectl", "python", "node", "yarn", "cargo", "go"}
-            if base in command_drivers and len(parts) > 1:
-                return f"{base} {parts[1].lower()}"
-            return base
-
-        elif entity_type == "error":
-            # Extract exception type for better deduplication
-            # "ValueError: invalid input" → "error:valueerror"
-            # "TypeError: cannot..." → "error:typeerror"
-            import re
-            # Match common exception patterns
-            match = re.match(r"^(\w+(?:Error|Exception|Warning|Failure))", name, re.IGNORECASE)
-            if match:
-                return f"error:{match.group(1).lower()}"
-            # Fallback: hash for unrecognized error formats
-            error_hash = hashlib.sha256(name[:200].encode()).hexdigest()[:12]
-            return f"error:{error_hash}"
-
-        return name
+        return self._entity_repository._canonicalize_entity(name, entity_type)
 
     def _cleanup_orphan_entities(self) -> int:
         """Delete Entity nodes that have no incoming edges.
@@ -2102,29 +1764,9 @@ class DatabaseManager:
     ) -> None:
         """Link a CodeChunk to an Entity node.
 
-        Args:
-            chunk_uuid: CodeChunk UUID
-            entity_name: Entity name (function, class, import, etc.)
-            entity_type: Entity type (function, class, import, file)
-            relation: Relationship type (DEFINES, IMPORTS, CALLS, etc.)
+        Delegates to EntityRepository.
         """
-        log.trace(f"Linking code {chunk_uuid[:8]}... to {entity_type}:{entity_name}")
-        # Ensure entity exists
-        self.add_entity_node(entity_name, entity_type)
-        # Create relationship
-        self.graph.query(
-            """
-            MATCH (c:CodeChunk {uuid: $chunk_uuid}), (e:Entity {name: $entity_name, type: $entity_type})
-            MERGE (c)-[r:REFERENCES {relation: $relation}]->(e)
-            ON CREATE SET r.created_at = timestamp()
-            """,
-            {
-                "chunk_uuid": chunk_uuid,
-                "entity_name": entity_name,
-                "entity_type": entity_type,
-                "relation": relation,
-            },
-        )
+        self._entity_repository.link_code_to_entity(chunk_uuid, entity_name, entity_type, relation)
 
     def get_code_related_memories(
         self,
@@ -2287,50 +1929,9 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Get related memories via graph traversal.
 
-        Args:
-            uuid: Starting memory UUID
-            hops: Number of hops to traverse (1-3)
-            direction: 'outgoing', 'incoming', or 'both'
-
-        Returns:
-            List of related memories
+        Delegates to GraphAnalytics.
         """
-        log.trace(f"Getting related nodes: uuid={uuid[:8]}..., hops={hops}, direction={direction}")
-        hops = min(max(hops, 1), self.config.max_graph_hops)
-
-        if direction == "outgoing":
-            pattern = f"(start:Memory {{uuid: $uuid}})-[r*1..{hops}]->(connected:Memory)"
-        elif direction == "incoming":
-            pattern = f"(start:Memory {{uuid: $uuid}})<-[r*1..{hops}]-(connected:Memory)"
-        else:
-            pattern = f"(start:Memory {{uuid: $uuid}})-[r*1..{hops}]-(connected:Memory)"
-
-        result = self.graph.query(
-            f"""
-            MATCH {pattern}
-            RETURN DISTINCT
-                connected.uuid AS uuid,
-                connected.content AS content,
-                connected.type AS type,
-                connected.session_id AS session_id,
-                connected.created_at AS created_at
-            """,
-            {"uuid": uuid},
-        )
-
-        rows = []
-        for record in result.result_set:
-            rows.append({
-                "uuid": record[0],
-                "content": record[1],
-                "type": record[2],
-                "session_id": record[3],
-                "created_at": record[4],
-                "hops": 1,  # Simplified
-            })
-
-        log.debug(f"Graph traversal returned {len(rows)} related nodes")
-        return rows
+        return self._graph_analytics.get_related_nodes(uuid, hops, direction)
 
     def get_paths(
         self,
@@ -2340,77 +1941,9 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Get paths from a node with full edge metadata.
 
-        Returns paths with node and edge information for scoring.
-        Includes paths through Entity nodes for cross-session reasoning.
-
-        Args:
-            from_uuid: Starting memory UUID
-            max_hops: Maximum path length (1-3)
-            direction: 'outgoing', 'incoming', or 'both'
-
-        Returns:
-            List of paths with nodes, edge_types, and metadata
+        Delegates to GraphAnalytics.
         """
-        log.trace(f"Getting paths: from={from_uuid[:8]}..., max_hops={max_hops}")
-        max_hops = min(max(max_hops, 1), self.config.max_graph_hops)
-
-        # FalkorDB Cypher for variable-length paths
-        if direction == "outgoing":
-            pattern = f"(start:Memory {{uuid: $uuid}})-[r*1..{max_hops}]->(target:Memory)"
-        elif direction == "incoming":
-            pattern = f"(start:Memory {{uuid: $uuid}})<-[r*1..{max_hops}]-(target:Memory)"
-        else:
-            pattern = f"(start:Memory {{uuid: $uuid}})-[r*1..{max_hops}]-(target:Memory)"
-
-        result = self.graph.query(
-            f"""
-            MATCH path = {pattern}
-            WHERE start <> target
-            RETURN DISTINCT
-                target.uuid AS end_uuid,
-                target.content AS end_content,
-                target.type AS end_type,
-                target.session_id AS session_id,
-                target.created_at AS created_at,
-                [rel in relationships(path) | type(rel)] AS rel_types,
-                [rel in relationships(path) | rel.relation_type] AS relation_types,
-                [rel in relationships(path) | rel.weight] AS weights,
-                length(path) AS hops
-            LIMIT $limit
-            """,
-            {"uuid": from_uuid, "limit": self.config.graph_path_limit},
-        )
-
-        paths = []
-        for record in result.result_set:
-            # Extract relationship info
-            rel_types = record[5] or []  # RELATES_TO, REFERENCES, etc.
-            relation_types = record[6] or []  # contains, follows, etc.
-            weights = record[7] or []
-
-            # Combine into edge_types (prefer relation_type if available)
-            edge_types = []
-            for i, rt in enumerate(rel_types):
-                if i < len(relation_types) and relation_types[i]:
-                    edge_types.append(relation_types[i])
-                elif rt == "REFERENCES":
-                    edge_types.append("references")
-                else:
-                    edge_types.append("relates")
-
-            paths.append({
-                "end_uuid": record[0],
-                "end_content": record[1],
-                "end_type": record[2],
-                "session_id": record[3],
-                "created_at": record[4] or 0,
-                "edge_types": edge_types,
-                "edge_weights": [w or 1.0 for w in (weights or [])],
-                "hops": record[8] or len(edge_types),
-            })
-
-        log.debug(f"Found {len(paths)} paths from {from_uuid[:8]}...")
-        return paths
+        return self._graph_analytics.get_paths(from_uuid, max_hops, direction)
 
     def get_cross_session_paths(
         self,
@@ -2419,53 +1952,9 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Get paths that cross sessions via shared Entity nodes.
 
-        This enables reasoning like "what other sessions touched this file?"
-
-        Args:
-            from_uuid: Starting memory UUID
-            max_hops: Maximum path length
-
-        Returns:
-            List of cross-session paths with entity bridge info
+        Delegates to GraphAnalytics.
         """
-        log.trace(f"Getting cross-session paths from {from_uuid[:8]}...")
-
-        result = self.graph.query(
-            """
-            MATCH (start:Memory {uuid: $uuid})-[:REFERENCES]->(e:Entity)<-[:REFERENCES]-(other:Memory)
-            WHERE start.session_id <> other.session_id
-            RETURN DISTINCT
-                other.uuid AS end_uuid,
-                other.content AS end_content,
-                other.type AS end_type,
-                other.session_id AS session_id,
-                other.created_at AS created_at,
-                e.name AS entity_name,
-                e.type AS entity_type
-            LIMIT $limit
-            """,
-            {"uuid": from_uuid, "limit": self.config.cross_session_limit},
-        )
-
-        paths = []
-        for record in result.result_set:
-            paths.append({
-                "end_uuid": record[0],
-                "end_content": record[1],
-                "end_type": record[2],
-                "session_id": record[3],
-                "created_at": record[4] or 0,
-                "edge_types": ["references", "references"],
-                "edge_weights": [0.7, 0.7],
-                "hops": 2,
-                "bridge_entity": {
-                    "name": record[5],
-                    "type": record[6],
-                },
-            })
-
-        log.debug(f"Found {len(paths)} cross-session paths")
-        return paths
+        return self._graph_analytics.get_cross_session_paths(from_uuid, max_hops)
 
     @property
     def write_lock(self) -> threading.Lock:
@@ -3031,35 +2520,9 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Compute PageRank scores for Memory nodes.
 
-        Delegates to the graph backend's PageRank implementation:
-        - FalkorDB: algo.pageRank()
-        - Memgraph: pagerank.get() via MAGE
-        - KuzuDB: degree-based fallback
-
-        Args:
-            uuids: Optional list of UUIDs to get scores for (None = all)
-
-        Returns:
-            Dictionary mapping UUID -> PageRank score (0.0 to 1.0)
+        Delegates to GraphAnalytics.
         """
-        log.trace("Computing PageRank scores")
-
-        try:
-            # Delegate to graph backend (handles FalkorDB/Memgraph/KuzuDB differences)
-            scores = self._graph_backend.get_pagerank_scores()
-
-            log.debug(f"PageRank computed for {len(scores)} nodes")
-
-            # Filter to requested UUIDs if specified
-            if uuids:
-                scores = {uuid: scores.get(uuid, 0.0) for uuid in uuids}
-
-            return scores
-
-        except Exception as e:
-            log.warning(f"PageRank computation failed (may not be supported): {e}")
-            # Return empty dict if PageRank not available
-            return {}
+        return self._graph_analytics.get_pagerank_scores(uuids)
 
     def get_pagerank_for_nodes(
         self,
@@ -3067,66 +2530,16 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Get PageRank scores for specific nodes.
 
-        Computes PageRank on the full graph and filters to requested nodes.
-        Falls back to degree-based scoring if PageRank is unavailable.
-
-        Args:
-            uuids: List of UUIDs to get scores for
-
-        Returns:
-            Dictionary mapping UUID -> PageRank score
+        Delegates to GraphAnalytics.
         """
-        log.trace(f"Getting PageRank for {len(uuids)} nodes")
-
-        try:
-            # Get PageRank for the whole graph
-            all_scores = self.get_pagerank_scores()
-
-            if all_scores:
-                # Filter for the requested UUIDs
-                scores = {uuid: all_scores.get(uuid, 0.0) for uuid in uuids}
-                log.debug(f"PageRank retrieved for {len(scores)} of {len(uuids)} nodes")
-                return scores
-
-            # Empty result, fall through to fallback
-            log.debug("PageRank returned no scores, using fallback")
-            return self._get_degree_scores(uuids)
-
-        except Exception as e:
-            log.warning(f"PageRank failed, using degree-based fallback: {e}")
-            # Fallback: use in-degree as a proxy for importance
-            return self._get_degree_scores(uuids)
+        return self._graph_analytics.get_pagerank_for_nodes(uuids)
 
     def _get_degree_scores(self, uuids: list[str]) -> dict[str, float]:
         """Fallback: compute importance scores based on in-degree.
 
-        Args:
-            uuids: List of UUIDs
-
-        Returns:
-            Normalized in-degree scores
+        Delegates to GraphAnalytics.
         """
-        result = self.graph.query(
-            """
-            MATCH (m:Memory)
-            WHERE m.uuid IN $uuids
-            OPTIONAL MATCH (other)-[r]->(m)
-            WITH m.uuid AS uuid, count(r) AS in_degree
-            RETURN uuid, in_degree
-            """,
-            {"uuids": uuids},
-        )
-
-        # Get raw degrees
-        degrees = {}
-        max_degree = 1
-        for record in result.result_set:
-            degrees[record[0]] = record[1]
-            max_degree = max(max_degree, record[1])
-
-        # Normalize to 0-1 range
-        scores = {uuid: degrees.get(uuid, 0) / max_degree for uuid in uuids}
-        return scores
+        return self._graph_analytics._get_degree_scores(uuids)
 
     # ═══════════════════════════════════════════════════════════════════════════════
     # ENTITY-CENTRIC QUERIES (P1 Resources Support)
@@ -3139,6 +2552,8 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Get all entities of a specific type with action counts.
 
+        Delegates to EntityRepository.
+
         Args:
             entity_type: Type of entity (file, tool, error, command)
             limit: Maximum results to return
@@ -3146,52 +2561,7 @@ class DatabaseManager:
         Returns:
             List of entities with name, type, version, session_count, action counts
         """
-        log.trace(f"Getting entities by type: {entity_type}")
-
-        result = self.graph.query(
-            """
-            MATCH (e:Entity {type: $type})
-            OPTIONAL MATCH (m:Memory)-[r:READS]->(e)
-            WITH e, count(DISTINCT r) AS reads_count, collect(DISTINCT m.session_id) AS read_sessions
-            OPTIONAL MATCH (m2:Memory)-[w:MODIFIES]->(e)
-            WITH e, reads_count, read_sessions, count(DISTINCT w) AS modifies_count, collect(DISTINCT m2.session_id) AS modify_sessions
-            OPTIONAL MATCH (m3:Memory)-[x:EXECUTES]->(e)
-            WITH e, reads_count, read_sessions, modifies_count, modify_sessions,
-                 count(DISTINCT x) AS executes_count, collect(DISTINCT m3.session_id) AS exec_sessions
-            RETURN
-                e.name AS name,
-                e.type AS type,
-                e.version AS version,
-                e.created_at AS created_at,
-                e.last_modified AS last_modified,
-                reads_count,
-                modifies_count,
-                executes_count,
-                read_sessions + modify_sessions + exec_sessions AS all_sessions
-            ORDER BY reads_count + modifies_count + executes_count DESC
-            LIMIT $limit
-            """,
-            {"type": entity_type, "limit": limit},
-        )
-
-        entities = []
-        for record in result.result_set:
-            # Deduplicate sessions
-            all_sessions = list(set(s for s in (record[8] or []) if s))
-            entities.append({
-                "name": record[0],
-                "type": record[1],
-                "version": record[2] or 1,
-                "created_at": record[3],
-                "last_modified": record[4],
-                "reads": record[5] or 0,
-                "modifies": record[6] or 0,
-                "executes": record[7] or 0,
-                "sessions_count": len(all_sessions),
-            })
-
-        log.debug(f"Found {len(entities)} entities of type {entity_type}")
-        return entities
+        return self._entity_repository.get_entities_by_type(entity_type, limit)
 
     def get_entity_history(
         self,
@@ -3201,6 +2571,8 @@ class DatabaseManager:
     ) -> dict[str, Any]:
         """Get complete history of a specific entity.
 
+        Delegates to EntityRepository.
+
         Args:
             name: Entity name (will be canonicalized)
             entity_type: Entity type
@@ -3209,97 +2581,7 @@ class DatabaseManager:
         Returns:
             Entity details with all linked memories and actions
         """
-        log.trace(f"Getting entity history: {entity_type}:{name}")
-
-        # Canonicalize the entity name for lookup
-        canonical_name = self._canonicalize_entity(name, entity_type)
-
-        # Get entity details
-        entity_result = self.graph.query(
-            """
-            MATCH (e:Entity {name: $name, type: $type})
-            RETURN e.name, e.type, e.version, e.created_at, e.last_modified
-            """,
-            {"name": canonical_name, "type": entity_type},
-        )
-
-        if not entity_result.result_set:
-            log.debug(f"Entity not found: {entity_type}:{canonical_name}")
-            return {"error": "Entity not found", "name": name, "type": entity_type}
-
-        record = entity_result.result_set[0]
-        entity = {
-            "name": record[0],
-            "type": record[1],
-            "version": record[2] or 1,
-            "created_at": record[3],
-            "last_modified": record[4],
-        }
-
-        # Get all memories linked to this entity with their actions
-        memories_result = self.graph.query(
-            """
-            MATCH (m:Memory)-[r]->(e:Entity {name: $name, type: $type})
-            WHERE type(r) IN ['READS', 'MODIFIES', 'EXECUTES', 'TRIGGERED', 'REFERENCES']
-            RETURN
-                m.uuid AS uuid,
-                m.content AS content,
-                m.type AS mem_type,
-                m.session_id AS session_id,
-                m.created_at AS created_at,
-                type(r) AS action,
-                r.timestamp AS action_timestamp,
-                r.change_summary AS change_summary
-            ORDER BY m.created_at DESC
-            LIMIT $limit
-            """,
-            {"name": canonical_name, "type": entity_type, "limit": limit},
-        )
-
-        memories = []
-        sessions = set()
-        for record in memories_result.result_set:
-            memories.append({
-                "uuid": record[0],
-                "content": record[1][:300] if record[1] else "",  # Truncate for display
-                "type": record[2],
-                "session_id": record[3],
-                "created_at": record[4],
-                "action": record[5],
-                "action_timestamp": record[6],
-                "change_summary": record[7],
-            })
-            if record[3]:
-                sessions.add(record[3])
-
-        # Get linked errors (for files/tools)
-        errors_result = self.graph.query(
-            """
-            MATCH (m:Memory)-[:READS|MODIFIES|EXECUTES]->(e:Entity {name: $name, type: $type})
-            MATCH (m)-[:TRIGGERED]->(err:Entity {type: 'error'})
-            RETURN DISTINCT err.name AS error_name, count(m) AS occurrences
-            ORDER BY occurrences DESC
-            LIMIT 10
-            """,
-            {"name": canonical_name, "type": entity_type},
-        )
-
-        errors = []
-        for record in errors_result.result_set:
-            errors.append({
-                "error": record[0],
-                "occurrences": record[1],
-            })
-
-        log.debug(f"Entity history: {len(memories)} memories, {len(sessions)} sessions, {len(errors)} errors")
-
-        return {
-            "entity": entity,
-            "memories": memories,
-            "sessions": list(sessions),
-            "sessions_count": len(sessions),
-            "related_errors": errors,
-        }
+        return self._entity_repository.get_entity_history(name, entity_type, limit)
 
     def get_cross_session_entities(
         self,
@@ -3308,49 +2590,9 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Get entities that appear across multiple sessions (bridge entities).
 
-        These are valuable for cross-session insights as they link
-        different work sessions together.
-
-        Args:
-            min_sessions: Minimum number of sessions the entity must appear in
-            limit: Maximum results to return
-
-        Returns:
-            List of entities with session count and linked sessions
+        Delegates to GraphAnalytics.
         """
-        log.trace(f"Getting cross-session entities (min_sessions={min_sessions})")
-
-        result = self.graph.query(
-            """
-            MATCH (m:Memory)-[r]->(e:Entity)
-            WHERE type(r) IN ['READS', 'MODIFIES', 'EXECUTES', 'TRIGGERED', 'REFERENCES']
-              AND m.session_id IS NOT NULL AND m.session_id <> ''
-            WITH e, collect(DISTINCT m.session_id) AS sessions
-            WHERE size(sessions) >= $min_sessions
-            RETURN
-                e.name AS name,
-                e.type AS type,
-                e.version AS version,
-                sessions AS session_ids,
-                size(sessions) AS sessions_count
-            ORDER BY size(sessions) DESC
-            LIMIT $limit
-            """,
-            {"min_sessions": min_sessions, "limit": limit},
-        )
-
-        entities = []
-        for record in result.result_set:
-            entities.append({
-                "name": record[0],
-                "type": record[1],
-                "version": record[2] or 1,
-                "session_ids": record[3] or [],
-                "sessions_count": record[4] or 0,
-            })
-
-        log.debug(f"Found {len(entities)} cross-session entities")
-        return entities
+        return self._graph_analytics.get_cross_session_entities(min_sessions, limit)
 
     def get_project_insights(
         self,
@@ -3658,6 +2900,7 @@ class DatabaseManager:
 
     # =========================================================================
     # Review Queue Methods (Consolidation Candidates)
+    # Delegated to ConsolidationManager - kept for backward compatibility
     # =========================================================================
 
     def make_dedupe_key(
@@ -3668,18 +2911,9 @@ class DatabaseManager:
     ) -> str:
         """Create deterministic key for candidate deduplication.
 
-        Args:
-            project_id: Project scope
-            candidate_type: entity_dedup | memory_merge | supersession
-            involved_ids: UUIDs or entity names involved in the candidate
-
-        Returns:
-            16-character hex hash for idempotent MERGE operations
+        Delegates to ConsolidationManager.
         """
-        import hashlib
-        sorted_ids = sorted(involved_ids)
-        raw = f"{project_id}|{candidate_type}|{','.join(sorted_ids)}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+        return self._consolidation.make_dedupe_key(project_id, candidate_type, involved_ids)
 
     def add_review_candidate(
         self,
@@ -3695,86 +2929,19 @@ class DatabaseManager:
     ) -> dict[str, Any]:
         """Persist a consolidation candidate for human review.
 
-        Uses MERGE with dedupe_key for idempotency - same candidate won't be
-        duplicated across multiple consolidation runs.
-
-        Args:
-            project_id: Project scope
-            candidate_type: entity_dedup | memory_merge | supersession
-            confidence: LLM confidence score (typically 0.7-0.9 for review queue)
-            reason: LLM reasoning for the suggested action
-            decision_data: Type-specific decision details (stored as JSON)
-            involved_ids: UUIDs or entity names for dedupe_key generation
-            source_id: First involved ID (for filtering)
-            target_id: Second involved ID (for filtering)
-            similarity: Embedding similarity score (for filtering)
-
-        Returns:
-            {"uuid": str, "created": bool} - created=False if existing candidate
+        Delegates to ConsolidationManager.
         """
-        import json
-        import time
-        import uuid as uuid_lib
-
-        dedupe_key = self.make_dedupe_key(project_id, candidate_type, involved_ids)
-
-        # Check if already exists (including rejected)
-        existing = self.graph.query(
-            """
-            MATCH (c:ReviewCandidate {dedupe_key: $dedupe_key})
-            RETURN c.uuid, c.status
-            """,
-            {"dedupe_key": dedupe_key},
+        return self._consolidation.add_review_candidate(
+            project_id=project_id,
+            candidate_type=candidate_type,
+            confidence=confidence,
+            reason=reason,
+            decision_data=decision_data,
+            involved_ids=involved_ids,
+            source_id=source_id,
+            target_id=target_id,
+            similarity=similarity,
         )
-
-        if existing.result_set:
-            existing_uuid, existing_status = existing.result_set[0]
-            # If rejected, don't recreate - honor the rejection
-            if existing_status == "rejected":
-                return {"uuid": existing_uuid, "created": False, "skipped": "rejected"}
-            # If pending or approved, return existing
-            return {"uuid": existing_uuid, "created": False}
-
-        # Create new candidate
-        candidate_uuid = str(uuid_lib.uuid4())
-        now = int(time.time())
-
-        self.graph.query(
-            """
-            CREATE (c:ReviewCandidate {
-                uuid: $uuid,
-                dedupe_key: $dedupe_key,
-                project_id: $project_id,
-                type: $type,
-                status: 'pending',
-                confidence: $confidence,
-                reason: $reason,
-                source_id: $source_id,
-                target_id: $target_id,
-                similarity: $similarity,
-                decision_data: $decision_data,
-                schema_version: 1,
-                created_at: $now,
-                resolved_at: NULL
-            })
-            """,
-            {
-                "uuid": candidate_uuid,
-                "dedupe_key": dedupe_key,
-                "project_id": project_id,
-                "type": candidate_type,
-                "confidence": confidence,
-                "reason": reason,
-                "source_id": source_id,
-                "target_id": target_id,
-                "similarity": similarity,
-                "decision_data": json.dumps(decision_data),
-                "now": now,
-            },
-        )
-
-        log.debug(f"Created ReviewCandidate {candidate_uuid} for {candidate_type}")
-        return {"uuid": candidate_uuid, "created": True}
 
     def get_review_candidates(
         self,
@@ -3785,117 +2952,21 @@ class DatabaseManager:
     ) -> list[dict[str, Any]]:
         """Fetch review candidates with optional filters.
 
-        Args:
-            project_id: Project scope
-            status: Filter by status (pending, approved, rejected)
-            type_filter: Filter by type (entity_dedup, memory_merge, supersession)
-            limit: Maximum candidates to return
-
-        Returns:
-            List of candidate dicts with all fields
+        Delegates to ConsolidationManager.
         """
-        import json
-
-        query = """
-            MATCH (c:ReviewCandidate {project_id: $project_id, status: $status})
-        """
-        params: dict[str, Any] = {
-            "project_id": project_id,
-            "status": status,
-            "limit": limit,
-        }
-
-        if type_filter:
-            query += " WHERE c.type = $type_filter"
-            params["type_filter"] = type_filter
-
-        query += """
-            RETURN c.uuid, c.dedupe_key, c.project_id, c.type, c.status,
-                   c.confidence, c.reason, c.source_id, c.target_id,
-                   c.similarity, c.decision_data, c.schema_version,
-                   c.created_at, c.resolved_at
-            ORDER BY c.created_at DESC
-            LIMIT $limit
-        """
-
-        result = self.graph.query(query, params)
-
-        candidates = []
-        for record in result.result_set:
-            decision_data_str = record[10]
-            try:
-                decision_data = json.loads(decision_data_str) if decision_data_str else {}
-            except (json.JSONDecodeError, TypeError):
-                decision_data = {}
-
-            candidates.append({
-                "uuid": record[0],
-                "dedupe_key": record[1],
-                "project_id": record[2],
-                "type": record[3],
-                "status": record[4],
-                "confidence": record[5],
-                "reason": record[6],
-                "source_id": record[7],
-                "target_id": record[8],
-                "similarity": record[9],
-                "decision_data": decision_data,
-                "schema_version": record[11],
-                "created_at": record[12],
-                "resolved_at": record[13],
-            })
-
-        log.debug(f"Retrieved {len(candidates)} review candidates for {project_id}")
-        return candidates
+        return self._consolidation.get_review_candidates(
+            project_id=project_id,
+            status=status,
+            type_filter=type_filter,
+            limit=limit,
+        )
 
     def get_review_candidate(self, uuid: str) -> dict[str, Any] | None:
         """Fetch a single review candidate by UUID.
 
-        Args:
-            uuid: Candidate UUID
-
-        Returns:
-            Candidate dict or None if not found
+        Delegates to ConsolidationManager.
         """
-        import json
-
-        result = self.graph.query(
-            """
-            MATCH (c:ReviewCandidate {uuid: $uuid})
-            RETURN c.uuid, c.dedupe_key, c.project_id, c.type, c.status,
-                   c.confidence, c.reason, c.source_id, c.target_id,
-                   c.similarity, c.decision_data, c.schema_version,
-                   c.created_at, c.resolved_at
-            """,
-            {"uuid": uuid},
-        )
-
-        if not result.result_set:
-            return None
-
-        record = result.result_set[0]
-        decision_data_str = record[10]
-        try:
-            decision_data = json.loads(decision_data_str) if decision_data_str else {}
-        except (json.JSONDecodeError, TypeError):
-            decision_data = {}
-
-        return {
-            "uuid": record[0],
-            "dedupe_key": record[1],
-            "project_id": record[2],
-            "type": record[3],
-            "status": record[4],
-            "confidence": record[5],
-            "reason": record[6],
-            "source_id": record[7],
-            "target_id": record[8],
-            "similarity": record[9],
-            "decision_data": decision_data,
-            "schema_version": record[11],
-            "created_at": record[12],
-            "resolved_at": record[13],
-        }
+        return self._consolidation.get_review_candidate(uuid)
 
     def update_candidate_status(
         self,
@@ -3905,42 +2976,9 @@ class DatabaseManager:
     ) -> bool:
         """Update a review candidate's status.
 
-        Idempotent - updating an already-resolved candidate returns False
-        without making changes.
-
-        Args:
-            uuid: Candidate UUID
-            status: New status (approved | rejected)
-            resolved_at: Timestamp when resolved (defaults to now)
-
-        Returns:
-            True if updated, False if already resolved or not found
+        Delegates to ConsolidationManager.
         """
-        import time
-
-        if resolved_at is None:
-            resolved_at = int(time.time())
-
-        # Only update if currently pending
-        result = self.graph.query(
-            """
-            MATCH (c:ReviewCandidate {uuid: $uuid, status: 'pending'})
-            SET c.status = $status, c.resolved_at = $resolved_at
-            RETURN c.uuid
-            """,
-            {
-                "uuid": uuid,
-                "status": status,
-                "resolved_at": resolved_at,
-            },
-        )
-
-        updated = bool(result.result_set)
-        if updated:
-            log.debug(f"Updated ReviewCandidate {uuid} to status={status}")
-        else:
-            log.debug(f"ReviewCandidate {uuid} not updated (already resolved or not found)")
-        return updated
+        return self._consolidation.update_candidate_status(uuid, status, resolved_at)
 
     def add_rejected_pair(
         self,
@@ -3950,62 +2988,16 @@ class DatabaseManager:
     ) -> None:
         """Create REJECTED_PAIR edge between two entities/memories.
 
-        Used to skip pairs in future consolidation runs after human rejection.
-        Stores pair in normalized order (pair_a=min, pair_b=max) for consistent lookup.
-
-        Args:
-            uuid1: First UUID/entity name
-            uuid2: Second UUID/entity name
-            candidate_uuid: UUID of the rejected ReviewCandidate
+        Delegates to ConsolidationManager.
         """
-        import time
-
-        # Normalize order for consistent lookup
-        pair_a = min(uuid1, uuid2)
-        pair_b = max(uuid1, uuid2)
-        now = int(time.time())
-
-        # Create relationship between the two items
-        # We store as a standalone node since the entities might be Memory or Entity
-        self.graph.query(
-            """
-            MERGE (r:RejectedPair {pair_a: $pair_a, pair_b: $pair_b})
-            ON CREATE SET r.rejected_at = $now,
-                          r.candidate_uuid = $candidate_uuid
-            """,
-            {
-                "pair_a": pair_a,
-                "pair_b": pair_b,
-                "candidate_uuid": candidate_uuid,
-                "now": now,
-            },
-        )
-        log.debug(f"Added RejectedPair: {pair_a} <-> {pair_b}")
+        return self._consolidation.add_rejected_pair(uuid1, uuid2, candidate_uuid)
 
     def is_rejected_pair(self, uuid1: str, uuid2: str) -> bool:
         """Check if a pair was previously rejected.
 
-        Uses normalized lookup (pair_a=min, pair_b=max) so order doesn't matter.
-
-        Args:
-            uuid1: First UUID/entity name
-            uuid2: Second UUID/entity name
-
-        Returns:
-            True if pair was rejected, False otherwise
+        Delegates to ConsolidationManager.
         """
-        pair_a = min(uuid1, uuid2)
-        pair_b = max(uuid1, uuid2)
-
-        result = self.graph.query(
-            """
-            MATCH (r:RejectedPair {pair_a: $pair_a, pair_b: $pair_b})
-            RETURN r.pair_a
-            """,
-            {"pair_a": pair_a, "pair_b": pair_b},
-        )
-
-        return bool(result.result_set)
+        return self._consolidation.is_rejected_pair(uuid1, uuid2)
 
     # =========================================================================
     # Graph-Enhanced Scoring Methods (MAGE Integration)
@@ -4018,51 +3010,9 @@ class DatabaseManager:
     ) -> dict[str, dict[str, int]]:
         """Get in-degree and out-degree for a list of memory UUIDs.
 
-        Used for connectivity-based scoring. Well-connected memories
-        are boosted, orphan memories are penalized.
-
-        Args:
-            uuids: List of memory UUIDs to get degrees for
-            project_id: Optional project filter
-
-        Returns:
-            Dict mapping uuid -> {"in_degree": int, "out_degree": int, "total": int}
+        Delegates to GraphAnalytics.
         """
-        if not uuids:
-            return {}
-
-        # Relationship types that indicate semantic dependency
-        # Exclude SUPERSEDES (handled separately) and structural edges
-        # Note: REFERENCES is the most common edge type (entity mentions)
-        semantic_edges = ["RELATES_TO", "SUPPORTS", "FOLLOWS", "SIMILAR", "CONTAINS", "CHILD_OF", "REFERENCES"]
-        edge_filter = "|".join(semantic_edges)
-
-        query = f"""
-        UNWIND $uuids AS uuid
-        MATCH (m:Memory {{uuid: uuid}})
-        OPTIONAL MATCH (m)-[out:{edge_filter}]->()
-        WITH m, uuid, count(out) AS out_deg
-        OPTIONAL MATCH ()-[in:{edge_filter}]->(m)
-        RETURN uuid, out_deg, count(in) AS in_deg
-        """
-
-        result = self.graph.query(query, {"uuids": uuids})
-
-        degrees: dict[str, dict[str, int]] = {}
-        for row in result.result_set or []:
-            uuid, out_deg, in_deg = row[0], row[1] or 0, row[2] or 0
-            degrees[uuid] = {
-                "in_degree": in_deg,
-                "out_degree": out_deg,
-                "total": in_deg + out_deg,
-            }
-
-        # Fill in zeros for any UUIDs not found
-        for uuid in uuids:
-            if uuid not in degrees:
-                degrees[uuid] = {"in_degree": 0, "out_degree": 0, "total": 0}
-
-        return degrees
+        return self._graph_analytics.get_memory_degrees(uuids, project_id)
 
     def get_graph_normalization_stats(
         self,
@@ -4070,48 +3020,9 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Get statistics for normalizing graph scores.
 
-        Returns max degree and max pagerank for the project,
-        used to normalize graph scores to [0, 1] range.
-
-        Args:
-            project_id: Optional project filter
-
-        Returns:
-            Dict with max_degree, max_pagerank, avg_degree, node_count
+        Delegates to GraphAnalytics.
         """
-        if project_id:
-            query = """
-            MATCH (m:Memory {project_id: $project_id})
-            OPTIONAL MATCH (m)-[r]-()
-            WITH m, count(r) AS degree
-            RETURN max(degree) AS max_degree,
-                   avg(degree) AS avg_degree,
-                   max(m.pagerank) AS max_pagerank,
-                   count(m) AS node_count
-            """
-            result = self.graph.query(query, {"project_id": project_id})
-        else:
-            query = """
-            MATCH (m:Memory)
-            OPTIONAL MATCH (m)-[r]-()
-            WITH m, count(r) AS degree
-            RETURN max(degree) AS max_degree,
-                   avg(degree) AS avg_degree,
-                   max(m.pagerank) AS max_pagerank,
-                   count(m) AS node_count
-            """
-            result = self.graph.query(query)
-
-        if not result.result_set:
-            return {"max_degree": 1.0, "avg_degree": 0.0, "max_pagerank": 1.0, "node_count": 0}
-
-        row = result.result_set[0]
-        return {
-            "max_degree": float(row[0] or 1),
-            "avg_degree": float(row[1] or 0),
-            "max_pagerank": float(row[2] or 1),
-            "node_count": int(row[3] or 0),
-        }
+        return self._graph_analytics.get_graph_normalization_stats(project_id)
 
     def compute_and_cache_pagerank(
         self,
@@ -4121,50 +3032,11 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Compute PageRank using MAGE and cache scores on Memory nodes.
 
-        Should be called asynchronously (not on every write) to avoid
-        latency impact. Recommended: run every 5 minutes or after N writes.
-
-        Args:
-            project_id: Optional project filter (runs on subgraph)
-            max_iterations: Maximum PageRank iterations
-            damping_factor: PageRank damping factor (default: 0.85)
-
-        Returns:
-            Dict mapping uuid -> pagerank score
+        Delegates to GraphAnalytics.
         """
-        try:
-            # Run PageRank using MAGE
-            # Note: For project-scoped PageRank, we'd need to use graph projection
-            # For now, run on full graph and filter by project_id
-            query = """
-            CALL pagerank.get()
-            YIELD node, rank
-            WITH node, rank
-            WHERE node:Memory
-            SET node.pagerank = rank
-            RETURN node.uuid AS uuid, rank
-            """
-
-            result = self.graph.query(
-                query,
-                {
-                    "max_iterations": max_iterations,
-                    "damping_factor": damping_factor,
-                },
-            )
-
-            scores: dict[str, float] = {}
-            for row in result.result_set or []:
-                uuid, rank = row[0], row[1]
-                if project_id is None or True:  # Filter would go here
-                    scores[uuid] = float(rank)
-
-            return scores
-
-        except Exception as e:
-            # MAGE PageRank may not be available - re-raise for caller to handle
-            log.warning(f"PageRank computation failed (MAGE may not be installed): {e}")
-            raise RuntimeError(f"PageRank computation failed: {e}") from e
+        return self._graph_analytics.compute_and_cache_pagerank(
+            project_id, max_iterations, damping_factor
+        )
 
     def get_memory_pageranks(
         self,
@@ -4172,33 +3044,6 @@ class DatabaseManager:
     ) -> dict[str, float]:
         """Get cached PageRank scores for a list of memory UUIDs.
 
-        Returns cached scores from the pagerank property on Memory nodes.
-        If PageRank hasn't been computed, returns 0.0 for missing nodes.
-
-        Args:
-            uuids: List of memory UUIDs
-
-        Returns:
-            Dict mapping uuid -> pagerank score (0.0 if not cached)
+        Delegates to GraphAnalytics.
         """
-        if not uuids:
-            return {}
-
-        query = """
-        UNWIND $uuids AS uuid
-        MATCH (m:Memory {uuid: uuid})
-        RETURN uuid, coalesce(m.pagerank, 0.0) AS pagerank
-        """
-
-        result = self.graph.query(query, {"uuids": uuids})
-
-        scores: dict[str, float] = {}
-        for row in result.result_set or []:
-            scores[row[0]] = float(row[1])
-
-        # Fill in zeros for any UUIDs not found
-        for uuid in uuids:
-            if uuid not in scores:
-                scores[uuid] = 0.0
-
-        return scores
+        return self._graph_analytics.get_memory_pageranks(uuids)
