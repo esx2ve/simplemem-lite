@@ -92,7 +92,7 @@ def _cleanup_old_jobs() -> None:
             del _jobs[job_id]
 
 
-def _create_job(job_type: str, session_id: str) -> str:
+def _create_job(job_type: str, session_id: str, project_id: str | None = None) -> str:
     """Create a new job entry and return the job ID."""
     _cleanup_old_jobs()  # Cleanup before creating new job
     job_id = str(uuid.uuid4())
@@ -100,6 +100,7 @@ def _create_job(job_type: str, session_id: str) -> str:
         "id": job_id,
         "type": job_type,
         "session_id": session_id,
+        "project_id": project_id,  # Store for /indexed-sessions filtering
         "status": "pending",
         "progress": 0,
         "message": "",
@@ -200,7 +201,7 @@ async def process_trace(
 
     if request.background:
         # Background processing
-        job_id = _create_job("process_trace", request.session_id)
+        job_id = _create_job("process_trace", request.session_id, request.project_id)
         background_tasks.add_task(
             _process_trace_task, job_id, request.session_id, trace_data, request.project_id
         )
@@ -265,7 +266,7 @@ async def process_trace_batch(
             # Create job and queue background task
             # Per-trace project_id takes precedence, fallback to request-level
             effective_project_id = trace_input.project_id or request.project_id
-            job_id = _create_job("process_trace", trace_input.session_id)
+            job_id = _create_job("process_trace", trace_input.session_id, effective_project_id)
             background_tasks.add_task(_process_trace_task, job_id, trace_input.session_id, trace_data, effective_project_id)
 
             queued.append(trace_input.session_id)
@@ -403,4 +404,44 @@ async def cancel_job(job_id: str) -> dict:
     return {
         "cancelled": True,
         "message": f"Job {job_id} marked as cancelled",
+    }
+
+
+@router.get("/indexed-sessions")
+async def get_indexed_sessions(
+    project_id: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """Get list of session IDs that have been successfully processed.
+
+    Used by MCP to filter out already-indexed sessions from discovery results.
+
+    Args:
+        project_id: Optional project ID to filter by
+        limit: Maximum number of session IDs to return
+
+    Returns:
+        Dict with list of indexed session IDs
+    """
+    indexed_sessions = []
+
+    # Get session IDs from completed trace jobs
+    for job in _jobs.values():
+        if job.get("status") == "completed" and job.get("type") == "process_trace":
+            session_id = job.get("session_id")
+            job_project = job.get("project_id")
+
+            # Filter by project if specified
+            if project_id and job_project and job_project != project_id:
+                continue
+
+            if session_id and session_id not in indexed_sessions:
+                indexed_sessions.append(session_id)
+
+    # Limit results
+    indexed_sessions = indexed_sessions[:limit]
+
+    return {
+        "indexed_sessions": indexed_sessions,
+        "count": len(indexed_sessions),
     }
