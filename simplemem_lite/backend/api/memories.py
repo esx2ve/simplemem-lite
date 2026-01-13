@@ -1,5 +1,7 @@
 """Memory operations API endpoints."""
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
@@ -13,6 +15,7 @@ from simplemem_lite.backend.scoring import (
     rerank_results,
 )
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
+from simplemem_lite.backend.time_utils import parse_time_spec
 from simplemem_lite.backend.toon import toonify
 from simplemem_lite.log_config import get_logger
 from simplemem_lite.memory import MemoryItem, detect_contradictions
@@ -75,6 +78,19 @@ class SearchMemoriesRequest(BaseModel):
     output_format: str | None = Field(
         default=None,
         description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
+    )
+    # Temporal filtering options (NEW)
+    sort_by: Literal["relevance", "newest", "oldest"] = Field(
+        default="relevance",
+        description="Sort order: 'relevance' (vector + scoring), 'newest' (most recent first), 'oldest' (oldest first)",
+    )
+    since: str | None = Field(
+        default=None,
+        description="Only return memories created after this time. Supports relative ('2d', '1w', '30d') or ISO date ('2024-01-15')",
+    )
+    until: str | None = Field(
+        default=None,
+        description="Only return memories created before this time. Supports relative ('2d', '1w') or ISO date ('2024-01-15')",
     )
     # Temporal scoring options
     use_temporal_scoring: bool = Field(
@@ -184,14 +200,37 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
 
     Set use_temporal_scoring=False for pure vector similarity ranking.
 
+    Temporal filtering (since/until) and sorting (sort_by) can be used to
+    focus on recent memories and prevent context pollution from old data.
+
     When output_format="toon", returns tab-separated format for token efficiency.
     """
     require_project_id(request.project_id, "search_memories")
     try:
         store = get_memory_store()
+
+        # Parse temporal filters
+        since_ts = parse_time_spec(request.since) if request.since else None
+        until_ts = parse_time_spec(request.until) if request.until else None
+
+        # Validate time specs
+        if request.since and since_ts is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid 'since' format: '{request.since}'. Use relative (2d, 1w, 30d) or ISO date (2024-01-15).",
+            )
+        if request.until and until_ts is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid 'until' format: '{request.until}'. Use relative (2d, 1w) or ISO date (2024-01-15).",
+            )
+
+        # Fetch more results if filtering by time (to ensure we have enough after filtering)
+        fetch_limit = request.limit * 3 if (since_ts or until_ts) else request.limit
+
         results = store.search(
             query=request.query,
-            limit=request.limit,
+            limit=fetch_limit,
             use_graph=request.use_graph,
             type_filter=request.type_filter,
             project_id=request.project_id,
@@ -210,7 +249,38 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
             for m in results
         ]
 
-        # Apply temporal scoring if enabled
+        # Apply temporal filtering (since/until)
+        if since_ts or until_ts:
+            filtered_dicts = []
+            for m in result_dicts:
+                created_at = m.get("created_at", 0)
+                # Skip memories without created_at (include them to be safe)
+                if created_at == 0:
+                    filtered_dicts.append(m)
+                    continue
+                # Apply since filter
+                if since_ts and created_at < since_ts:
+                    continue
+                # Apply until filter
+                if until_ts and created_at > until_ts:
+                    continue
+                filtered_dicts.append(m)
+            result_dicts = filtered_dicts
+            log.debug(f"Temporal filter applied: {len(filtered_dicts)} results (since={since_ts}, until={until_ts})")
+
+        # Apply sort_by (before other scoring if not relevance)
+        if request.sort_by == "newest":
+            # Sort by created_at descending (newest first)
+            result_dicts = sorted(result_dicts, key=lambda m: m.get("created_at", 0), reverse=True)
+        elif request.sort_by == "oldest":
+            # Sort by created_at ascending (oldest first)
+            result_dicts = sorted(result_dicts, key=lambda m: m.get("created_at", 0))
+        # For "relevance", keep the vector similarity order and apply scoring below
+
+        # Limit results after filtering/sorting
+        result_dicts = result_dicts[:request.limit]
+
+        # Apply temporal scoring if enabled (only for relevance sort)
         if request.use_temporal_scoring and result_dicts:
             # Validate weights sum to ~1.0
             total_weight = request.vector_weight + request.temporal_weight + request.importance_weight

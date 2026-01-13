@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from simplemem_lite.backend.config import get_config
 from simplemem_lite.backend.scoring import rerank_results
+from simplemem_lite.backend.time_utils import parse_time_spec
 from simplemem_lite.backend.services import (
     get_code_indexer,
     get_hierarchical_indexer,
@@ -140,6 +141,19 @@ class RecallRequest(BaseModel):
         description="Search mode: fast (vector search), deep (reranked), ask (LLM synthesis)",
     )
     limit: int = Field(default=10, ge=1, le=100, description="Max results")
+    # Temporal filtering options
+    sort_by: Literal["relevance", "newest", "oldest"] = Field(
+        default="relevance",
+        description="Sort order: 'relevance' (vector similarity), 'newest' (most recent first), 'oldest' (oldest first)",
+    )
+    since: str | None = Field(
+        default=None,
+        description="Only return memories created after this time. Supports relative ('2d', '1w', '30d') or ISO date ('2024-01-15')",
+    )
+    until: str | None = Field(
+        default=None,
+        description="Only return memories created before this time. Supports relative ('2d', '1w') or ISO date ('2024-01-15')",
+    )
     output_format: str | None = Field(
         default=None,
         description="Response format: 'toon' (default) or 'json'",
@@ -226,11 +240,43 @@ async def recall(request: RecallRequest) -> dict:
             )
         query: str = request.query
 
+        # Parse temporal filters once (used by fast and deep modes)
+        since_ts = parse_time_spec(request.since) if request.since else None
+        until_ts = parse_time_spec(request.until) if request.until else None
+
+        def _apply_temporal_filter(result_dicts: list[dict]) -> list[dict]:
+            """Apply temporal filtering and sorting to results."""
+            if since_ts or until_ts:
+                filtered = []
+                for m in result_dicts:
+                    created_at = m.get("created_at", 0)
+                    if created_at == 0:
+                        # No timestamp - include by default
+                        filtered.append(m)
+                        continue
+                    if since_ts and created_at < since_ts:
+                        continue
+                    if until_ts and created_at > until_ts:
+                        continue
+                    filtered.append(m)
+                result_dicts = filtered
+
+            # Apply sort_by
+            if request.sort_by == "newest":
+                result_dicts = sorted(result_dicts, key=lambda m: m.get("created_at", 0), reverse=True)
+            elif request.sort_by == "oldest":
+                result_dicts = sorted(result_dicts, key=lambda m: m.get("created_at", 0))
+            # else: "relevance" - keep original order
+
+            return result_dicts
+
         if request.mode == "fast":
             # Standard vector search with graph enhancement
+            # Fetch more if filtering by time
+            fetch_limit = request.limit * 3 if (since_ts or until_ts) else request.limit
             results = store.search(
                 query=query,
-                limit=request.limit,
+                limit=fetch_limit,
                 use_graph=True,
                 project_id=request.project,
             )
@@ -241,14 +287,22 @@ async def recall(request: RecallRequest) -> dict:
                     "content": m.content,
                     "type": m.type,
                     "score": m.score,
+                    "created_at": m.created_at,
                 }
                 for m in results
             ]
+            # Apply temporal filtering and sorting
+            result_dicts = _apply_temporal_filter(result_dicts)
+            # Limit to requested count
+            result_dicts = result_dicts[:request.limit]
             return {"results": result_dicts}
 
         elif request.mode == "deep":
             # LLM-reranked search with conflict detection
-            rerank_pool = request.limit * 2
+            # Fetch more if filtering by time
+            base_rerank_pool = request.limit * 2
+            fetch_multiplier = 3 if (since_ts or until_ts) else 1
+            rerank_pool = base_rerank_pool * fetch_multiplier
             results = store.search(
                 query=query,
                 limit=rerank_pool,
@@ -266,12 +320,14 @@ async def recall(request: RecallRequest) -> dict:
                 }
                 for m in results
             ]
-            # Apply LLM reranking
+            # Apply temporal filtering first (before reranking)
+            result_dicts = _apply_temporal_filter(result_dicts)
+            # Apply LLM reranking on filtered results
             reranked = await rerank_results(
                 query=query,
                 results=result_dicts,
                 top_k=request.limit,
-                rerank_pool=rerank_pool,
+                rerank_pool=len(result_dicts),
             )
             return {
                 "results": reranked.get("reranked", result_dicts[:request.limit]),
