@@ -11,15 +11,17 @@ import subprocess
 import threading
 import time
 import uuid as uuid_lib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import pathspec
 
+from simplemem_lite.ast_chunker import chunk_file, CodeChunk
 from simplemem_lite.config import Config
 from simplemem_lite.db import DatabaseManager
-from simplemem_lite.embeddings import embed, embed_batch
-from simplemem_lite.log_config import get_logger
+from simplemem_lite.embeddings import embed_code_batch
+from simplemem_lite.log_config import get_logger, log_timing
 from simplemem_lite.projects_utils import get_project_id
 
 log = get_logger("code_index")
@@ -737,7 +739,7 @@ class CodeIndexer:
         filepath: str,
         project_id: str,
     ) -> int:
-        """Index content of a single file.
+        """Index content of a single file using AST-aware chunking.
 
         Args:
             content: File content as string
@@ -751,26 +753,55 @@ class CodeIndexer:
         if not content.strip():
             return 0
 
-        # Split into chunks
-        chunks = self._split_code(content, filepath)
-        if not chunks:
+        # AST-aware chunking with Tree-sitter (semantic code chunking)
+        with log_timing(f"AST chunking {filepath}", log, level="trace"):
+            ast_chunks: list[CodeChunk] = chunk_file(content, filepath)
+        if not ast_chunks:
+            log.debug(f"No chunks extracted from {filepath}")
             return 0
 
-        # Generate embeddings for all chunks
-        texts = [c["content"] for c in chunks]
-        embeddings = embed_batch(texts, self.config)
+        log.debug(f"AST chunked {filepath}: {len(ast_chunks)} semantic chunks")
 
-        # Prepare records for database
+        # Generate code embeddings with fallback chain (Voyage → OpenRouter → Local)
+        texts = [c.content for c in ast_chunks]
+
+        # Check if project has existing chunks and get expected dimension
+        expected_dim = self.db.get_code_embedding_dimension(project_id)
+
+        with log_timing(f"Embedding {len(texts)} chunks", log, level="trace"):
+            embedding_result = embed_code_batch(
+                texts,
+                self.config,
+                expected_dim=expected_dim,
+            )
+
+        log.trace(
+            f"Embeddings: provider={embedding_result.provider}, "
+            f"model={embedding_result.model}, dim={embedding_result.dimension}, "
+            f"elapsed={embedding_result.elapsed_ms:.1f}ms"
+        )
+
+        # Prepare records with rich metadata
+        indexed_at = datetime.now(timezone.utc).isoformat()
         records = []
-        for chunk, embedding in zip(chunks, embeddings):
+        for chunk, embedding in zip(ast_chunks, embedding_result.embeddings):
             records.append({
                 "uuid": str(uuid_lib.uuid4()),
                 "vector": embedding,
-                "content": chunk["content"],
+                "content": chunk.content,
                 "filepath": filepath,
                 "project_id": project_id,
-                "start_line": chunk["start_line"],
-                "end_line": chunk["end_line"],
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                # New AST metadata fields
+                "function_name": chunk.function_name,
+                "class_name": chunk.class_name,
+                "language": chunk.language,
+                "node_type": chunk.node_type,
+                # Timestamp and embedding provenance
+                "indexed_at": indexed_at,
+                "embedding_model": embedding_result.model,
+                "embedding_dim": embedding_result.dimension,
             })
 
         # Add to vector database
@@ -794,7 +825,7 @@ class CodeIndexer:
         return len(records)
 
     def _index_file(self, file_path: Path, project_root: Path, project_id: str) -> int:
-        """Index a single file.
+        """Index a single file using AST-aware chunking.
 
         Args:
             file_path: Path to the file
@@ -816,27 +847,57 @@ class CodeIndexer:
         if not content.strip():
             return 0
 
-        # Split into chunks
-        chunks = self._split_code(content, str(file_path))
-        if not chunks:
+        relative_path = str(file_path.relative_to(project_root))
+
+        # AST-aware chunking with Tree-sitter (semantic code chunking)
+        with log_timing(f"AST chunking {relative_path}", log, level="trace"):
+            ast_chunks: list[CodeChunk] = chunk_file(content, relative_path)
+        if not ast_chunks:
+            log.debug(f"No chunks extracted from {relative_path}")
             return 0
 
-        # Generate embeddings for all chunks
-        texts = [c["content"] for c in chunks]
-        embeddings = embed_batch(texts, self.config)
+        log.debug(f"AST chunked {relative_path}: {len(ast_chunks)} semantic chunks")
 
-        # Prepare records for database
+        # Generate code embeddings with fallback chain (Voyage → OpenRouter → Local)
+        texts = [c.content for c in ast_chunks]
+
+        # Check if project has existing chunks and get expected dimension
+        expected_dim = self.db.get_code_embedding_dimension(project_id)
+
+        with log_timing(f"Embedding {len(texts)} chunks", log, level="trace"):
+            embedding_result = embed_code_batch(
+                texts,
+                self.config,
+                expected_dim=expected_dim,
+            )
+
+        log.trace(
+            f"Embeddings: provider={embedding_result.provider}, "
+            f"model={embedding_result.model}, dim={embedding_result.dimension}, "
+            f"elapsed={embedding_result.elapsed_ms:.1f}ms"
+        )
+
+        # Prepare records with rich metadata
+        indexed_at = datetime.now(timezone.utc).isoformat()
         records = []
-        relative_path = str(file_path.relative_to(project_root))
-        for chunk, embedding in zip(chunks, embeddings):
+        for chunk, embedding in zip(ast_chunks, embedding_result.embeddings):
             records.append({
                 "uuid": str(uuid_lib.uuid4()),
                 "vector": embedding,
-                "content": chunk["content"],
+                "content": chunk.content,
                 "filepath": relative_path,
                 "project_id": project_id,
-                "start_line": chunk["start_line"],
-                "end_line": chunk["end_line"],
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                # New AST metadata fields
+                "function_name": chunk.function_name,
+                "class_name": chunk.class_name,
+                "language": chunk.language,
+                "node_type": chunk.node_type,
+                # Timestamp and embedding provenance
+                "indexed_at": indexed_at,
+                "embedding_model": embedding_result.model,
+                "embedding_dim": embedding_result.dimension,
             })
 
         # Add to vector database
@@ -1154,7 +1215,11 @@ class CodeIndexer:
         limit: int = 10,
         project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search the code index.
+        """Search the code index using code-optimized embeddings.
+
+        Uses the same embedding model as the indexed chunks to ensure
+        query-document compatibility. Respects dimension constraints
+        to prevent mismatches.
 
         Args:
             query: Search query
@@ -1162,17 +1227,28 @@ class CodeIndexer:
             project_id: Optional filter by project (canonical identifier)
 
         Returns:
-            List of matching code chunks with scores
+            List of matching code chunks with scores and metadata
         """
         log.info(f"Code search: '{query[:50]}...' limit={limit} project_id={project_id}")
 
-        # Generate query embedding
-        query_vector = embed(query, self.config)
+        # Get expected dimension from existing index (if any)
+        expected_dim = self.db.get_code_embedding_dimension(project_id)
+
+        # Generate query embedding using same model as indexed chunks
+        with log_timing(f"Query embedding", log, level="trace"):
+            embedding_result = embed_code_batch(
+                [query],
+                self.config,
+                expected_dim=expected_dim,
+            )
+        query_vector = embedding_result.embeddings[0]
+
+        log.trace(f"Query embedded: dim={len(query_vector)}, provider={embedding_result.provider}")
 
         # Search
         results = self.db.search_code(query_vector, limit, project_id)
 
-        # Format results
+        # Format results with rich metadata
         formatted = []
         for r in results:
             formatted.append({
@@ -1183,13 +1259,21 @@ class CodeIndexer:
                 "end_line": r.get("end_line", 0),
                 "project_id": r.get("project_id", ""),
                 "score": 1.0 - r.get("_distance", 0.0),  # Convert distance to similarity
+                # AST metadata (may be None for legacy chunks)
+                "function_name": r.get("function_name"),
+                "class_name": r.get("class_name"),
+                "language": r.get("language"),
+                "node_type": r.get("node_type"),
+                # Provenance metadata
+                "indexed_at": r.get("indexed_at"),
+                "embedding_model": r.get("embedding_model"),
             })
 
         log.info(f"Code search returned {len(formatted)} results")
         return formatted
 
     def get_chunk(self, uuid: str) -> dict | None:
-        """Retrieve a specific code chunk by UUID.
+        """Retrieve a specific code chunk by UUID with full metadata.
 
         Use this to fetch full content for a chunk found via search().
 
@@ -1197,7 +1281,7 @@ class CodeIndexer:
             uuid: Code chunk UUID
 
         Returns:
-            Code chunk dict if found, None otherwise
+            Code chunk dict with all metadata if found, None otherwise
         """
         log.info(f"Code get_chunk: uuid={uuid[:8]}...")
         result = self.db.get_code_chunk_by_uuid(uuid)
@@ -1210,6 +1294,14 @@ class CodeIndexer:
                 "start_line": result.get("start_line", 0),
                 "end_line": result.get("end_line", 0),
                 "project_id": result.get("project_id", ""),
+                # AST metadata
+                "function_name": result.get("function_name"),
+                "class_name": result.get("class_name"),
+                "language": result.get("language"),
+                "node_type": result.get("node_type"),
+                # Provenance metadata
+                "indexed_at": result.get("indexed_at"),
+                "embedding_model": result.get("embedding_model"),
             }
 
         return None
@@ -1397,3 +1489,205 @@ class CodeIndexer:
 
         log.info(f"Staleness check: is_stale={result['is_stale']}, reason={result['reason']}")
         return result
+
+    # ═══════════════════════════════════════════════════════════════════════════════
+    # P5: LLM-POWERED CODE QUESTION ANSWERING
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def ask_codebase(
+        self,
+        query: str,
+        max_chunks: int = 8,
+        project_id: str | None = None,
+        include_raw: bool = False,
+    ) -> dict[str, Any]:
+        """LLM-powered question answering over indexed code.
+
+        Retrieves relevant code chunks via semantic search, then uses an LLM
+        to synthesize a coherent answer grounded in the actual code.
+
+        Args:
+            query: Natural language question about the codebase
+            max_chunks: Maximum code chunks to include in context (default: 8)
+            project_id: Optional filter by project (for cross-project isolation)
+            include_raw: Include raw chunk data in response (default: False)
+
+        Returns:
+            Dictionary with:
+            - answer: LLM-synthesized answer with citations [1], [2], etc.
+            - chunks_used: Number of code chunks in context
+            - confidence: high/medium/low based on relevance scores
+            - sources: List of source code chunk metadata (filepath, lines, etc.)
+        """
+        from litellm import acompletion
+
+        log.info(f"ask_codebase: query='{query[:50]}...', max_chunks={max_chunks}, project={project_id}")
+
+        # Step 1: Retrieve relevant code chunks via semantic search
+        results = self.search(query, limit=max_chunks, project_id=project_id)
+
+        if not results:
+            log.info("ask_codebase: No relevant code chunks found")
+            return {
+                "answer": "I couldn't find any relevant code to answer this question. "
+                          "The codebase may not be indexed, or the query may not match any indexed code.",
+                "chunks_used": 0,
+                "confidence": "none",
+                "sources": [],
+            }
+
+        # Step 2: Format code chunks for LLM context
+        formatted_chunks = self._format_chunks_for_llm(results)
+
+        # Step 3: Calculate confidence based on relevance scores
+        avg_score = sum(r.get("score", 0) for r in results) / len(results)
+        if avg_score >= 0.5:
+            confidence = "high"
+        elif avg_score >= 0.25:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Step 4: Build the reasoning prompt
+        prompt = f'''You are a code-understanding assistant that answers questions about a codebase using retrieved code snippets.
+
+## Retrieved Code Snippets (ranked by relevance)
+{formatted_chunks}
+
+## Rules
+1. Answer ONLY using information from the code snippets above
+2. Cite sources using [1], [2], etc. when referencing specific code
+3. If the code snippets don't contain enough information, say "Based on the indexed code, I cannot fully answer this, but here's what I found: ..."
+4. Include specific function/class names, file paths, and line numbers in your answer
+5. Be concise and technically accurate
+6. Focus on explaining HOW the code works, not just describing it
+
+## Question
+{query}
+
+## Answer (with citations)'''
+
+        # Step 5: Call LLM for synthesis
+        try:
+            response = await acompletion(
+                model=self.config.summary_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,  # Allow longer answers for code explanations
+                temperature=0.1,  # Very low temperature for code accuracy
+            )
+            answer = response.choices[0].message.content
+        except Exception as e:
+            log.error(f"ask_codebase LLM call failed: {e}")
+            answer = f"Error generating answer: {e}"
+            confidence = "error"
+
+        log.info(f"ask_codebase complete: {len(results)} chunks, confidence={confidence}")
+
+        result = {
+            "answer": answer,
+            "chunks_used": len(results),
+            "confidence": confidence,
+            "sources": [
+                {
+                    "index": i + 1,
+                    "filepath": r.get("filepath", ""),
+                    "start_line": r.get("start_line", 0),
+                    "end_line": r.get("end_line", 0),
+                    "function_name": r.get("function_name"),
+                    "class_name": r.get("class_name"),
+                    "node_type": r.get("node_type"),
+                    "score": round(r.get("score", 0), 3),
+                }
+                for i, r in enumerate(results)
+            ],
+        }
+
+        if include_raw:
+            result["raw_chunks"] = results
+
+        return result
+
+    def _format_chunks_for_llm(self, chunks: list[dict[str, Any]]) -> str:
+        """Format code chunks with metadata for LLM context.
+
+        Args:
+            chunks: List of code chunk dicts from search()
+
+        Returns:
+            Formatted string with numbered code snippets and metadata
+        """
+        formatted = []
+        for i, chunk in enumerate(chunks, 1):
+            # Build metadata header
+            meta_parts = []
+
+            # Location info
+            filepath = chunk.get("filepath", "unknown")
+            start_line = chunk.get("start_line", 0)
+            end_line = chunk.get("end_line", 0)
+            meta_parts.append(f"File: {filepath}")
+            meta_parts.append(f"Lines: {start_line}-{end_line}")
+
+            # AST metadata
+            node_type = chunk.get("node_type")
+            if node_type:
+                meta_parts.append(f"Type: {node_type}")
+
+            func_name = chunk.get("function_name")
+            if func_name:
+                meta_parts.append(f"Function: {func_name}")
+
+            class_name = chunk.get("class_name")
+            if class_name:
+                meta_parts.append(f"Class: {class_name}")
+
+            language = chunk.get("language")
+            if language:
+                meta_parts.append(f"Language: {language}")
+
+            # Relevance score
+            score = chunk.get("score", 0)
+            meta_parts.append(f"Relevance: {score:.2f}")
+
+            # Format the code block
+            content = chunk.get("content", "")
+            lang_hint = language or self._infer_language(filepath)
+
+            formatted.append(
+                f"[{i}] {' | '.join(meta_parts)}\n"
+                f"```{lang_hint}\n{content}\n```"
+            )
+
+        return "\n\n".join(formatted)
+
+    def _infer_language(self, filepath: str) -> str:
+        """Infer language from file extension for syntax highlighting.
+
+        Args:
+            filepath: File path
+
+        Returns:
+            Language name for markdown code block
+        """
+        suffix = Path(filepath).suffix.lower()
+        lang_map = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".jsx": "jsx",
+            ".tsx": "tsx",
+            ".rs": "rust",
+            ".go": "go",
+            ".java": "java",
+            ".c": "c",
+            ".cpp": "cpp",
+            ".h": "c",
+            ".hpp": "cpp",
+            ".rb": "ruby",
+            ".php": "php",
+            ".swift": "swift",
+            ".kt": "kotlin",
+            ".scala": "scala",
+            ".cs": "csharp",
+        }
+        return lang_map.get(suffix, "")

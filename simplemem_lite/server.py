@@ -2152,6 +2152,94 @@ async def search_code(
 
 
 @mcp.tool()
+async def ask_codebase(
+    query: str,
+    max_chunks: int = 8,
+    project_id: str | None = None,
+) -> dict:
+    """Ask a question about the codebase and get an LLM-synthesized answer.
+
+    Retrieves relevant code chunks via semantic search, then uses an LLM
+    to synthesize a coherent answer grounded in the actual code.
+
+    The answer includes citations [1], [2], etc. referencing specific code
+    locations. Each citation maps to a source in the "sources" list, which
+    includes filepath, line numbers, and function/class names.
+
+    WHEN TO USE:
+    - Understanding code: "How does the authentication flow work?"
+    - Finding implementations: "Where is rate limiting implemented?"
+    - Architecture questions: "How do the API endpoints handle errors?"
+    - Before making changes: "How is the cache invalidation logic structured?"
+    - Code review: "What patterns are used for database connections?"
+
+    WHEN NOT TO USE:
+    - For exact text matches (use grep/ripgrep instead)
+    - For simple code location (use search_code for raw results)
+    - For files that haven't been indexed (use index_directory first)
+    - For memory/insight search (use ask_memories instead)
+
+    PREREQUISITE: The codebase must be indexed first using index_directory().
+    If no results found, the codebase may not be indexed.
+
+    EXAMPLES:
+        # Understand a feature
+        ask_codebase(query="How does user authentication work?")
+
+        # Find implementation patterns
+        ask_codebase(
+            query="What error handling patterns are used in API endpoints?",
+            max_chunks=12  # More context for complex questions
+        )
+
+        # Scope to specific project
+        ask_codebase(
+            query="How is the database connection pool managed?",
+            project_id="git:github.com/user/myproject"
+        )
+
+    Args:
+        query: Natural language question about the codebase.
+               Be descriptive: "How does the JWT token validation work?"
+               is better than just "JWT".
+        max_chunks: Maximum code chunks to include in LLM context (default: 8).
+                    Increase for complex questions, decrease for faster responses.
+        project_id: Filter to specific project (recommended). Auto-inferred
+                    from cwd if not specified.
+
+    Returns:
+        {
+            "answer": "The authentication flow works by... [1] ... [2]",
+            "chunks_used": 6,
+            "confidence": "high",  # high/medium/low based on relevance
+            "sources": [
+                {
+                    "index": 1,
+                    "filepath": "src/auth/handler.py",
+                    "start_line": 45,
+                    "end_line": 78,
+                    "function_name": "validate_token",
+                    "class_name": "AuthHandler",
+                    "node_type": "function",
+                    "score": 0.89
+                },
+                ...
+            ]
+        }
+    """
+    log.info(f"Tool: ask_codebase called (query='{query[:50]}...', max_chunks={max_chunks}, project_id={project_id})")
+
+    result = await _deps.code_indexer.ask_codebase(
+        query=query,
+        max_chunks=max_chunks,
+        project_id=project_id,
+    )
+
+    log.info(f"Tool: ask_codebase complete: confidence={result['confidence']}, chunks={result['chunks_used']}")
+    return result
+
+
+@mcp.tool()
 async def get_memory(uuid: str) -> dict:
     """Fetch full content of a specific memory by UUID.
 

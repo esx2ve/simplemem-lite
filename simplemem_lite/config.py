@@ -121,6 +121,39 @@ class Config:
         default_factory=lambda: int(_get_env("CODE_CHUNK_OVERLAP", "150"))
     )
 
+    # Code embedding provider settings (voyage | openrouter | local)
+    code_embedding_provider: str = field(
+        default_factory=lambda: _get_env("CODE_EMBEDDING_PROVIDER", "voyage")
+    )
+
+    # Voyage AI settings (default provider for code embeddings)
+    voyage_api_key: str | None = field(
+        default_factory=lambda: os.getenv("VOYAGE_API_KEY")
+    )
+    voyage_code_model: str = field(
+        default_factory=lambda: _get_env("VOYAGE_CODE_MODEL", "voyage-code-3")
+    )
+
+    # Local code embedding model (fallback)
+    code_local_model: str = field(
+        default_factory=lambda: _get_env("CODE_LOCAL_MODEL", "jinaai/jina-embeddings-v2-base-code")
+    )
+
+    # OpenRouter fallback model for code embeddings
+    openrouter_code_model: str = field(
+        default_factory=lambda: _get_env("OPENROUTER_CODE_MODEL", "openai/text-embedding-3-large")
+    )
+
+    # AST chunking settings
+    ast_chunking_enabled: bool = field(
+        default_factory=lambda: _get_env_bool("AST_CHUNKING_ENABLED", True)
+    )
+
+    # Optional dimension override (useful when using non-default models)
+    code_embedding_dim_override: int | None = field(
+        default_factory=lambda: int(_get_env("CODE_EMBEDDING_DIM", "0")) or None
+    )
+
     # Embedding cache size (number of embeddings to cache in memory)
     embedding_cache_size: int = field(
         default_factory=lambda: int(_get_env("EMBEDDING_CACHE_SIZE", "1000"))
@@ -175,6 +208,30 @@ class Config:
         # OpenAI text-embedding-3-small produces 1536-dim vectors
         return 1536
 
+    @property
+    def code_embedding_dim(self) -> int:
+        """Get code embedding dimension based on provider/model.
+
+        Returns dimension for the configured code embedding provider.
+        Used for LanceDB vector table schema.
+
+        Can be overridden via SIMPLEMEM_LITE_CODE_EMBEDDING_DIM env var
+        when using non-default models.
+        """
+        # Allow explicit override for non-default models
+        if self.code_embedding_dim_override:
+            return self.code_embedding_dim_override
+
+        if self.code_embedding_provider == "local":
+            # jina-embeddings-v2-base-code produces 768-dim vectors
+            return 768
+        elif self.code_embedding_provider == "voyage":
+            # voyage-code-3 produces 1024-dim vectors
+            return 1024
+        else:  # openrouter
+            # text-embedding-3-large produces 3072-dim vectors
+            return 3072
+
     def __post_init__(self):
         """Ensure paths are Path objects and directories exist."""
         log.trace("Initializing Config")
@@ -200,6 +257,12 @@ class Config:
         log.debug(f"falkor_host={self.falkor_host}, falkor_port={self.falkor_port}, falkor_password={'***' if self.falkor_password else 'None'}")
         log.debug(f"code_index_enabled={self.code_index_enabled}")
         log.debug(f"code_index_patterns={self.code_index_patterns}")
+        log.debug(f"code_embedding_provider={self.code_embedding_provider}")
+        log.debug(f"voyage_api_key={'***' if self.voyage_api_key else 'None'}")
+        log.debug(f"voyage_code_model={self.voyage_code_model}")
+        log.debug(f"code_local_model={self.code_local_model}")
+        log.debug(f"code_embedding_dim={self.code_embedding_dim}")
+        log.debug(f"ast_chunking_enabled={self.ast_chunking_enabled}")
         log.info(f"Config initialized: data_dir={self.data_dir}, traces={self.claude_traces_dir}")
 
     @property

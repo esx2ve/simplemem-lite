@@ -5,12 +5,54 @@ Logs are stored in ~/.simplemem_lite/logs/ with:
 - Rotation at 10 MB per file
 - Retention of 7 days
 - Compression of old logs
+
+Environment variables for log level control:
+- SIMPLEMEM_LITE_LOG_LEVEL: Global log level (default: INFO)
+- SIMPLEMEM_LITE_LOG_AST: AST chunker log level
+- SIMPLEMEM_LITE_LOG_EMBEDDINGS: Embedding provider log level
+- SIMPLEMEM_LITE_LOG_INDEXER: Code indexer log level
 """
 
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from time import perf_counter
 
 from loguru import logger
+
+# Get global log level from environment
+_global_log_level = os.getenv("SIMPLEMEM_LITE_LOG_LEVEL", "INFO").upper()
+
+# Component-specific log level overrides
+_component_log_levels: dict[str, str] = {
+    "ast_chunker": os.getenv("SIMPLEMEM_LITE_LOG_AST", "").upper(),
+    "embeddings": os.getenv("SIMPLEMEM_LITE_LOG_EMBEDDINGS", "").upper(),
+    "code_index": os.getenv("SIMPLEMEM_LITE_LOG_INDEXER", "").upper(),
+}
+
+
+def _log_filter(record) -> bool:
+    """Filter log records based on global and component-specific log levels.
+
+    Allows component-specific log level overrides while respecting global level.
+    """
+    name = record["extra"].get("name", "")
+
+    # Check component overrides first
+    for component, level in _component_log_levels.items():
+        if level and component in name:
+            try:
+                return record["level"].no >= logger.level(level).no
+            except ValueError:
+                pass  # Invalid level, fall through to global
+
+    # Fallback to global level
+    try:
+        return record["level"].no >= logger.level(_global_log_level).no
+    except ValueError:
+        return True  # If level parsing fails, allow the message
+
 
 # Remove default handler
 logger.remove()
@@ -19,10 +61,11 @@ logger.remove()
 _log_dir = Path.home() / ".simplemem_lite" / "logs"
 _log_dir.mkdir(parents=True, exist_ok=True)
 
-# Console handler - INFO level, colored
+# Console handler - uses filter for level control (allows component overrides)
 logger.add(
     sys.stderr,
-    level="INFO",
+    level=0,  # Accept all, let filter decide
+    filter=_log_filter,
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
     colorize=True,
 )
@@ -61,5 +104,32 @@ def get_logger(name: str):
     return logger.bind(name=name)
 
 
-# Export configured logger
-__all__ = ["logger", "get_logger"]
+@contextmanager
+def log_timing(operation: str, log_instance=None, level: str = "debug"):
+    """Context manager for timing operations with automatic logging.
+
+    Args:
+        operation: Description of the operation being timed
+        log_instance: Logger instance (uses global logger if None)
+        level: Log level for the timing message (default: debug)
+
+    Yields:
+        dict with 'elapsed_ms' key (populated after context exits)
+
+    Example:
+        with log_timing("AST parsing", log) as timing:
+            tree = parser.parse(content)
+        # timing['elapsed_ms'] now contains the elapsed time
+    """
+    log_fn = log_instance or logger
+    timing = {"elapsed_ms": 0.0}
+    start = perf_counter()
+    try:
+        yield timing
+    finally:
+        timing["elapsed_ms"] = (perf_counter() - start) * 1000
+        getattr(log_fn, level)(f"{operation}: {timing['elapsed_ms']:.1f}ms")
+
+
+# Export configured logger and utilities
+__all__ = ["logger", "get_logger", "log_timing"]

@@ -55,13 +55,19 @@ falkordb = [
 memgraph = [
     "neo4j>=5.0.0",
 ]
+# Code indexing with AST parsing and code-specific embeddings
+code = [
+    "tree-sitter>=0.21.0,<0.22.0",  # Pin to 0.21.x for tree-sitter-languages compatibility
+    "tree-sitter-languages>=1.10.0",
+    "voyageai>=0.3.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
 ]
 all = [
-    "simplemem-lite[local,falkordb,memgraph,dev]",
+    "simplemem-lite[local,falkordb,memgraph,code,dev]",
 ]
 
 [project.scripts]

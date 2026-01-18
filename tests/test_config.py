@@ -100,5 +100,98 @@ class TestConfigLimitsArePositive:
         assert config.cross_session_limit > 0
 
 
+class TestCodeEmbeddingConfig:
+    """Test code embedding configuration fields."""
+
+    def test_code_embedding_provider_default(self):
+        """Code embedding provider should default to voyage."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        assert config.code_embedding_provider == "voyage"
+
+    def test_voyage_code_model_default(self):
+        """Voyage code model should default to voyage-code-3."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        assert config.voyage_code_model == "voyage-code-3"
+
+    def test_code_local_model_default(self):
+        """Local code model should default to jina."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        assert config.code_local_model == "jinaai/jina-embeddings-v2-base-code"
+
+    def test_openrouter_code_model_default(self):
+        """OpenRouter code model should default to text-embedding-3-large."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        assert config.openrouter_code_model == "openai/text-embedding-3-large"
+
+    def test_ast_chunking_enabled_default(self):
+        """AST chunking should be enabled by default."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        assert config.ast_chunking_enabled is True
+
+
+class TestCodeEmbeddingDimensions:
+    """Test code embedding dimension property."""
+
+    def test_voyage_dimension(self):
+        """Voyage embeddings should have 1024 dimensions."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        config.code_embedding_provider = "voyage"
+        assert config.code_embedding_dim == 1024
+
+    def test_local_dimension(self):
+        """Local jina embeddings should have 768 dimensions."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        config.code_embedding_provider = "local"
+        assert config.code_embedding_dim == 768
+
+    def test_openrouter_dimension(self):
+        """OpenRouter embeddings should have 3072 dimensions."""
+        from simplemem_lite.config import Config
+
+        config = Config()
+        config.code_embedding_provider = "openrouter"
+        assert config.code_embedding_dim == 3072
+
+
+class TestCodeEmbeddingEnvOverrides:
+    """Test environment variable overrides for code embedding config."""
+
+    def test_code_embedding_provider_env_override(self):
+        """Code embedding provider should be overridable via env var."""
+        with patch.dict(os.environ, {"SIMPLEMEM_LITE_CODE_EMBEDDING_PROVIDER": "local"}):
+            from importlib import reload
+
+            import simplemem_lite.config as config_module
+
+            reload(config_module)
+            config = config_module.Config()
+            assert config.code_embedding_provider == "local"
+
+    def test_voyage_api_key_env(self):
+        """Voyage API key should be read from environment."""
+        with patch.dict(os.environ, {"VOYAGE_API_KEY": "test-key-123"}):
+            from importlib import reload
+
+            import simplemem_lite.config as config_module
+
+            reload(config_module)
+            config = config_module.Config()
+            assert config.voyage_api_key == "test-key-123"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

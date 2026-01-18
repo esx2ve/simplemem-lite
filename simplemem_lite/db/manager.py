@@ -293,25 +293,49 @@ class DatabaseManager:
             self._init_code_table()
 
     def _init_code_table(self) -> None:
-        """Initialize LanceDB table for code chunks.
+        """Initialize LanceDB table for code chunks with AST metadata.
+
+        Schema includes:
+        - Core fields: uuid, vector, content, filepath, project_id, start_line, end_line
+        - AST metadata: function_name, class_name, language, node_type
+        - Provenance: indexed_at, embedding_model, embedding_dim
+
+        NOTE: Vector dimension is determined by the embedding provider at runtime.
+        The configured embedding_dim is used for the schema, but actual vectors
+        may have different dimensions based on which provider is used (Voyage=1024,
+        OpenRouter=3072, Local=768). The embed_code_batch function handles
+        dimension validation to prevent mismatches.
 
         Includes corruption recovery: if the table exists but is corrupted,
         it will be dropped and recreated automatically.
         """
         log.trace("Checking code_chunks table")
 
+        # Use code embedding dimension from config (1024 for Voyage)
+        code_dim = self.config.code_embedding_dim
+
         schema = pa.schema([
+            # Core fields
             pa.field("uuid", pa.string()),
-            pa.field("vector", pa.list_(pa.float32(), self.config.embedding_dim)),
+            pa.field("vector", pa.list_(pa.float32(), code_dim)),
             pa.field("content", pa.string()),
             pa.field("filepath", pa.string()),
             pa.field("project_id", pa.string()),
             pa.field("start_line", pa.int32()),
             pa.field("end_line", pa.int32()),
+            # AST metadata fields (from Tree-sitter chunking)
+            pa.field("function_name", pa.string()),  # Name of function/method
+            pa.field("class_name", pa.string()),     # Name of containing class
+            pa.field("language", pa.string()),       # Programming language
+            pa.field("node_type", pa.string()),      # function|class|method|module|interface|type
+            # Timestamp and embedding provenance
+            pa.field("indexed_at", pa.string()),     # ISO timestamp
+            pa.field("embedding_model", pa.string()), # Model used (voyage-code-3, etc.)
+            pa.field("embedding_dim", pa.int32()),   # Dimension for validation
         ])
 
         if self.CODE_TABLE_NAME not in self.lance_db.table_names():
-            log.debug(f"Creating code_chunks table with embedding_dim={self.config.embedding_dim}")
+            log.debug(f"Creating code_chunks table with code_embedding_dim={code_dim}")
             self.lance_db.create_table(self.CODE_TABLE_NAME, schema=schema)
             log.info(f"LanceDB table '{self.CODE_TABLE_NAME}' created")
         else:
@@ -1533,7 +1557,7 @@ class DatabaseManager:
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
             try:
                 safe_uuid = uuid.replace("'", "''")
-                results = self.code_table.search([0.0] * self.config.embedding_dim).where(
+                results = self.code_table.search([0.0] * self.config.code_embedding_dim).where(
                     f"uuid = '{safe_uuid}'"
                 ).limit(1).to_list()
 
@@ -1545,6 +1569,54 @@ class DatabaseManager:
                 log.warning(f"Failed to get code chunk by UUID: {e}")
 
         log.trace(f"Code chunk not found: uuid={uuid[:8]}...")
+        return None
+
+    def get_code_embedding_dimension(self, project_id: str | None = None) -> int | None:
+        """Get the embedding dimension of existing code chunks for a project.
+
+        Used for dimension mismatch protection: when adding new chunks, we need
+        to ensure the embedding dimension matches existing data to prevent
+        LanceDB errors and inconsistent search results.
+
+        Args:
+            project_id: Optional filter by project ID. If None, checks any project.
+
+        Returns:
+            Embedding dimension if chunks exist, None if no chunks found.
+            Returns None if code indexing is disabled.
+        """
+        if not self.config.code_index_enabled:
+            return None
+
+        log.trace(f"Checking code embedding dimension for project: {project_id}")
+
+        with self._write_lock:
+            try:
+                # Query for one existing chunk to get its dimension
+                search = self.code_table.search(
+                    [0.0] * self.config.code_embedding_dim
+                ).limit(1)
+
+                if project_id:
+                    safe_project_id = project_id.replace("'", "''")
+                    search = search.where(f"project_id = '{safe_project_id}'")
+
+                results = search.to_list()
+
+                if results and "embedding_dim" in results[0]:
+                    dim = results[0]["embedding_dim"]
+                    log.debug(f"Found existing code chunks with dim={dim} for project={project_id}")
+                    return dim
+                elif results and "vector" in results[0]:
+                    # Fallback: infer dimension from vector length
+                    dim = len(results[0]["vector"])
+                    log.debug(f"Inferred embedding dim={dim} from vector length for project={project_id}")
+                    return dim
+
+            except Exception as e:
+                log.warning(f"Failed to get code embedding dimension: {e}")
+
+        log.trace(f"No existing code chunks found for project: {project_id}")
         return None
 
     def clear_code_index(self, project_id: str | None = None) -> int:
@@ -1568,7 +1640,7 @@ class DatabaseManager:
                 safe_project_id = project_id.replace("'", "''")
                 # Count before delete
                 try:
-                    count = len(self.code_table.search([0.0] * self.config.embedding_dim)
+                    count = len(self.code_table.search([0.0] * self.config.code_embedding_dim)
                                .where(f"project_id = '{safe_project_id}'")
                                .limit(100000).to_list())
                 except Exception:
@@ -1650,7 +1722,7 @@ class DatabaseManager:
                 offset = 0
                 batch_size = 1000
                 while True:
-                    matches = self.code_table.search([0.0] * self.config.embedding_dim).where(
+                    matches = self.code_table.search([0.0] * self.config.code_embedding_dim).where(
                         where_clause
                     ).limit(batch_size).to_list()
                     if not matches:
@@ -1702,7 +1774,7 @@ class DatabaseManager:
             with self._write_lock:  # LanceDB not thread-safe for concurrent ops
                 total = self.code_table.count_rows()
                 # Get sample to count unique files (approximate)
-                sample = self.code_table.search([0.0] * self.config.embedding_dim).limit(1000).to_list()
+                sample = self.code_table.search([0.0] * self.config.code_embedding_dim).limit(1000).to_list()
             unique_files = len(set(r.get("filepath", "") for r in sample))
             return {
                 "enabled": True,
