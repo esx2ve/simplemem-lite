@@ -90,6 +90,86 @@ async def wipe_all_data(request: WipeRequest) -> WipeResponse:
     )
 
 
+class WipeCodeRequest(BaseModel):
+    """Request body for wipe-code endpoint."""
+
+    confirm: str
+    project_id: str | None = None  # If None, wipe all code indices
+
+
+class WipeCodeResponse(BaseModel):
+    """Response from wipe-code endpoint."""
+
+    status: str
+    message: str
+    chunks_deleted: int
+    project_id: str | None
+
+
+@router.post("/wipe-code", response_model=WipeCodeResponse)
+async def wipe_code_index(request: WipeCodeRequest) -> WipeCodeResponse:
+    """Wipe ONLY code index, preserving memories. DEV MODE ONLY.
+
+    This is a targeted operation that clears:
+    - Code chunks from LanceDB (code_chunks table)
+    - CodeChunk nodes from graph
+    - Orphaned Entity nodes
+
+    **Does NOT touch:**
+    - Memory vectors (memories table)
+    - Memory nodes in graph
+    - Relationships between memories
+
+    Use this when:
+    - Code index is corrupted
+    - Switching embedding providers (dimension mismatch)
+    - Re-indexing codebase from scratch
+
+    **DEV MODE ONLY** - Returns 403 Forbidden in PROD mode.
+
+    Request body:
+    - confirm: Must be exactly "WIPE_CODE_INDEX" to proceed
+    - project_id: Optional - if provided, only wipe code for that project
+
+    Returns:
+        Number of code chunks deleted
+    """
+    config = get_config()
+
+    # CRITICAL: Only allow in DEV mode
+    if not config.is_dev_mode:
+        log.warning("WIPE-CODE: Attempted wipe in PROD mode - DENIED")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Wipe-code endpoint is only available in DEV mode. "
+            "Set SIMPLEMEM_MODE=dev to enable.",
+        )
+
+    # Require explicit confirmation
+    if request.confirm != "WIPE_CODE_INDEX":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Must confirm with {"confirm": "WIPE_CODE_INDEX"} in request body',
+        )
+
+    scope = f"project={request.project_id}" if request.project_id else "ALL projects"
+    log.warning("=" * 70)
+    log.warning(f"  ADMIN: Wipe CODE INDEX request received for {scope}")
+    log.warning("  Memories will be PRESERVED")
+    log.warning("=" * 70)
+
+    # Execute code-only wipe
+    db_manager = get_database_manager()
+    chunks_deleted = db_manager.clear_code_index(project_id=request.project_id)
+
+    return WipeCodeResponse(
+        status="wiped",
+        message=f"Code index wiped for {scope}. Memories preserved.",
+        chunks_deleted=chunks_deleted,
+        project_id=request.project_id,
+    )
+
+
 @router.get("/status")
 async def admin_status() -> dict:
     """Get admin status including security mode."""

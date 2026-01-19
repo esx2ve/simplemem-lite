@@ -26,6 +26,8 @@ primary_region = "sjc"
   SIMPLEMEM_REQUIRE_AUTH = "true"
   # Use TOON format for 30-60% token reduction in responses
   SIMPLEMEM_OUTPUT_FORMAT = "toon"
+  # Use Voyage for code embeddings (voyage-code-3, 1024-dim)
+  CODE_EMBEDDING_PROVIDER = "voyage"
 
 [http_service]
   internal_port = 8420

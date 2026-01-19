@@ -297,7 +297,7 @@ class DatabaseManager:
 
         Schema includes:
         - Core fields: uuid, vector, content, filepath, project_id, start_line, end_line
-        - AST metadata: function_name, class_name, language, node_type
+        - AST metadata: function_name, class_name, language, node_type, signature
         - Provenance: indexed_at, embedding_model, embedding_dim
 
         NOTE: Vector dimension is determined by the embedding provider at runtime.
@@ -328,6 +328,7 @@ class DatabaseManager:
             pa.field("class_name", pa.string()),     # Name of containing class
             pa.field("language", pa.string()),       # Programming language
             pa.field("node_type", pa.string()),      # function|class|method|module|interface|type
+            pa.field("signature", pa.string()),      # Function/class signature for skeleton mode
             # Timestamp and embedding provenance
             pa.field("indexed_at", pa.string()),     # ISO timestamp
             pa.field("embedding_model", pa.string()), # Model used (voyage-code-3, etc.)
@@ -346,6 +347,24 @@ class DatabaseManager:
             self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
             # Verify table is readable with a simple operation
             _ = self.code_table.count_rows()
+
+            # Schema migration: check for missing columns and add them
+            existing_fields = {f.name for f in self.code_table.schema}
+            required_fields = {f.name for f in schema}
+            missing_fields = required_fields - existing_fields
+
+            if missing_fields:
+                log.warning(f"Code table missing columns: {missing_fields}. Recreating table.")
+                # LanceDB doesn't support ALTER TABLE, so we must recreate
+                # This is acceptable for code index as it can be rebuilt
+                try:
+                    self.lance_db.drop_table(self.CODE_TABLE_NAME)
+                except Exception:
+                    pass
+                self.lance_db.create_table(self.CODE_TABLE_NAME, schema=schema)
+                self.code_table = self.lance_db.open_table(self.CODE_TABLE_NAME)
+                log.info(f"LanceDB table '{self.CODE_TABLE_NAME}' recreated with updated schema")
+
         except Exception as e:
             log.warning(f"Code table corrupted, recreating: {e}")
             # Table is corrupted - drop and recreate
@@ -1310,17 +1329,31 @@ class DatabaseManager:
         fetch_limit = limit * 3 if project_id else limit
 
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
-            # LanceDB 0.1 pattern with explicit vector_column_name and query_type
-            search = self.lance_table.search(
-                query_vector,
-                vector_column_name="vector",
-                query_type="auto"
-            ).limit(fetch_limit)
+            try:
+                # Check for empty table first to avoid LanceDB search-on-empty bug
+                row_count = self.lance_table.count_rows()
+                if row_count == 0:
+                    log.debug("Memory table is empty, returning no results")
+                    return []
 
-            if type_filter:
-                search = search.where(f"type = '{type_filter}'")
+                # LanceDB 0.1 pattern with explicit vector_column_name and query_type
+                search = self.lance_table.search(
+                    query_vector,
+                    vector_column_name="vector",
+                    query_type="auto"
+                ).limit(fetch_limit)
 
-            results = search.to_list()
+                if type_filter:
+                    search = search.where(f"type = '{type_filter}'")
+
+                results = search.to_list()
+            except Exception as e:
+                # Handle LanceDB corruption/empty table errors gracefully
+                error_msg = str(e)
+                if "Invalid range" in error_msg or "empty" in error_msg.lower():
+                    log.warning(f"LanceDB table appears corrupted or empty: {e}")
+                    return []
+                raise  # Re-raise unexpected errors
 
         log.debug(f"Vector search returned {len(results)} results before filtering")
 
@@ -1405,6 +1438,7 @@ class DatabaseManager:
         self,
         memories: list[dict[str, Any]],
         vectors: list[list[float]],
+        project_id: str | None = None,
     ) -> int:
         """Write/update vectors in LanceDB for given memory UUIDs.
 
@@ -1414,6 +1448,7 @@ class DatabaseManager:
         Args:
             memories: List of memory dicts with uuid, content, type, session_id
             vectors: Corresponding embedding vectors
+            project_id: Project ID to store in metadata for filtering
 
         Returns:
             Number of vectors written
@@ -1426,7 +1461,7 @@ class DatabaseManager:
         if len(memories) != len(vectors):
             raise ValueError(f"Mismatched counts: {len(memories)} memories, {len(vectors)} vectors")
 
-        log.debug(f"Upserting {len(memories)} memory vectors")
+        log.debug(f"Upserting {len(memories)} memory vectors for project={project_id}")
 
         with self._write_lock:
             # Step 1: Delete existing vectors for these UUIDs
@@ -1442,13 +1477,17 @@ class DatabaseManager:
             # Step 2: Add new vectors
             records = []
             for mem, vec in zip(memories, vectors):
+                # Build metadata with project_id for search filtering
+                metadata = {"reindexed": True}
+                if project_id:
+                    metadata["project_id"] = project_id
                 records.append({
                     "uuid": mem["uuid"],
                     "vector": vec,
                     "content": mem["content"],
                     "type": mem.get("type", "fact"),
                     "session_id": mem.get("session_id") or "",
-                    "metadata": json.dumps({"reindexed": True}),
+                    "metadata": json.dumps(metadata),
                 })
 
             self.lance_table.add(records)
@@ -1486,7 +1525,9 @@ class DatabaseManager:
         """Add code chunks to the code index.
 
         Args:
-            chunks: List of dicts with keys: uuid, vector, content, filepath, project_id, start_line, end_line
+            chunks: List of dicts with keys: uuid, vector, content, filepath, project_id,
+                    start_line, end_line, function_name, class_name, language, node_type,
+                    signature (optional), indexed_at, embedding_model, embedding_dim
 
         Returns:
             Number of chunks added
@@ -1529,13 +1570,30 @@ class DatabaseManager:
         log.trace(f"Searching code: limit={limit}, project_id={project_id}")
 
         with self._write_lock:  # LanceDB not thread-safe for concurrent ops
-            search = self.code_table.search(query_vector).limit(limit)
+            try:
+                # Check for empty/uninitialized table first
+                if self.code_table is None:
+                    log.debug("Code table not initialized, returning no results")
+                    return []
+                row_count = self.code_table.count_rows()
+                if row_count == 0:
+                    log.debug("Code table is empty, returning no results")
+                    return []
 
-            if project_id:
-                safe_project_id = project_id.replace("'", "''")
-                search = search.where(f"project_id = '{safe_project_id}'")
+                search = self.code_table.search(query_vector).limit(limit)
 
-            results = search.to_list()
+                if project_id:
+                    safe_project_id = project_id.replace("'", "''")
+                    search = search.where(f"project_id = '{safe_project_id}'")
+
+                results = search.to_list()
+            except Exception as e:
+                # Handle LanceDB corruption/empty table errors gracefully
+                error_msg = str(e)
+                if "Invalid range" in error_msg or "empty" in error_msg.lower():
+                    log.warning(f"Code table appears corrupted or empty: {e}")
+                    return []
+                raise  # Re-raise unexpected errors
 
         log.debug(f"Code search returned {len(results)} results")
         return results
@@ -1638,11 +1696,17 @@ class DatabaseManager:
             if project_id:
                 log.info(f"Clearing code index for project: {project_id}")
                 safe_project_id = project_id.replace("'", "''")
-                # Count before delete
+                # Count before delete - use count_rows with filter to avoid search-on-empty bug
                 try:
-                    count = len(self.code_table.search([0.0] * self.config.code_embedding_dim)
-                               .where(f"project_id = '{safe_project_id}'")
-                               .limit(100000).to_list())
+                    # LanceDB search fails on empty tables, use filter + count instead
+                    total_rows = self.code_table.count_rows()
+                    if total_rows == 0:
+                        count = 0
+                    else:
+                        # Table has rows, safe to search
+                        count = len(self.code_table.search([0.0] * self.config.code_embedding_dim)
+                                   .where(f"project_id = '{safe_project_id}'")
+                                   .limit(100000).to_list())
                 except Exception:
                     count = 0
 

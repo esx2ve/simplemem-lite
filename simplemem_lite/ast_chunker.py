@@ -123,6 +123,7 @@ class CodeChunk:
         class_name: Name of containing or defining class if applicable
         language: Programming language
         filepath: Source file path
+        signature: Function/class signature for skeleton mode (token-efficient)
     """
     content: str
     start_line: int
@@ -132,6 +133,7 @@ class CodeChunk:
     class_name: str | None
     language: str
     filepath: str
+    signature: str | None = None  # e.g., "def process(data: dict) -> list:"
 
 
 def detect_language(filepath: str) -> str | None:
@@ -220,6 +222,7 @@ def chunk_file(content: str, filepath: str, chunk_size: int = 1200, overlap: int
             class_name=None,
             language=language,
             filepath=filepath,
+            signature=None,  # Module-level chunks have no signature
         ))
 
     log.debug(f"Tree-sitter parsed {filepath}: {len(chunks)} chunks extracted")
@@ -294,8 +297,9 @@ def _extract_chunks_recursive(
                             function_name = name
                     break
 
+        node_content = node.text.decode("utf8")
         chunk = CodeChunk(
-            content=node.text.decode("utf8"),
+            content=node_content,
             start_line=node.start_point[0] + 1,  # 1-indexed
             end_line=node.end_point[0] + 1,
             node_type=node_type,
@@ -303,6 +307,7 @@ def _extract_chunks_recursive(
             class_name=class_name,
             language=language,
             filepath=filepath,
+            signature=_extract_signature(node_content, language),
         )
         chunks.append(chunk)
 
@@ -355,6 +360,64 @@ def _normalize_node_type(ast_type: str, language: str) -> str:  # noqa: ARG001
     return "module"
 
 
+def _extract_signature(node_text: str, language: str) -> str | None:
+    """Extract function/class signature from AST node text.
+
+    Returns the declaration line(s) up to and including the colon or opening brace.
+    This enables skeleton mode for token-efficient code search results.
+
+    Examples:
+      - def process(data: dict) -> list:
+      - class UserService:
+      - async function fetchData(url) {
+      - fn calculate(&self, x: i32) -> i32 {
+      - @router.post("/search")
+        async def search_code(request: Request) -> dict:
+
+    Args:
+        node_text: Full text of the AST node
+        language: Programming language for language-specific handling
+
+    Returns:
+        Signature string or None if extraction fails
+    """
+    if not node_text:
+        return None
+
+    lines = node_text.split("\n")
+    sig_lines: list[str] = []
+
+    for line in lines:
+        sig_lines.append(line)
+        stripped = line.rstrip()
+
+        # Python/Ruby: signature ends at colon
+        if language in ("python", "ruby") and stripped.endswith(":"):
+            break
+
+        # JS/TS/Java/C/C++/PHP: signature ends at opening brace
+        if language in ("javascript", "typescript", "tsx", "java", "c", "cpp", "php"):
+            if stripped.endswith("{"):
+                break
+
+        # Rust/Go: signature ends at opening brace OR closing paren for fn declarations
+        if language in ("rust", "go"):
+            if stripped.endswith("{"):
+                break
+            # Rust fn without body (trait methods): ends at semicolon
+            if stripped.endswith(";"):
+                break
+
+    signature = "\n".join(sig_lines).strip()
+
+    # Sanity check: signature shouldn't be too long (>500 chars suggests extraction issue)
+    if len(signature) > 500:
+        # Fall back to first line only
+        return lines[0].strip() if lines else None
+
+    return signature if signature else None
+
+
 def _fallback_line_chunks(
     content: str,
     filepath: str,
@@ -405,6 +468,7 @@ def _fallback_line_chunks(
                 class_name=None,
                 language=language,
                 filepath=filepath,
+                signature=None,  # Line-based fallback has no signature
             ))
 
         # Move forward with overlap

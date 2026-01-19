@@ -793,11 +793,12 @@ class CodeIndexer:
                 "project_id": project_id,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                # New AST metadata fields
+                # AST metadata fields
                 "function_name": chunk.function_name,
                 "class_name": chunk.class_name,
                 "language": chunk.language,
                 "node_type": chunk.node_type,
+                "signature": chunk.signature or "",  # Signature for skeleton mode
                 # Timestamp and embedding provenance
                 "indexed_at": indexed_at,
                 "embedding_model": embedding_result.model,
@@ -889,11 +890,12 @@ class CodeIndexer:
                 "project_id": project_id,
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
-                # New AST metadata fields
+                # AST metadata fields
                 "function_name": chunk.function_name,
                 "class_name": chunk.class_name,
                 "language": chunk.language,
                 "node_type": chunk.node_type,
+                "signature": chunk.signature or "",  # Signature for skeleton mode
                 # Timestamp and embedding provenance
                 "indexed_at": indexed_at,
                 "embedding_model": embedding_result.model,

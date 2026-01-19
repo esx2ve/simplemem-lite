@@ -80,6 +80,10 @@ class SearchCodeRequest(BaseModel):
     query: str = Field(..., description="Natural language search query")
     limit: int = Field(default=10, ge=1, le=100)
     project_id: str | None = Field(default=None, description="Filter to specific project")
+    content_mode: str = Field(
+        default="preview",
+        description="Content verbosity: 'signature' (~15 tokens), 'preview' (~80 tokens), 'full' (~400 tokens)",
+    )
     output_format: str | None = Field(
         default=None,
         description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
@@ -257,6 +261,16 @@ async def update_code(request: UpdateCodeRequest) -> dict:
 async def search_code(request: SearchCodeRequest) -> dict:
     """Semantic search over indexed code.
 
+    Args:
+        query: Natural language search query
+        limit: Max results (default 10)
+        project_id: Filter to specific project
+        content_mode: Content verbosity level:
+            - 'signature': Function/class signature only (~15 tokens/result)
+            - 'preview': Signature + truncated body (~80 tokens/result)
+            - 'full': Complete content (~400 tokens/result)
+        output_format: 'toon' (default) or 'json'
+
     When output_format="toon", returns tab-separated format for token efficiency.
     """
     require_project_id(request.project_id, "search_code")
@@ -267,6 +281,36 @@ async def search_code(request: SearchCodeRequest) -> dict:
             limit=request.limit,
             project_id=request.project_id,
         )
+
+        # Apply content_mode transformation for token efficiency
+        content_mode = request.content_mode.lower() if request.content_mode else "preview"
+        for r in results:
+            sig = r.get("signature", "") or ""
+            content = r.get("content", "") or ""
+
+            if content_mode == "signature":
+                # Signature only (~15 tokens) - most token-efficient
+                if sig:
+                    r["content"] = sig
+                else:
+                    # Fallback: first line of content
+                    first_line = content.split("\n")[0] if content else ""
+                    r["content"] = first_line[:100] + ("..." if len(first_line) > 100 else "")
+
+            elif content_mode == "preview":
+                # Signature + truncated body (~80 tokens) - balanced
+                if sig:
+                    # Get body after signature
+                    sig_len = len(sig)
+                    body_start = content.find(sig) + sig_len if sig in content else 0
+                    body_preview = content[body_start:].strip()[:200]
+                    r["content"] = sig + ("\n" + body_preview + "..." if body_preview else "")
+                else:
+                    # Fallback: truncate content
+                    r["content"] = content[:300] + ("..." if len(content) > 300 else "")
+
+            # "full" mode: no transformation, keep original content
+
         return {"results": results}
 
     except Exception as e:

@@ -1666,8 +1666,8 @@ PATTERNS:
                     # Truncate to match
                     batch = batch[:len(embeddings)]
 
-                # Write to LanceDB via upsert
-                written = self.db.upsert_memory_vectors(batch, embeddings)
+                # Write to LanceDB via upsert (include project_id for search filtering)
+                written = self.db.upsert_memory_vectors(batch, embeddings, project_id=project_id)
                 reindexed += written
 
                 processed += len(batch)
