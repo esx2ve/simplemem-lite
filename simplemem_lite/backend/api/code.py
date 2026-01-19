@@ -88,6 +88,17 @@ class SearchCodeRequest(BaseModel):
         default=None,
         description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
     )
+    # Code-memory correlation surfacing
+    include_related_memories: bool = Field(
+        default=False,
+        description="Include related memories (debugging sessions, lessons) for each code result",
+    )
+    related_memories_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max related memories per code result",
+    )
 
 
 class CodeRelatedMemoriesRequest(BaseModel):
@@ -310,6 +321,30 @@ async def search_code(request: SearchCodeRequest) -> dict:
                     r["content"] = content[:300] + ("..." if len(content) > 300 else "")
 
             # "full" mode: no transformation, keep original content
+
+        # Add related memories if requested (code-memory correlation surfacing)
+        if request.include_related_memories and results:
+            try:
+                store = get_memory_store()
+                for r in results:
+                    chunk_uuid = r.get("uuid")
+                    if chunk_uuid:
+                        related = store.db.get_code_related_memories(
+                            chunk_uuid=chunk_uuid,
+                            limit=request.related_memories_limit,
+                        )
+                        # Include essential fields for context
+                        r["related_memories"] = [
+                            {
+                                "uuid": m.get("uuid", ""),
+                                "type": m.get("type", ""),
+                                "content_preview": m.get("content", "")[:150] + "..." if len(m.get("content", "")) > 150 else m.get("content", ""),
+                            }
+                            for m in related
+                        ]
+                log.debug(f"Added related memories to {len(results)} code results")
+            except Exception as e:
+                log.warning(f"Failed to add related memories (continuing without): {e}")
 
         return {"results": results}
 

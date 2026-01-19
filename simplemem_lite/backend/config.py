@@ -79,6 +79,20 @@ class BackendConfig:
         )
     )
 
+    # Voyage AI settings (for code embeddings and reranking)
+    voyage_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("VOYAGE_API_KEY")
+    )
+
+    # Reranking model (Voyage rerank-2-lite is cost-effective with +11-14% precision)
+    # Options: rerank-2 (highest quality), rerank-2-lite (cost-effective), none (disabled)
+    rerank_model: str = field(
+        default_factory=lambda: os.environ.get("SIMPLEMEM_RERANK_MODEL", "rerank-2-lite")
+    )
+
+    # Whether to enable Voyage reranking (falls back to LLM reranking if disabled)
+    enable_voyage_rerank: bool = field(default=None)  # type: ignore[assignment]
+
     # Decompression limits (always enforced)
     max_decompressed_size_mb: int = field(
         default_factory=lambda: int(os.environ.get("SIMPLEMEM_MAX_DECOMPRESS_MB", "100"))
@@ -117,6 +131,12 @@ class BackendConfig:
             self.verbose_errors = self._env_bool("SIMPLEMEM_VERBOSE_ERRORS", True)
         if self.host is None:
             self.host = os.environ.get("HOST", "127.0.0.1")
+        if self.enable_voyage_rerank is None:
+            # Enable if API key is available
+            self.enable_voyage_rerank = self._env_bool(
+                "SIMPLEMEM_ENABLE_VOYAGE_RERANK",
+                self.voyage_api_key is not None
+            )
 
     def _apply_prod_defaults(self) -> None:
         """Apply strict defaults for production mode."""
@@ -130,6 +150,12 @@ class BackendConfig:
             self.verbose_errors = self._env_bool("SIMPLEMEM_VERBOSE_ERRORS", False)
         if self.host is None:
             self.host = os.environ.get("HOST", "0.0.0.0")
+        if self.enable_voyage_rerank is None:
+            # Enable if API key is available
+            self.enable_voyage_rerank = self._env_bool(
+                "SIMPLEMEM_ENABLE_VOYAGE_RERANK",
+                self.voyage_api_key is not None
+            )
 
     @staticmethod
     def _env_bool(key: str, default: bool) -> bool:

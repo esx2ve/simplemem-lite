@@ -781,11 +781,23 @@ class MemoryStore:
         use_graph: bool = True,
         type_filter: str | None = None,
         project_id: str | None = None,
+        rrf_k: int = 60,
     ) -> list[Memory]:
-        """Search with multiple query variations and deduplicate results.
+        """Search with multiple query variations and combine using Reciprocal Rank Fusion.
 
-        Performs search for each query variation, then combines and deduplicates
-        results by UUID, keeping the highest score for each memory.
+        Performs search for each query variation, then combines results using RRF
+        (Reciprocal Rank Fusion), which rewards memories that appear consistently
+        across query variations rather than just having a single high score.
+
+        RRF Formula: score = Σ 1/(k + rank_i)
+        - k is a constant (default 60, standard in IR literature)
+        - rank_i is the 1-indexed position in each query's result list
+        - Memories appearing in multiple query results accumulate higher scores
+
+        This approach is superior to max-score deduplication because:
+        - It rewards consensus: a memory ranked #3 in all queries beats one ranked #1 in only one query
+        - It's robust to score miscalibration across different queries
+        - It reduces sensitivity to outlier scores
 
         Args:
             queries: List of query variations (typically from expand_query)
@@ -793,44 +805,80 @@ class MemoryStore:
             use_graph: Whether to expand results via graph
             type_filter: Optional filter by memory type
             project_id: Optional filter by project
+            rrf_k: RRF constant (default 60, higher values = smoother ranking)
 
         Returns:
-            Deduplicated list of memories sorted by best score
+            Deduplicated list of memories sorted by RRF score
         """
         if not queries:
             return []
 
-        log.info(f"Multi-query search with {len(queries)} variations")
+        log.info(f"Multi-query search with {len(queries)} variations using RRF (k={rrf_k})")
 
-        # Collect results from all queries, keyed by UUID
-        all_results: dict[str, Memory] = {}
+        # RRF accumulation: uuid -> cumulative RRF score
+        rrf_scores: dict[str, float] = {}
+        # Store Memory objects: uuid -> Memory (keep first occurrence for metadata)
+        memory_data: dict[str, Memory] = {}
+        # Track original vector scores for logging/debugging
+        original_scores: dict[str, list[float]] = {}
 
         for i, query in enumerate(queries):
-            log.debug(f"Searching variation {i+1}/{len(queries)}: '{query[:40]}...'")
+            log.debug(f"Searching variation {i+1}/{len(queries)}: '{query[:50]}...'")
             results = self.search(
                 query=query,
-                limit=limit * 2,  # Get more per query, then dedupe
+                limit=limit * 3,  # Fetch more for better RRF coverage
                 use_graph=use_graph,
                 type_filter=type_filter,
                 project_id=project_id,
             )
 
-            for memory in results:
-                if memory.uuid not in all_results:
-                    all_results[memory.uuid] = memory
-                elif memory.score > all_results[memory.uuid].score:
-                    # Keep the higher score
-                    all_results[memory.uuid] = memory
+            # Calculate RRF contribution for each result based on rank (1-indexed)
+            for rank, memory in enumerate(results, start=1):
+                # RRF formula: 1 / (k + rank)
+                rrf_contribution = 1.0 / (rrf_k + rank)
+                rrf_scores[memory.uuid] = rrf_scores.get(memory.uuid, 0.0) + rrf_contribution
 
-        # Sort by score and return top limit
-        sorted_results = sorted(
-            all_results.values(),
-            key=lambda m: m.score,
+                # Store memory data (first occurrence)
+                if memory.uuid not in memory_data:
+                    memory_data[memory.uuid] = memory
+                    original_scores[memory.uuid] = []
+
+                # Track original scores for debugging
+                original_scores[memory.uuid].append(memory.score)
+
+        # Sort by RRF score (descending)
+        sorted_uuids = sorted(
+            rrf_scores.keys(),
+            key=lambda uuid: rrf_scores[uuid],
             reverse=True,
         )
 
-        log.info(f"Multi-query search complete: {len(sorted_results)} unique results, returning top {limit}")
-        return sorted_results[:limit]
+        # Build result list with RRF scores replacing original scores
+        results: list[Memory] = []
+        for uuid in sorted_uuids[:limit]:
+            memory = memory_data[uuid]
+            # Create new Memory with RRF score
+            results.append(Memory(
+                uuid=memory.uuid,
+                content=memory.content,
+                type=memory.type,
+                created_at=memory.created_at,
+                score=rrf_scores[uuid],  # Use RRF score
+                session_id=memory.session_id,
+            ))
+
+        # Log statistics for debugging
+        if results:
+            top_uuid = results[0].uuid
+            log.debug(
+                f"RRF top result: {top_uuid[:8]}... "
+                f"rrf_score={rrf_scores[top_uuid]:.4f}, "
+                f"original_scores={original_scores[top_uuid]}, "
+                f"appeared_in={len(original_scores[top_uuid])} queries"
+            )
+
+        log.info(f"Multi-query RRF search complete: {len(rrf_scores)} unique results, returning top {limit}")
+        return results
 
     def relate(
         self,

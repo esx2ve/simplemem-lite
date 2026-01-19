@@ -13,6 +13,7 @@ from simplemem_lite.backend.scoring import (
     apply_supersession_penalty,
     apply_temporal_scoring,
     rerank_results,
+    rerank_with_voyage,
 )
 from simplemem_lite.backend.services import get_code_indexer, get_job_manager, get_memory_store
 from simplemem_lite.backend.time_utils import parse_time_spec
@@ -123,6 +124,17 @@ class SearchMemoriesRequest(BaseModel):
     use_graph_scoring: bool = Field(
         default=True,
         description="Apply graph-enhanced scoring (PageRank + connectivity) for better ranking in active codebases",
+    )
+    # Code-memory correlation surfacing
+    include_related_code: bool = Field(
+        default=False,
+        description="Include related code files for each memory result (bridges code and debugging history)",
+    )
+    related_code_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max related code files per memory result",
     )
 
 
@@ -335,6 +347,29 @@ async def search_memories(request: SearchMemoriesRequest) -> dict:
             except Exception as e:
                 log.warning(f"Failed to apply graph scoring (continuing without): {e}")
 
+        # Add related code files if requested (code-memory correlation surfacing)
+        if request.include_related_code and result_dicts:
+            try:
+                for result in result_dicts:
+                    memory_uuid = result.get("uuid")
+                    if memory_uuid:
+                        related = store.db.get_memory_related_code(
+                            memory_uuid=memory_uuid,
+                            limit=request.related_code_limit,
+                        )
+                        # Include only essential fields to keep response compact
+                        result["related_code"] = [
+                            {
+                                "filepath": r.get("filepath", ""),
+                                "start_line": r.get("start_line", 0),
+                                "end_line": r.get("end_line", 0),
+                            }
+                            for r in related
+                        ]
+                log.debug(f"Added related code to {len(result_dicts)} memories")
+            except Exception as e:
+                log.warning(f"Failed to add related code (continuing without): {e}")
+
         # Return results - decorator handles TOON conversion if requested
         return {"results": result_dicts}
 
@@ -488,29 +523,45 @@ async def reset_all(confirm: bool = False) -> dict:
 
 
 class SearchDeepRequest(BaseModel):
-    """Request model for LLM-reranked deep search."""
+    """Request model for reranked deep search.
+
+    Supports two reranking strategies:
+    - "voyage": Voyage AI rerank-2-lite (+11-14% precision, ~50-100ms latency)
+    - "llm": LLM-based reranking with conflict detection (higher latency)
+    - "auto": Prefer Voyage if available, fallback to LLM (default)
+    """
 
     query: str = Field(..., description="Search query")
     limit: int = Field(default=10, ge=1, le=50, description="Number of results to return")
-    rerank_pool: int = Field(default=20, ge=1, le=50, description="Pool size for reranking")
+    rerank_pool: int = Field(default=30, ge=1, le=50, description="Pool size for reranking")
     project_id: str | None = Field(default=None, description="Project identifier")
     output_format: str | None = Field(
         default=None,
         description="Response format: 'toon' (default) or 'json'. Env var: SIMPLEMEM_OUTPUT_FORMAT.",
+    )
+    reranker: str = Field(
+        default="auto",
+        description="Reranking strategy: 'voyage' (fast, +11-14% precision), 'llm' (with conflict detection), 'auto' (prefer voyage)",
     )
 
 
 @router.post("/search-deep")
 @toonify(headers=["uuid", "type", "score", "content"])
 async def search_memories_deep(request: SearchDeepRequest) -> dict:
-    """LLM-reranked semantic search with conflict detection.
+    """Reranked semantic search with optional conflict detection.
 
-    Performs vector search, then uses an LLM to rerank results by
-    semantic relevance and detect potential conflicts between memories.
+    Performs vector search, then applies reranking for improved precision.
+
+    Reranking strategies:
+    - "voyage": Voyage AI rerank-2-lite (+11-14% precision, ~50-100ms)
+    - "llm": LLM-based reranking with conflict detection (higher latency)
+    - "auto": Prefer Voyage if available, fallback to LLM
+
     Use this for higher precision when quality matters more than speed.
     """
     require_project_id(request.project_id, "search_memories_deep")
     try:
+        config = get_config()
         store = get_memory_store()
 
         # Get expanded pool for reranking
@@ -533,30 +584,72 @@ async def search_memories_deep(request: SearchDeepRequest) -> dict:
             for m in results
         ]
 
-        # Apply LLM reranking
-        reranked = await rerank_results(
-            query=request.query,
-            results=result_dicts,
-            top_k=request.limit,
-            rerank_pool=request.rerank_pool,
-        )
+        # Determine reranking strategy
+        use_voyage = False
+        if request.reranker == "voyage":
+            use_voyage = True
+        elif request.reranker == "auto":
+            # Auto: prefer Voyage if enabled and API key available
+            use_voyage = config.enable_voyage_rerank and config.voyage_api_key
 
-        # Map conflict indices to UUIDs
         conflicts_with_uuids = []
-        for conflict in reranked.get("conflicts", []):
-            if len(conflict) >= 3:
-                idx1, idx2, reason = conflict[0], conflict[1], conflict[2]
-                if idx1 < len(result_dicts) and idx2 < len(result_dicts):
-                    conflicts_with_uuids.append([
-                        result_dicts[idx1]["uuid"],
-                        result_dicts[idx2]["uuid"],
-                        reason,
-                    ])
+
+        if use_voyage:
+            # Voyage AI reranking (fast, high precision, no conflict detection)
+            log.info(f"Using Voyage reranking (model={config.rerank_model})")
+            reranked = await rerank_with_voyage(
+                query=request.query,
+                results=result_dicts,
+                top_k=request.limit,
+                model=config.rerank_model,
+                api_key=config.voyage_api_key,
+            )
+
+            if not reranked.get("rerank_applied", False):
+                # Voyage failed, fallback to LLM
+                log.warning(f"Voyage reranking failed: {reranked.get('error')}, falling back to LLM")
+                reranked = await rerank_results(
+                    query=request.query,
+                    results=result_dicts,
+                    top_k=request.limit,
+                    rerank_pool=request.rerank_pool,
+                )
+                # Extract conflicts from LLM reranking
+                for conflict in reranked.get("conflicts", []):
+                    if len(conflict) >= 3:
+                        idx1, idx2, reason = conflict[0], conflict[1], conflict[2]
+                        if idx1 < len(result_dicts) and idx2 < len(result_dicts):
+                            conflicts_with_uuids.append([
+                                result_dicts[idx1]["uuid"],
+                                result_dicts[idx2]["uuid"],
+                                reason,
+                            ])
+        else:
+            # LLM reranking (with conflict detection)
+            log.info("Using LLM reranking with conflict detection")
+            reranked = await rerank_results(
+                query=request.query,
+                results=result_dicts,
+                top_k=request.limit,
+                rerank_pool=request.rerank_pool,
+            )
+
+            # Map conflict indices to UUIDs
+            for conflict in reranked.get("conflicts", []):
+                if len(conflict) >= 3:
+                    idx1, idx2, reason = conflict[0], conflict[1], conflict[2]
+                    if idx1 < len(result_dicts) and idx2 < len(result_dicts):
+                        conflicts_with_uuids.append([
+                            result_dicts[idx1]["uuid"],
+                            result_dicts[idx2]["uuid"],
+                            reason,
+                        ])
 
         return {
             "results": reranked["results"],
             "conflicts": conflicts_with_uuids,
             "rerank_applied": reranked.get("rerank_applied", False),
+            "reranker": "voyage" if use_voyage and reranked.get("rerank_applied") else "llm",
         }
 
     except Exception as e:

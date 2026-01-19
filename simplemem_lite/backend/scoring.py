@@ -516,7 +516,127 @@ def apply_supersession_penalty(
     return sorted(results, key=lambda x: -x.get("final_score", 0.0))
 
 
-# LLM Reranking (Phase 2)
+# Voyage AI Reranking (high precision, low latency)
+# Uses rerank-2-lite by default: +11-14% precision over vector-only at ~50-100ms latency
+
+async def rerank_with_voyage(
+    query: str,
+    results: list[dict[str, Any]],
+    top_k: int = 10,
+    model: str = "rerank-2-lite",
+    api_key: str | None = None,
+    truncate_content: int = 2000,
+) -> dict[str, Any]:
+    """Rerank search results using Voyage AI's reranker for improved precision.
+
+    Voyage rerank-2-lite provides +11-14% precision boost over vector-only search
+    with ~50-100ms latency. This is more accurate and faster than LLM-based reranking.
+
+    Two-stage pipeline: Vector search (broad recall) → Voyage rerank (precision)
+
+    Args:
+        query: Original search query
+        results: List of memory/code dicts with 'content' field
+        top_k: Number of top results to return after reranking
+        model: Voyage model ('rerank-2' for max quality, 'rerank-2-lite' for cost/speed)
+        api_key: Voyage API key (uses VOYAGE_API_KEY env var if not provided)
+        truncate_content: Max chars of content to send (Voyage has 8K token limit)
+
+    Returns:
+        Dict with:
+            - results: Reranked top-k results with updated scores
+            - rerank_applied: True if reranking was applied
+            - model: Model used for reranking
+            - error: Error message if reranking failed (results still returned)
+    """
+    import os
+
+    import httpx
+
+    # Get API key
+    if api_key is None:
+        api_key = os.environ.get("VOYAGE_API_KEY")
+
+    if not api_key:
+        return {
+            "results": results[:top_k],
+            "rerank_applied": False,
+            "error": "VOYAGE_API_KEY not set",
+        }
+
+    # If not enough results to rerank, return as-is
+    if len(results) <= top_k:
+        return {
+            "results": results,
+            "rerank_applied": False,
+        }
+
+    # Prepare documents for Voyage API (truncate for token limit)
+    documents = []
+    for r in results:
+        content = r.get("content", "")
+        if len(content) > truncate_content:
+            content = content[:truncate_content] + "..."
+        documents.append(content)
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.voyageai.com/v1/rerank",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "query": query,
+                    "documents": documents,
+                    "top_k": top_k,
+                    "return_documents": False,  # We already have them
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Build reranked results
+        ranked_data = data.get("data", [])
+        reranked = []
+
+        for item in ranked_data:
+            idx = item.get("index", 0)
+            relevance_score = item.get("relevance_score", 0.0)
+
+            if idx < len(results):
+                result = dict(results[idx])
+                # Update score with reranker score
+                result["score"] = relevance_score
+                result["original_score"] = results[idx].get("score", 0.0)
+                result["reranker_score"] = relevance_score
+                reranked.append(result)
+
+        return {
+            "results": reranked,
+            "rerank_applied": True,
+            "model": model,
+        }
+
+    except httpx.HTTPStatusError as e:
+        # Return original results with error info
+        return {
+            "results": results[:top_k],
+            "rerank_applied": False,
+            "error": f"Voyage API error: {e.response.status_code} - {e.response.text[:200]}",
+        }
+    except Exception as e:
+        # Return original results with error info
+        return {
+            "results": results[:top_k],
+            "rerank_applied": False,
+            "error": f"Reranking failed: {str(e)[:200]}",
+        }
+
+
+# LLM Reranking (Phase 2) - fallback when Voyage is unavailable
 
 async def rerank_results(
     query: str,
