@@ -241,14 +241,30 @@ Rules:
 
 # Semantic weights for relation types (applied in Python for flexibility)
 RELATION_WEIGHTS = {
-    "contains": 1.0,    # Hierarchical drill-down
-    "child_of": 1.0,    # Reverse contains
-    "supports": 0.8,    # Evidence for conclusion
-    "references": 0.7,  # Entity reference (cross-session)
-    "follows": 0.6,     # Temporal sequence
-    "mentions": 0.4,    # Reference
-    "relates": 0.3,     # Generic/weak
-    "supersedes": 0.1,  # New memory supersedes old (for contradiction handling)
+    # Graph edge types (uppercase as returned by FalkorDB)
+    "CONTAINS": 1.0,      # Hierarchical drill-down
+    "CHILD_OF": 1.0,      # Reverse contains
+    "RELATES_TO": 0.8,    # Semantic relationship (most common)
+    "REFERENCES": 0.7,    # Entity reference (cross-session)
+    "READS": 0.7,         # Memory reads a file
+    "MODIFIES": 0.8,      # Memory modifies something
+    "EXECUTES": 0.6,      # Memory executes a tool
+    "TRIGGERED": 0.6,     # Memory triggered an error
+    "FOLLOWS": 0.6,       # Temporal sequence
+    "ACHIEVES": 0.8,      # Memory achieves a goal
+    "HAS_GOAL": 0.6,      # Session has a goal
+    "BELONGS_TO": 0.5,    # Belongs to project
+    "SUPERSEDES": 0.2,    # New memory supersedes old
+    "MERGED_INTO": 0.1,   # Old memory merged into new
+    # Legacy lowercase keys (for backward compat with relation_type field)
+    "contains": 1.0,
+    "child_of": 1.0,
+    "supports": 0.8,
+    "references": 0.7,
+    "follows": 0.6,
+    "mentions": 0.4,
+    "relates": 0.3,
+    "supersedes": 0.1,
 }
 
 # Content preview length for contradiction detection
